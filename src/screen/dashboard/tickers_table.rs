@@ -42,19 +42,10 @@ const SORT_AND_FILTER_HEIGHT: f32 = 200.0;
 
 const COMPACT_ROW_HEIGHT: f32 = 28.0;
 
-const EXCHANGE_FILTERS: [(ExchangeInclusive, Exchange, &str); 4] = [
-    (ExchangeInclusive::Bybit, Exchange::BybitLinear, "Bybit"),
-    (
-        ExchangeInclusive::Binance,
-        Exchange::BinanceLinear,
-        "Binance",
-    ),
-    (
-        ExchangeInclusive::Hyperliquid,
-        Exchange::HyperliquidLinear,
-        "Hyperliquid",
-    ),
-    (ExchangeInclusive::Okex, Exchange::OkexLinear, "OKX"),
+const EXCHANGE_FILTERS: [(ExchangeInclusive, Exchange, &str); 3] = [
+    (ExchangeInclusive::Binance, Exchange::BinanceLinear, "Binance"),
+    (ExchangeInclusive::SSH, Exchange::SSH, "SSH"),
+    (ExchangeInclusive::SSZ, Exchange::SSZ, "SSZ"),
 ];
 
 pub fn fetch_tickers_info() -> Task<Message> {

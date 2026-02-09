@@ -6,7 +6,7 @@ use crate::{
 use data::chart::Basis;
 use exchange::{
     TickMultiplier, TickerInfo, Timeframe,
-    adapter::{Exchange, hyperliquid::allowed_multipliers_for_base_tick},
+    adapter::{Exchange},
 };
 use iced::{
     Element, Length,
@@ -579,12 +579,11 @@ impl Modifier {
                     let allowed_tm = if allows_custom_tsizes {
                         exchange::TickMultiplier::ALL.to_vec()
                     } else {
-                        let base = self.base_ticksize.unwrap_or(0.0);
-                        let allow = allowed_multipliers_for_base_tick(base);
+                        //let base = self.base_ticksize.unwrap_or(0.0);
                         exchange::TickMultiplier::ALL
                             .iter()
                             .copied()
-                            .filter(|tm| allow.contains(&tm.0))
+                            // .filter(|tm| allow.contains(&tm.0))
                             .collect()
                     };
 

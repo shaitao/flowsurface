@@ -10,9 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Instant};
 
 pub mod binance;
-pub mod bybit;
-pub mod hyperliquid;
-pub mod okex;
+pub mod qmt;
 
 /// Persisted stream resolution to avoid loop retries
 pub const RESOLVE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -424,28 +422,25 @@ pub struct StreamSpecs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum ExchangeInclusive {
-    Bybit,
     Binance,
-    Hyperliquid,
-    Okex,
+    SSZ,
+    SSH,
 }
 
 impl ExchangeInclusive {
-    pub const ALL: [ExchangeInclusive; 4] = [
-        ExchangeInclusive::Bybit,
+    pub const ALL: [ExchangeInclusive; 3] = [
         ExchangeInclusive::Binance,
-        ExchangeInclusive::Hyperliquid,
-        ExchangeInclusive::Okex,
+        ExchangeInclusive::SSZ,
+        ExchangeInclusive::SSH,
     ];
 
     pub fn of(ex: Exchange) -> Self {
         match ex {
-            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => Self::Bybit,
             Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
                 Self::Binance
             }
-            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => Self::Hyperliquid,
-            Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => Self::Okex,
+            Exchange::SSH => Self::SSH,
+            Exchange::SSZ => Self::SSZ,
         }
     }
 }
@@ -455,14 +450,8 @@ pub enum Exchange {
     BinanceLinear,
     BinanceInverse,
     BinanceSpot,
-    BybitLinear,
-    BybitInverse,
-    BybitSpot,
-    HyperliquidLinear,
-    HyperliquidSpot,
-    OkexLinear,
-    OkexInverse,
-    OkexSpot,
+    SSZ,
+    SSH,
 }
 
 impl std::fmt::Display for Exchange {
@@ -474,14 +463,8 @@ impl std::fmt::Display for Exchange {
                 Exchange::BinanceLinear => "Binance Linear",
                 Exchange::BinanceInverse => "Binance Inverse",
                 Exchange::BinanceSpot => "Binance Spot",
-                Exchange::BybitLinear => "Bybit Linear",
-                Exchange::BybitInverse => "Bybit Inverse",
-                Exchange::BybitSpot => "Bybit Spot",
-                Exchange::HyperliquidLinear => "Hyperliquid Linear",
-                Exchange::HyperliquidSpot => "Hyperliquid Spot",
-                Exchange::OkexLinear => "Okex Linear",
-                Exchange::OkexInverse => "Okex Inverse",
-                Exchange::OkexSpot => "Okex Spot",
+                Exchange::SSZ => "SSZ",
+                Exchange::SSH => "SSH",
             }
         )
     }
@@ -495,100 +478,59 @@ impl FromStr for Exchange {
             "Binance Linear" => Ok(Exchange::BinanceLinear),
             "Binance Inverse" => Ok(Exchange::BinanceInverse),
             "Binance Spot" => Ok(Exchange::BinanceSpot),
-            "Bybit Linear" => Ok(Exchange::BybitLinear),
-            "Bybit Inverse" => Ok(Exchange::BybitInverse),
-            "Bybit Spot" => Ok(Exchange::BybitSpot),
-            "Hyperliquid Linear" => Ok(Exchange::HyperliquidLinear),
-            "Hyperliquid Spot" => Ok(Exchange::HyperliquidSpot),
-            "Okex Linear" => Ok(Exchange::OkexLinear),
-            "Okex Inverse" => Ok(Exchange::OkexInverse),
-            "Okex Spot" => Ok(Exchange::OkexSpot),
+            "SSZ" => Ok(Exchange::SSZ),
+            "SSH" => Ok(Exchange::SSH),
             _ => Err(format!("Invalid exchange: {}", s)),
         }
     }
 }
 
 impl Exchange {
-    pub const ALL: [Exchange; 11] = [
+    pub const ALL: [Exchange; 5] = [
         Exchange::BinanceLinear,
         Exchange::BinanceInverse,
         Exchange::BinanceSpot,
-        Exchange::BybitLinear,
-        Exchange::BybitInverse,
-        Exchange::BybitSpot,
-        Exchange::HyperliquidLinear,
-        Exchange::HyperliquidSpot,
-        Exchange::OkexLinear,
-        Exchange::OkexInverse,
-        Exchange::OkexSpot,
+        Exchange::SSZ,
+        Exchange::SSH,
     ];
 
     pub fn market_type(&self) -> MarketKind {
         match self {
-            Exchange::BinanceLinear
-            | Exchange::BybitLinear
-            | Exchange::HyperliquidLinear
-            | Exchange::OkexLinear => MarketKind::LinearPerps,
-            Exchange::BinanceInverse | Exchange::BybitInverse | Exchange::OkexInverse => {
-                MarketKind::InversePerps
-            }
-            Exchange::BinanceSpot
-            | Exchange::BybitSpot
-            | Exchange::HyperliquidSpot
-            | Exchange::OkexSpot => MarketKind::Spot,
+            Exchange::BinanceLinear => MarketKind::LinearPerps,
+            Exchange::BinanceInverse => MarketKind::InversePerps,
+            Exchange::BinanceSpot | Exchange::SSZ | Exchange::SSH => MarketKind::Spot,
         }
     }
 
     pub fn is_depth_client_aggr(&self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot
+            Exchange::BinanceLinear
+                | Exchange::BinanceInverse
+                | Exchange::BinanceSpot
+                | Exchange::SSZ
+                | Exchange::SSH
         )
     }
 
     pub fn is_custom_push_freq(&self) -> bool {
-        matches!(
-            self,
-            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot
-        )
+        false
     }
 
     pub fn allowed_push_freqs(&self) -> &[PushFrequency] {
         match self {
-            Exchange::BybitLinear | Exchange::BybitInverse => &[
-                PushFrequency::Custom(Timeframe::MS100),
-                PushFrequency::Custom(Timeframe::MS300),
-            ],
-            Exchange::BybitSpot => &[
-                PushFrequency::Custom(Timeframe::MS200),
-                PushFrequency::Custom(Timeframe::MS300),
-            ],
             _ => &[PushFrequency::ServerDefault],
         }
     }
 
-    pub fn supports_heatmap_timeframe(&self, tf: Timeframe) -> bool {
+    pub fn supports_heatmap_timeframe(&self, _tf: Timeframe) -> bool {
         match self {
-            Exchange::BybitSpot => tf != Timeframe::MS100,
-            Exchange::BybitLinear | Exchange::BybitInverse => tf != Timeframe::MS200,
-            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-                tf != Timeframe::MS100 && tf != Timeframe::MS200 && tf != Timeframe::MS300
-            }
             _ => true,
         }
     }
 
     pub fn is_perps(&self) -> bool {
-        matches!(
-            self,
-            Exchange::BinanceLinear
-                | Exchange::BinanceInverse
-                | Exchange::BybitLinear
-                | Exchange::BybitInverse
-                | Exchange::HyperliquidLinear
-                | Exchange::OkexLinear
-                | Exchange::OkexInverse
-        )
+        matches!(self, Exchange::BinanceLinear | Exchange::BinanceInverse)
     }
 
     pub fn stream_ticksize(
@@ -641,20 +583,11 @@ pub async fn fetch_ticker_info(
     exchange: Exchange,
 ) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError> {
     let market_type = exchange.market_type();
-
     match exchange {
         Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
             binance::fetch_ticksize(market_type).await
         }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_ticksize(market_type).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_ticksize(market_type).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_ticksize(market_type).await
-        }
+        Exchange::SSH | Exchange::SSZ => qmt::fetch_ticksize().await,
     }
 }
 
@@ -667,15 +600,7 @@ pub async fn fetch_ticker_prices(
         Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
             binance::fetch_ticker_prices(market_type).await
         }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_ticker_prices(market_type).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_ticker_prices(market_type).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_ticker_prices(market_type).await
-        }
+        Exchange::SSH | Exchange::SSZ => qmt::fetch_ticker_prices(market_type).await,
     }
 }
 
@@ -688,15 +613,7 @@ pub async fn fetch_klines(
         Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
             binance::fetch_klines(ticker_info, timeframe, range).await
         }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_klines(ticker_info, timeframe, range).await
-        }
+        Exchange::SSH | Exchange::SSZ => qmt::fetch_klines(ticker_info, timeframe, range).await,
     }
 }
 
@@ -708,12 +625,6 @@ pub async fn fetch_open_interest(
     match ticker.exchange {
         Exchange::BinanceLinear | Exchange::BinanceInverse => {
             binance::fetch_historical_oi(ticker, range, timeframe).await
-        }
-        Exchange::BybitLinear | Exchange::BybitInverse => {
-            bybit::fetch_historical_oi(ticker, range, timeframe).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse => {
-            okex::fetch_historical_oi(ticker, range, timeframe).await
         }
         _ => Err(AdapterError::InvalidRequest("Invalid exchange".to_string())),
     }

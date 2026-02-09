@@ -32,9 +32,7 @@ pub enum Icon {
     Cog,
     Link,
     BinanceLogo,
-    BybitLogo,
-    HyperliquidLogo,
-    OkexLogo,
+    StockLogo,
     Search,
     Sort,
     SortDesc,
@@ -67,10 +65,8 @@ impl From<Icon> for char {
             Icon::Close => '\u{E805}',
             Icon::Layout => '\u{E806}',
             Icon::Link => '\u{E807}',
-            Icon::BybitLogo => '\u{E808}',
             Icon::BinanceLogo => '\u{E809}',
-            Icon::HyperliquidLogo => '\u{E813}',
-            Icon::OkexLogo => '\u{E81F}',
+            Icon::StockLogo => '\u{E813}',
             Icon::Cog => '\u{E810}',
             Icon::Sort => '\u{F0DC}',
             Icon::SortDesc => '\u{F0DD}',
@@ -102,12 +98,10 @@ pub fn icon_text<'a>(icon: Icon, size: u16) -> Text<'a, Theme, Renderer> {
 
 pub fn exchange_icon(exchange: Exchange) -> Icon {
     match exchange {
-        Exchange::BybitInverse | Exchange::BybitLinear | Exchange::BybitSpot => Icon::BybitLogo,
         Exchange::BinanceInverse | Exchange::BinanceLinear | Exchange::BinanceSpot => {
             Icon::BinanceLogo
         }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => Icon::HyperliquidLogo,
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => Icon::OkexLogo,
+        Exchange::SSH | Exchange::SSZ => Icon::StockLogo,
     }
 }
 

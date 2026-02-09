@@ -49,7 +49,7 @@ pub fn volume_size_unit() -> SizeUnit {
 ///
 /// Maps user-selected update intervals to exchange-specific depth levels.
 /// Used for some exchanges that determine push frequency based on subscribed depth level
-/// (e.g., Bybit pushes every 300ms for 1000-level depth, 100ms for 200-level).
+/// (some adapters may map level/depth choices to server push cadence).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum PushFrequency {
     #[default]
@@ -77,6 +77,7 @@ impl std::fmt::Display for Timeframe {
                 Timeframe::MS300 => "300ms",
                 Timeframe::MS500 => "500ms",
                 Timeframe::MS1000 => "1s",
+                Timeframe::MS3000 => "3s",
                 Timeframe::M1 => "1m",
                 Timeframe::M3 => "3m",
                 Timeframe::M5 => "5m",
@@ -99,6 +100,7 @@ pub enum Timeframe {
     MS300,
     MS500,
     MS1000,
+    MS3000,
     M1,
     M3,
     M5,
@@ -125,12 +127,13 @@ impl Timeframe {
         Timeframe::D1,
     ];
 
-    pub const HEATMAP: [Timeframe; 5] = [
+    pub const HEATMAP: [Timeframe; 6] = [
         Timeframe::MS100,
         Timeframe::MS200,
         Timeframe::MS300,
         Timeframe::MS500,
         Timeframe::MS1000,
+        Timeframe::MS3000,
     ];
 
     /// # Panics
@@ -159,6 +162,7 @@ impl Timeframe {
             Timeframe::MS300 => 300,
             Timeframe::MS500 => 500,
             Timeframe::MS1000 => 1_000,
+            Timeframe::MS3000 => 3_000,
             _ => {
                 let minutes = self.to_minutes();
                 u64::from(minutes) * 60_000
@@ -215,14 +219,8 @@ impl SerTicker {
             Exchange::BinanceLinear => "BinanceLinear",
             Exchange::BinanceInverse => "BinanceInverse",
             Exchange::BinanceSpot => "BinanceSpot",
-            Exchange::BybitLinear => "BybitLinear",
-            Exchange::BybitInverse => "BybitInverse",
-            Exchange::BybitSpot => "BybitSpot",
-            Exchange::HyperliquidLinear => "HyperliquidLinear",
-            Exchange::HyperliquidSpot => "HyperliquidSpot",
-            Exchange::OkexLinear => "OkexLinear",
-            Exchange::OkexInverse => "OkexInverse",
-            Exchange::OkexSpot => "OkexSpot",
+            Exchange::SSH => "SSH",
+            Exchange::SSZ => "SSZ",
         }
     }
 
@@ -231,14 +229,8 @@ impl SerTicker {
             "BinanceLinear" => Ok(Exchange::BinanceLinear),
             "BinanceInverse" => Ok(Exchange::BinanceInverse),
             "BinanceSpot" => Ok(Exchange::BinanceSpot),
-            "BybitLinear" => Ok(Exchange::BybitLinear),
-            "BybitInverse" => Ok(Exchange::BybitInverse),
-            "BybitSpot" => Ok(Exchange::BybitSpot),
-            "HyperliquidLinear" => Ok(Exchange::HyperliquidLinear),
-            "HyperliquidSpot" => Ok(Exchange::HyperliquidSpot),
-            "OkexLinear" => Ok(Exchange::OkexLinear),
-            "OkexInverse" => Ok(Exchange::OkexInverse),
-            "OkexSpot" => Ok(Exchange::OkexSpot),
+            "SSH" => Ok(Exchange::SSH),
+            "SSZ" => Ok(Exchange::SSZ),
             _ => Err(format!("Unknown exchange: {}", s)),
         }
     }
@@ -293,8 +285,7 @@ impl fmt::Display for SerTicker {
 pub struct Ticker {
     bytes: [u8; Ticker::MAX_LEN as usize],
     pub exchange: Exchange,
-    // Optional display symbol for UI, mainly used for Hyperliquid spot markets
-    // to show "HYPEUSDC" instead of "@107"
+    // Optional display symbol for UI.
     display_bytes: [u8; Ticker::MAX_LEN as usize],
     has_display_symbol: bool,
 }
@@ -380,23 +371,7 @@ impl Ticker {
 
     pub fn display_symbol_and_type(&self) -> (String, MarketKind) {
         let market_kind = self.market_type();
-
-        let result = if self.has_display_symbol {
-            // Use the custom display symbol (e.g., "HYPEUSDC" for Hyperliquid spot)
-            self.display_as_str().to_owned()
-        } else {
-            let mut result = self.as_str().to_owned();
-            // Transform Hyperliquid symbols to standardized display format
-            if matches!(self.exchange, Exchange::HyperliquidLinear)
-                && market_kind == MarketKind::LinearPerps
-            {
-                // For Hyperliquid Linear Perps, append USDT to match other exchanges' format
-                // The "P" suffix will be added later in compute_display_data for all perpetual contracts
-                result.push_str("USDT");
-            }
-            result
-        };
-
+        let result = self.display_as_str().to_owned();
         (result, market_kind)
     }
 
@@ -652,14 +627,6 @@ where
 {
     let s: String = serde::Deserialize::deserialize(deserializer)?;
     s.parse::<f32>().map_err(serde::de::Error::custom)
-}
-
-fn de_string_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: String = serde::Deserialize::deserialize(deserializer)?;
-    s.parse::<u64>().map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

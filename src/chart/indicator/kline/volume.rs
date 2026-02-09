@@ -47,7 +47,7 @@ impl VolumeIndicator {
 
         let bar_kind = |&(buy, sell): &(f32, f32)| {
             if buy == -1.0 {
-                BarClass::Single // bybit workaround: single bar
+                BarClass::Single
             } else {
                 BarClass::Overlay {
                     overlay: buy - sell,

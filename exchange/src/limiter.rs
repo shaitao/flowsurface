@@ -200,10 +200,6 @@ impl FixedWindowBucket {
         Some(wait_time)
     }
 
-    pub fn consume_tokens(&mut self, tokens: usize) {
-        self.refill();
-        self.available_tokens -= tokens.min(self.available_tokens);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

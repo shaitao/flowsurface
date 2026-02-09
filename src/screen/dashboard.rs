@@ -20,8 +20,8 @@ use data::{
 use exchange::{
     Kline, PushFrequency, StreamPairKind, TickMultiplier, TickerInfo, Timeframe, Trade,
     adapter::{
-        self, AdapterError, Exchange, PersistStreamKind, ResolvedStream, StreamConfig, StreamKind,
-        StreamTicksize, UniqueStreams, binance, bybit, hyperliquid, okex,
+        self, Exchange, PersistStreamKind, ResolvedStream, StreamConfig, StreamKind,
+        StreamTicksize, UniqueStreams, binance, qmt,
     },
     depth::Depth,
     fetcher::{FetchRange, FetchedData},
@@ -29,14 +29,13 @@ use exchange::{
 
 use iced::{
     Element, Length, Subscription, Task, Vector,
-    task::{Straw, sipper},
     widget::{
         PaneGrid, center, container,
         pane_grid::{self, Configuration},
     },
 };
 use iced_futures::futures::TryFutureExt;
-use std::{collections::HashMap, path::PathBuf, time::Instant, vec};
+use std::{collections::HashMap, time::Instant, vec};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -1161,58 +1160,7 @@ fn request_fetch(
                 return oi_fetch_task(layout_id, pane_uid, stream, Some(req_id), Some((from, to)));
             }
         }
-        FetchRange::Trades(from_time, to_time) => {
-            let trade_info = state.streams.find_ready_map(|stream| {
-                if let StreamKind::DepthAndTrades { ticker_info, .. } = stream {
-                    Some((*ticker_info, pane_id, *stream))
-                } else {
-                    None
-                }
-            });
-
-            if let Some((ticker_info, pane_id, stream)) = trade_info {
-                let is_binance = matches!(
-                    ticker_info.exchange(),
-                    Exchange::BinanceSpot | Exchange::BinanceLinear | Exchange::BinanceInverse
-                );
-
-                if is_binance {
-                    let data_path = data::data_path(Some("market_data/binance/"));
-
-                    let (task, handle) = Task::sip(
-                        fetch_trades_batched(ticker_info, from_time, to_time, data_path),
-                        move |batch| {
-                            let data = FetchedData::Trades {
-                                batch,
-                                until_time: to_time,
-                            };
-                            Message::DistributeFetchedData {
-                                layout_id,
-                                pane_id,
-                                data,
-                                stream,
-                            }
-                        },
-                        move |result| match result {
-                            Ok(()) => Message::ChangePaneStatus(pane_id, pane::Status::Ready),
-                            Err(err) => Message::ErrorOccurred(
-                                Some(pane_id),
-                                DashboardError::Fetch(err.to_string()),
-                            ),
-                        },
-                    )
-                    .abortable();
-
-                    if let pane::Content::Kline { chart, .. } = &mut state.content
-                        && let Some(c) = chart
-                    {
-                        c.set_handle(handle.abort_on_drop());
-                    }
-
-                    return task;
-                }
-            }
-        }
+        FetchRange::Trades(_, _) => {}
     }
 
     Task::none()
@@ -1311,34 +1259,6 @@ fn kline_fetch_task(
     update_status.chain(fetch_task)
 }
 
-pub fn fetch_trades_batched(
-    ticker_info: TickerInfo,
-    from_time: u64,
-    to_time: u64,
-    data_path: PathBuf,
-) -> impl Straw<(), Vec<Trade>, AdapterError> {
-    sipper(async move |mut progress| {
-        let mut latest_trade_t = from_time;
-
-        while latest_trade_t < to_time {
-            match binance::fetch_trades(ticker_info, latest_trade_t, data_path.clone()).await {
-                Ok(batch) => {
-                    if batch.is_empty() {
-                        break;
-                    }
-
-                    latest_trade_t = batch.last().map_or(latest_trade_t, |trade| trade.time);
-
-                    let () = progress.send(batch).await;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(())
-    })
-}
-
 pub fn depth_subscription(
     ticker_info: TickerInfo,
     tick_mlpt: Option<TickMultiplier>,
@@ -1349,27 +1269,16 @@ pub fn depth_subscription(
     let config = StreamConfig::new(ticker_info, exchange, tick_mlpt, push_freq);
 
     match exchange {
-        Exchange::BinanceSpot | Exchange::BinanceInverse | Exchange::BinanceLinear => {
-            let builder = |cfg: &StreamConfig<TickerInfo>| {
-                binance::connect_market_stream(cfg.id, cfg.push_freq)
-            };
-            Subscription::run_with(config, builder)
-        }
-        Exchange::BybitSpot | Exchange::BybitLinear | Exchange::BybitInverse => {
-            let builder = |cfg: &StreamConfig<TickerInfo>| {
-                bybit::connect_market_stream(cfg.id, cfg.push_freq)
-            };
-            Subscription::run_with(config, builder)
-        }
-        Exchange::HyperliquidSpot | Exchange::HyperliquidLinear => {
-            let builder = |cfg: &StreamConfig<TickerInfo>| {
-                hyperliquid::connect_market_stream(cfg.id, cfg.tick_mltp, cfg.push_freq)
-            };
-            Subscription::run_with(config, builder)
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
+        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
             let builder =
-                |cfg: &StreamConfig<TickerInfo>| okex::connect_market_stream(cfg.id, cfg.push_freq);
+                |cfg: &StreamConfig<TickerInfo>| {
+                    binance::connect_market_stream(cfg.id, cfg.push_freq)
+                };
+            Subscription::run_with(config, builder)
+        }
+        Exchange::SSH | Exchange::SSZ => {
+            let builder =
+                |cfg: &StreamConfig<TickerInfo>| qmt::connect_market_stream(cfg.id, cfg.push_freq);
             Subscription::run_with(config, builder)
         }
     }
@@ -1381,27 +1290,15 @@ pub fn kline_subscription(
 ) -> Subscription<exchange::Event> {
     let config = StreamConfig::new(kline_subs, exchange, None, PushFrequency::ServerDefault);
     match exchange {
-        Exchange::BinanceSpot | Exchange::BinanceInverse | Exchange::BinanceLinear => {
+        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
             let builder = |cfg: &StreamConfig<Vec<(TickerInfo, Timeframe)>>| {
                 binance::connect_kline_stream(cfg.id.clone(), cfg.market_type)
             };
             Subscription::run_with(config, builder)
         }
-        Exchange::BybitSpot | Exchange::BybitInverse | Exchange::BybitLinear => {
+        Exchange::SSH | Exchange::SSZ => {
             let builder = |cfg: &StreamConfig<Vec<(TickerInfo, Timeframe)>>| {
-                bybit::connect_kline_stream(cfg.id.clone(), cfg.market_type)
-            };
-            Subscription::run_with(config, builder)
-        }
-        Exchange::HyperliquidSpot | Exchange::HyperliquidLinear => {
-            let builder = |cfg: &StreamConfig<Vec<(TickerInfo, Timeframe)>>| {
-                hyperliquid::connect_kline_stream(cfg.id.clone(), cfg.market_type)
-            };
-            Subscription::run_with(config, builder)
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            let builder = |cfg: &StreamConfig<Vec<(TickerInfo, Timeframe)>>| {
-                okex::connect_kline_stream(cfg.id.clone(), cfg.market_type)
+                qmt::connect_kline_stream(cfg.id.clone(), cfg.market_type)
             };
             Subscription::run_with(config, builder)
         }

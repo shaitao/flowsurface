@@ -532,6 +532,7 @@ impl canvas::Program<Message> for HeatmapChart {
 
                     if width > 0.001 {
                         let color_alpha = (visual_run.qty() / max_depth_qty).min(1.0);
+                        let color_alpha = color_alpha.powf(0.5);
 
                         frame.fill_rectangle(
                             Point::new(start_x, y_position - (cell_height / 2.0)),
