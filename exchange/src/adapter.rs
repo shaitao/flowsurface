@@ -1,120 +1,51 @@
 use super::{Ticker, Timeframe};
 use crate::{
     Kline, OpenInterest, Price, PushFrequency, TickMultiplier, TickerInfo, TickerStats, Trade,
-    depth::Depth,
+    depth::Depth, unit::Qty,
 };
 
 use enum_map::{Enum, EnumMap};
+use futures::SinkExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Instant};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 pub mod binance;
 pub mod qmt;
 
-/// Persisted stream resolution to avoid loop retries
-pub const RESOLVE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Buffer trades and flush in this interval
+const TRADE_BUCKET_INTERVAL: Duration = Duration::from_micros(33_333);
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ResolvedStream {
-    /// Streams that are persisted but needs to be resolved for use
-    Waiting {
-        streams: Vec<PersistStreamKind>,
-        last_attempt: Option<Instant>,
-    },
-    /// Streams that are active and ready to use, but can't persist
-    Ready(Vec<StreamKind>),
-}
+async fn flush_trade_buffers<V>(
+    output: &mut futures::channel::mpsc::Sender<Event>,
+    ticker_info_map: &FxHashMap<Ticker, (TickerInfo, V)>,
+    trade_buffers_map: &mut FxHashMap<Ticker, Vec<Trade>>,
+) {
+    let interval_ms = TRADE_BUCKET_INTERVAL.as_millis() as u64;
 
-impl ResolvedStream {
-    pub fn waiting(streams: Vec<PersistStreamKind>) -> Self {
-        ResolvedStream::Waiting {
-            streams,
-            last_attempt: None,
-        }
-    }
-
-    /// Returns streams to resolve only if the retry interval has elapsed
-    pub fn due_streams_to_resolve(&mut self, now: Instant) -> Option<Vec<PersistStreamKind>> {
-        let ResolvedStream::Waiting {
-            streams,
-            last_attempt,
-        } = self
-        else {
-            return None;
-        };
-
-        if streams.is_empty() {
-            return None;
+    for (ticker, trades_buffer) in trade_buffers_map.iter_mut() {
+        if trades_buffer.is_empty() {
+            continue;
         }
 
-        let should_retry = last_attempt
-            .map(|t| now.duration_since(t) >= RESOLVE_RETRY_INTERVAL)
-            .unwrap_or(true);
+        let bucket_update_t = trades_buffer
+            .iter()
+            .map(|t| t.time)
+            .max()
+            .map(|t| (t / interval_ms) * interval_ms);
 
-        if !should_retry {
-            return None;
-        }
-
-        *last_attempt = Some(now);
-        Some(streams.clone())
-    }
-
-    pub fn matches_stream(&self, stream: &StreamKind) -> bool {
-        match self {
-            ResolvedStream::Ready(existing) => existing.iter().any(|s| s == stream),
-            _ => false,
-        }
-    }
-
-    pub fn ready_iter_mut(&mut self) -> Option<impl Iterator<Item = &mut StreamKind>> {
-        match self {
-            ResolvedStream::Ready(streams) => Some(streams.iter_mut()),
-            _ => None,
-        }
-    }
-
-    pub fn ready_iter(&self) -> Option<impl Iterator<Item = &StreamKind>> {
-        match self {
-            ResolvedStream::Ready(streams) => Some(streams.iter()),
-            _ => None,
-        }
-    }
-
-    pub fn find_ready_map<F, T>(&self, f: F) -> Option<T>
-    where
-        F: FnMut(&StreamKind) -> Option<T>,
-    {
-        match self {
-            ResolvedStream::Ready(streams) => streams.iter().find_map(f),
-            _ => None,
-        }
-    }
-
-    pub fn into_waiting(self) -> Vec<PersistStreamKind> {
-        match self {
-            ResolvedStream::Waiting { streams, .. } => streams,
-            ResolvedStream::Ready(streams) => streams
-                .into_iter()
-                .map(|s| match s {
-                    StreamKind::DepthAndTrades {
-                        ticker_info,
-                        depth_aggr,
-                        push_freq,
-                    } => PersistStreamKind::DepthAndTrades(PersistDepth {
-                        ticker: ticker_info.ticker,
-                        depth_aggr,
-                        push_freq,
-                    }),
-                    StreamKind::Kline {
-                        ticker_info,
-                        timeframe,
-                    } => PersistStreamKind::Kline(PersistKline {
-                        ticker: ticker_info.ticker,
-                        timeframe,
-                    }),
-                })
-                .collect(),
+        if let Some((ticker_info, _)) = ticker_info_map.get(ticker)
+            && let Some(update_t) = bucket_update_t
+        {
+            let _ = output
+                .send(Event::TradesReceived(
+                    StreamKind::Trades {
+                        ticker_info: *ticker_info,
+                    },
+                    update_t,
+                    std::mem::take(trades_buffer).into_boxed_slice(),
+                ))
+                .await;
         }
     }
 }
@@ -122,7 +53,7 @@ impl ResolvedStream {
 #[derive(thiserror::Error, Debug)]
 pub enum AdapterError {
     #[error("{0}")]
-    FetchError(#[from] reqwest::Error),
+    FetchError(FetchError),
     #[error("Parsing: {0}")]
     ParseError(String),
     #[error("Stream: {0}")]
@@ -131,25 +62,157 @@ pub enum AdapterError {
     InvalidRequest(String),
 }
 
-impl AdapterError {
-    pub fn to_user_message(&self) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReqwestErrorKind {
+    Timeout,
+    Connect,
+    Decode,
+    Body,
+    Request,
+    Other,
+}
+
+impl ReqwestErrorKind {
+    fn from_error(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else if error.is_decode() {
+            Self::Decode
+        } else if error.is_body() {
+            Self::Body
+        } else if error.is_request() {
+            Self::Request
+        } else {
+            Self::Other
+        }
+    }
+
+    fn as_str(self) -> &'static str {
         match self {
-            AdapterError::InvalidRequest(err) => {
-                log::error!("Adapter invalid request: {err}");
-                "Invalid request made to the exchange. Check logs for details."
-            }
-            AdapterError::FetchError(err) => {
-                log::error!("Adapter fetch error: {err}");
-                "Network error while contacting the exchange."
-            }
-            AdapterError::ParseError(err) => {
-                log::error!("Adapter parse error: {err}");
-                "Unexpected response from the exchange. Check logs for details."
-            }
-            AdapterError::WebsocketError(err) => {
-                log::error!("Adapter websocket error: {err}");
-                "Realtime connection error. Trying to reconnect..."
-            }
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Decode => "decode",
+            Self::Body => "body",
+            Self::Request => "request",
+            Self::Other => "other",
+        }
+    }
+
+    fn ui_message(self) -> &'static str {
+        match self {
+            Self::Timeout => "Request timed out. Check logs for details.",
+            Self::Connect => "Connection failed. Check logs for details.",
+            Self::Decode | Self::Body => "Invalid server response. Check logs for details.",
+            Self::Request | Self::Other => "Request failed. Check logs for details.",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FetchError {
+    detail: String,
+    ui_message: &'static str,
+}
+
+impl FetchError {
+    fn from_reqwest_detail(error: &reqwest::Error, detail: String) -> Self {
+        let ui_message = ReqwestErrorKind::from_error(error).ui_message();
+
+        Self { detail, ui_message }
+    }
+
+    fn from_status_detail(status: reqwest::StatusCode, detail: String) -> Self {
+        let ui_message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            "Rate limited. Check logs for details."
+        } else if status.is_server_error() {
+            "Server error. Check logs for details."
+        } else if status.is_client_error() {
+            "Request was rejected. Check logs for details."
+        } else {
+            "Request failed. Check logs for details."
+        };
+
+        Self { detail, ui_message }
+    }
+
+    pub fn ui_message(&self) -> &'static str {
+        self.ui_message
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+fn format_reqwest_error(error: &reqwest::Error) -> String {
+    let kind = ReqwestErrorKind::from_error(error);
+    let mut details = vec![error.to_string(), format!("kind={}", kind.as_str())];
+
+    if let Some(status) = error.status() {
+        details.push(format!("status={status}"));
+    }
+
+    if let Some(url) = error.url() {
+        details.push(format!("url={url}"));
+    }
+
+    details.join(" | ")
+}
+
+impl From<reqwest::Error> for AdapterError {
+    fn from(error: reqwest::Error) -> Self {
+        let detail = format_reqwest_error(&error);
+        Self::FetchError(FetchError::from_reqwest_detail(&error, detail))
+    }
+}
+
+impl AdapterError {
+    pub(crate) fn request_failed(
+        method: &reqwest::Method,
+        url: &str,
+        error: reqwest::Error,
+    ) -> Self {
+        let detail = format!(
+            "{} {}: request failed | {}",
+            method,
+            url,
+            format_reqwest_error(&error)
+        );
+        Self::FetchError(FetchError::from_reqwest_detail(&error, detail))
+    }
+
+    pub(crate) fn response_body_failed(
+        method: &reqwest::Method,
+        url: &str,
+        status: reqwest::StatusCode,
+        content_type: &str,
+        error: reqwest::Error,
+    ) -> Self {
+        let detail = format!(
+            "{} {}: failed reading response body | status={} | content-type={} | {}",
+            method,
+            url,
+            status,
+            content_type,
+            format_reqwest_error(&error)
+        );
+        Self::FetchError(FetchError::from_reqwest_detail(&error, detail))
+    }
+
+    pub(crate) fn http_status_failed(status: reqwest::StatusCode, detail: String) -> Self {
+        Self::FetchError(FetchError::from_status_detail(status, detail))
+    }
+
+    pub fn ui_message(&self) -> String {
+        match self {
+            Self::FetchError(error) => error.ui_message().to_string(),
+            Self::ParseError(_) => "Invalid server response. Check logs for details.".to_string(),
+            Self::WebsocketError(_) => "Stream error. Check logs for details.".to_string(),
+            Self::InvalidRequest(message) => message.clone(),
         }
     }
 }
@@ -168,7 +231,9 @@ impl MarketKind {
         MarketKind::InversePerps,
     ];
 
-    pub fn qty_in_quote_value(&self, qty: f32, price: Price, size_in_quote_ccy: bool) -> f32 {
+    pub fn qty_in_quote_value(&self, qty: Qty, price: Price, size_in_quote_ccy: bool) -> f32 {
+        let qty = qty.to_f32_lossy();
+
         match self {
             MarketKind::InversePerps => qty,
             _ => {
@@ -196,17 +261,36 @@ impl std::fmt::Display for MarketKind {
     }
 }
 
+impl FromStr for MarketKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("spot") {
+            Ok(Self::Spot)
+        } else if s.eq_ignore_ascii_case("linear") {
+            Ok(Self::LinearPerps)
+        } else if s.eq_ignore_ascii_case("inverse") {
+            Ok(Self::InversePerps)
+        } else {
+            Err(format!("Invalid market kind: {}", s))
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum StreamKind {
     Kline {
         ticker_info: TickerInfo,
         timeframe: Timeframe,
     },
-    DepthAndTrades {
+    Depth {
         ticker_info: TickerInfo,
         #[serde(default = "default_depth_aggr")]
         depth_aggr: StreamTicksize,
         push_freq: PushFrequency,
+    },
+    Trades {
+        ticker_info: TickerInfo,
     },
 }
 
@@ -214,17 +298,25 @@ impl StreamKind {
     pub fn ticker_info(&self) -> TickerInfo {
         match self {
             StreamKind::Kline { ticker_info, .. }
-            | StreamKind::DepthAndTrades { ticker_info, .. } => *ticker_info,
+            | StreamKind::Depth { ticker_info, .. }
+            | StreamKind::Trades { ticker_info, .. } => *ticker_info,
         }
     }
 
     pub fn as_depth_stream(&self) -> Option<(TickerInfo, StreamTicksize, PushFrequency)> {
         match self {
-            StreamKind::DepthAndTrades {
+            StreamKind::Depth {
                 ticker_info,
                 depth_aggr,
                 push_freq,
             } => Some((*ticker_info, *depth_aggr, *push_freq)),
+            _ => None,
+        }
+    }
+
+    pub fn as_trade_stream(&self) -> Option<TickerInfo> {
+        match self {
+            StreamKind::Trades { ticker_info } => Some(*ticker_info),
             _ => None,
         }
     }
@@ -258,9 +350,8 @@ impl UniqueStreams {
     pub fn add(&mut self, stream: StreamKind) {
         let (exchange, ticker_info) = match stream {
             StreamKind::Kline { ticker_info, .. }
-            | StreamKind::DepthAndTrades { ticker_info, .. } => {
-                (ticker_info.exchange(), ticker_info)
-            }
+            | StreamKind::Depth { ticker_info, .. }
+            | StreamKind::Trades { ticker_info, .. } => (ticker_info.exchange(), ticker_info),
         };
 
         self.streams[exchange]
@@ -280,10 +371,12 @@ impl UniqueStreams {
 
     fn update_specs_for_exchange(&mut self, exchange: Exchange) {
         let depth_streams = self.depth_streams(Some(exchange));
+        let trade_streams = self.trade_streams(Some(exchange));
         let kline_streams = self.kline_streams(Some(exchange));
 
         self.specs[exchange] = Some(StreamSpecs {
             depth: depth_streams,
+            trade: trade_streams,
             kline: kline_streams,
         });
     }
@@ -319,6 +412,10 @@ impl UniqueStreams {
         self.streams(exchange_filter, |_, stream| stream.as_kline_stream())
     }
 
+    pub fn trade_streams(&self, exchange_filter: Option<Exchange>) -> Vec<TickerInfo> {
+        self.streams(exchange_filter, |_, stream| stream.as_trade_stream())
+    }
+
     pub fn combined_used(&self) -> impl Iterator<Item = (Exchange, &StreamSpecs)> {
         self.specs
             .iter()
@@ -327,75 +424,6 @@ impl UniqueStreams {
 
     pub fn combined(&self) -> &EnumMap<Exchange, Option<StreamSpecs>> {
         &self.specs
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub enum PersistStreamKind {
-    Kline(PersistKline),
-    DepthAndTrades(PersistDepth),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct PersistDepth {
-    pub ticker: Ticker,
-    #[serde(default = "default_depth_aggr")]
-    pub depth_aggr: StreamTicksize,
-    #[serde(default = "default_push_freq")]
-    pub push_freq: PushFrequency,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct PersistKline {
-    pub ticker: Ticker,
-    pub timeframe: Timeframe,
-}
-
-impl From<StreamKind> for PersistStreamKind {
-    fn from(s: StreamKind) -> Self {
-        match s {
-            StreamKind::Kline {
-                ticker_info,
-                timeframe,
-            } => PersistStreamKind::Kline(PersistKline {
-                ticker: ticker_info.ticker,
-                timeframe,
-            }),
-            StreamKind::DepthAndTrades {
-                ticker_info,
-                depth_aggr,
-                push_freq,
-            } => PersistStreamKind::DepthAndTrades(PersistDepth {
-                ticker: ticker_info.ticker,
-                depth_aggr,
-                push_freq,
-            }),
-        }
-    }
-}
-
-impl PersistStreamKind {
-    /// Try to convert into runtime StreamKind. `resolver` should return Some(TickerInfo) for a ticker string,
-    /// otherwise the conversion fails (so caller can trigger a refresh / fetch).
-    pub fn into_stream_kind<F>(self, mut resolver: F) -> Result<StreamKind, String>
-    where
-        F: FnMut(&Ticker) -> Option<TickerInfo>,
-    {
-        match self {
-            PersistStreamKind::Kline(k) => resolver(&k.ticker)
-                .map(|ti| StreamKind::Kline {
-                    ticker_info: ti,
-                    timeframe: k.timeframe,
-                })
-                .ok_or_else(|| format!("TickerInfo not found for {}", k.ticker)),
-            PersistStreamKind::DepthAndTrades(d) => resolver(&d.ticker)
-                .map(|ti| StreamKind::DepthAndTrades {
-                    ticker_info: ti,
-                    depth_aggr: d.depth_aggr,
-                    push_freq: d.push_freq,
-                })
-                .ok_or_else(|| format!("TickerInfo not found for {}", d.ticker)),
-        }
     }
 }
 
@@ -410,37 +438,54 @@ fn default_depth_aggr() -> StreamTicksize {
     StreamTicksize::Client
 }
 
-fn default_push_freq() -> PushFrequency {
-    PushFrequency::ServerDefault
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct StreamSpecs {
     pub depth: Vec<(TickerInfo, StreamTicksize, PushFrequency)>,
+    pub trade: Vec<TickerInfo>,
     pub kline: Vec<(TickerInfo, Timeframe)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum ExchangeInclusive {
+pub enum Venue {
     Binance,
     SSZ,
     SSH,
 }
 
-impl ExchangeInclusive {
-    pub const ALL: [ExchangeInclusive; 3] = [
-        ExchangeInclusive::Binance,
-        ExchangeInclusive::SSZ,
-        ExchangeInclusive::SSH,
+impl Venue {
+    pub const ALL: [Venue; 3] = [
+        Venue::Binance,
+        Venue::SSZ,
+        Venue::SSH,
     ];
+}
 
-    pub fn of(ex: Exchange) -> Self {
-        match ex {
-            Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-                Self::Binance
+impl std::fmt::Display for Venue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Venue::Binance => "Binance",
+                Venue::SSZ => "SSZ",
+                Venue::SSH => "SSH",
             }
-            Exchange::SSH => Self::SSH,
-            Exchange::SSZ => Self::SSZ,
+        )
+    }
+}
+
+impl FromStr for Venue {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("binance") {
+            Ok(Self::Binance)
+        } else if s.eq_ignore_ascii_case("ssz") {
+            Ok(Self::SSZ)
+        } else if s.eq_ignore_ascii_case("ssh") {
+            Ok(Self::SSH)
+        } else {
+            Err(format!("Invalid venue: {}", s))
         }
     }
 }
@@ -475,11 +520,11 @@ impl FromStr for Exchange {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "Binance Linear" => Ok(Exchange::BinanceLinear),
-            "Binance Inverse" => Ok(Exchange::BinanceInverse),
-            "Binance Spot" => Ok(Exchange::BinanceSpot),
-            "SSZ" => Ok(Exchange::SSZ),
-            "SSH" => Ok(Exchange::SSH),
+            "Binance Linear" | "BinanceLinear" => Ok(Exchange::BinanceLinear),
+            "Binance Inverse" | "BinanceInverse" => Ok(Exchange::BinanceInverse),
+            "Binance Spot" | "BinanceSpot" => Ok(Exchange::BinanceSpot),
+            "SSZ" | "SSZ Spot" | "SSZSpot" => Ok(Exchange::SSZ),
+            "SSH" | "SSH Spot" | "SSHSpot" => Ok(Exchange::SSH),
             _ => Err(format!("Invalid exchange: {}", s)),
         }
     }
@@ -494,11 +539,27 @@ impl Exchange {
         Exchange::SSH,
     ];
 
+    pub fn from_venue_and_market(venue: Venue, market: MarketKind) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|exchange| exchange.venue() == venue && exchange.market_type() == market)
+    }
+
     pub fn market_type(&self) -> MarketKind {
         match self {
             Exchange::BinanceLinear => MarketKind::LinearPerps,
             Exchange::BinanceInverse => MarketKind::InversePerps,
             Exchange::BinanceSpot | Exchange::SSZ | Exchange::SSH => MarketKind::Spot,
+        }
+    }
+
+    pub fn venue(&self) -> Venue {
+        match self {
+            Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
+                Venue::Binance
+            }
+            Exchange::SSZ => Venue::SSZ,
+            Exchange::SSH => Venue::SSH,
         }
     }
 
@@ -518,14 +579,16 @@ impl Exchange {
     }
 
     pub fn allowed_push_freqs(&self) -> &[PushFrequency] {
-        match self {
-            _ => &[PushFrequency::ServerDefault],
-        }
+        &[PushFrequency::ServerDefault]
     }
 
     pub fn supports_heatmap_timeframe(&self, _tf: Timeframe) -> bool {
-        match self {
-            _ => true,
+        true
+    }
+
+    pub fn supports_kline_timeframe(&self, tf: Timeframe) -> bool {
+        match self.venue() {
+            Venue::Binance | Venue::SSZ | Venue::SSH => Timeframe::KLINE.contains(&tf),
         }
     }
 
@@ -544,20 +607,34 @@ impl Exchange {
             StreamTicksize::ServerSide(multiplier.unwrap_or(server_fallback))
         }
     }
+
+    pub fn is_symbol_supported(&self, symbol: &str, log: bool) -> bool {
+        let valid_symbol = symbol
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+
+        if valid_symbol {
+            return true;
+        } else if log {
+            log::warn!("Unsupported ticker: '{}': {:?}", self, symbol,);
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum Event {
     Connected(Exchange),
     Disconnected(Exchange, String),
-    DepthReceived(StreamKind, u64, Arc<Depth>, Box<[Trade]>),
+    DepthReceived(StreamKind, u64, Arc<Depth>),
+    TradesReceived(StreamKind, u64, Box<[Trade]>),
     KlineReceived(StreamKind, Kline),
 }
 
 #[derive(Debug, Clone, Hash)]
 pub struct StreamConfig<I> {
     pub id: I,
-    pub market_type: MarketKind,
+    pub exchange: Exchange,
     pub tick_mltp: Option<TickMultiplier>,
     pub push_freq: PushFrequency,
 }
@@ -569,38 +646,48 @@ impl<I> StreamConfig<I> {
         tick_mltp: Option<TickMultiplier>,
         push_freq: PushFrequency,
     ) -> Self {
-        let market_type = exchange.market_type();
         Self {
             id,
-            market_type,
+            exchange,
             tick_mltp,
             push_freq,
         }
     }
 }
 
-pub async fn fetch_ticker_info(
-    exchange: Exchange,
+/// Returns a map of tickers to their [`TickerInfo`].
+/// If metadata for a ticker can't be fetched/parsed expectedly, it will still be included in the map as `None`.
+pub async fn fetch_ticker_metadata(
+    venue: Venue,
+    markets: &[MarketKind],
 ) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError> {
-    let market_type = exchange.market_type();
-    match exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_ticksize(market_type).await
+    match venue {
+        Venue::Binance => {
+            let mut out = HashMap::default();
+            for market in markets {
+                out.extend(binance::fetch_ticker_metadata(*market).await?);
+            }
+            Ok(out)
         }
-        Exchange::SSH | Exchange::SSZ => qmt::fetch_ticksize().await,
+        Venue::SSZ | Venue::SSH => qmt::fetch_ticker_metadata(venue).await,
     }
 }
 
-pub async fn fetch_ticker_prices(
-    exchange: Exchange,
+/// Returns a map of tickers to their [`TickerStats`].
+pub async fn fetch_ticker_stats(
+    venue: Venue,
+    markets: &[MarketKind],
+    contract_sizes: Option<HashMap<Ticker, f32>>,
 ) -> Result<HashMap<Ticker, TickerStats>, AdapterError> {
-    let market_type = exchange.market_type();
-
-    match exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_ticker_prices(market_type).await
+    match venue {
+        Venue::Binance => {
+            let mut out = HashMap::default();
+            for market in markets {
+                out.extend(binance::fetch_ticker_stats(*market, contract_sizes.as_ref()).await?);
+            }
+            Ok(out)
         }
-        Exchange::SSH | Exchange::SSZ => qmt::fetch_ticker_prices(market_type).await,
+        Venue::SSZ | Venue::SSH => qmt::fetch_ticker_stats(venue).await,
     }
 }
 
@@ -609,23 +696,25 @@ pub async fn fetch_klines(
     timeframe: Timeframe,
     range: Option<(u64, u64)>,
 ) -> Result<Vec<Kline>, AdapterError> {
-    match ticker_info.ticker.exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::SSH | Exchange::SSZ => qmt::fetch_klines(ticker_info, timeframe, range).await,
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => binance::fetch_klines(ticker_info, timeframe, range).await,
+        Venue::SSZ | Venue::SSH => qmt::fetch_klines(ticker_info, timeframe, range).await,
     }
 }
 
 pub async fn fetch_open_interest(
-    ticker: Ticker,
+    ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(u64, u64)>,
 ) -> Result<Vec<OpenInterest>, AdapterError> {
-    match ticker.exchange {
+    let exchange = ticker_info.ticker.exchange;
+
+    match exchange {
         Exchange::BinanceLinear | Exchange::BinanceInverse => {
-            binance::fetch_historical_oi(ticker, range, timeframe).await
+            binance::fetch_historical_oi(ticker_info, range, timeframe).await
         }
-        _ => Err(AdapterError::InvalidRequest("Invalid exchange".to_string())),
+        _ => Err(AdapterError::InvalidRequest(format!(
+            "Open interest data not available for {exchange}"
+        ))),
     }
 }

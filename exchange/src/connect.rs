@@ -1,7 +1,11 @@
-use crate::adapter::AdapterError;
+use crate::{
+    Event, TickerInfo, Timeframe,
+    adapter::{self, AdapterError, StreamConfig, Venue},
+};
 
 use bytes::Bytes;
 use fastwebsockets::FragmentCollector;
+use futures::{StreamExt, stream::BoxStream};
 use http_body_util::Empty;
 use hyper::{
     Request,
@@ -9,13 +13,12 @@ use hyper::{
     upgrade::Upgraded,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::{future::Future, sync::LazyLock, time::Duration};
 use tokio_rustls::{
     TlsConnector,
     rustls::{ClientConfig, OwnedTrustAnchor},
 };
 use url::Url;
-
-use std::{sync::LazyLock, time::Duration};
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -23,6 +26,43 @@ const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub static TLS_CONNECTOR: LazyLock<TlsConnector> =
     LazyLock::new(|| tls_connector().expect("failed to create TLS connector"));
+
+// Keep topics per websocket conservative across venues
+// allow up to 100 tickers per websocket stream
+pub const MAX_TRADE_TICKERS_PER_STREAM: usize = 100;
+pub const MAX_KLINE_STREAMS_PER_STREAM: usize = 100;
+
+pub fn depth_stream(config: &StreamConfig<TickerInfo>) -> BoxStream<'static, Event> {
+    let ticker = config.id;
+    let push_freq = config.push_freq;
+
+    match config.exchange.venue() {
+        Venue::Binance => adapter::binance::connect_depth_stream(ticker, push_freq).boxed(),
+        Venue::SSH | Venue::SSZ => adapter::qmt::connect_depth_stream(ticker, push_freq).boxed(),
+    }
+}
+
+pub fn trade_stream(config: &StreamConfig<Vec<TickerInfo>>) -> BoxStream<'static, Event> {
+    let tickers = config.id.clone();
+    let market_kind = config.exchange.market_type();
+
+    match config.exchange.venue() {
+        Venue::Binance => adapter::binance::connect_trade_stream(tickers, market_kind).boxed(),
+        Venue::SSH | Venue::SSZ => adapter::qmt::connect_trade_stream(tickers, market_kind).boxed(),
+    }
+}
+
+pub fn kline_stream(
+    config: &StreamConfig<Vec<(TickerInfo, Timeframe)>>,
+) -> BoxStream<'static, Event> {
+    let streams = config.id.clone();
+    let market_kind = config.exchange.market_type();
+
+    match config.exchange.venue() {
+        Venue::Binance => adapter::binance::connect_kline_stream(streams, market_kind).boxed(),
+        Venue::SSH | Venue::SSZ => adapter::qmt::connect_kline_stream(streams, market_kind).boxed(),
+    }
+}
 
 fn tls_connector() -> Result<TlsConnector, AdapterError> {
     let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
@@ -46,6 +86,19 @@ fn tls_connector() -> Result<TlsConnector, AdapterError> {
 pub enum State {
     Disconnected,
     Connected(FragmentCollector<TokioIo<Upgraded>>),
+}
+
+pub fn channel<T, Fut, F>(buffer: usize, f: F) -> impl futures::Stream<Item = T>
+where
+    T: Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+    F: FnOnce(futures::channel::mpsc::Sender<T>) -> Fut + Send + 'static,
+{
+    let (sender, receiver) = futures::channel::mpsc::channel(buffer);
+    tokio::spawn(async move {
+        f(sender).await;
+    });
+    receiver
 }
 
 pub async fn connect_ws(

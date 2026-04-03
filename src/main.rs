@@ -2,11 +2,14 @@
 
 mod audio;
 mod chart;
+mod connector;
 mod layout;
 mod logger;
 mod modal;
+mod notify;
 mod screen;
 mod style;
+mod version;
 mod widget;
 mod window;
 
@@ -19,6 +22,7 @@ use modal::{
     network_manager::{self, NetworkManager},
 };
 use modal::{dashboard_modal, main_dialog_modal};
+use notify::Notifications;
 use screen::dashboard::{self, Dashboard};
 use widget::{
     confirm_dialog_container,
@@ -69,7 +73,7 @@ struct Flowsurface {
     ui_scale_factor: data::ScaleFactor,
     timezone: data::UserTimezone,
     theme: data::Theme,
-    notifications: Vec<Toast>,
+    notifications: Notifications,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +92,7 @@ enum Message {
     SaveStateRequested(HashMap<window::Id, WindowSpec>),
     GoBack,
     DataFolderRequested,
+    OpenUrlRequested(Cow<'static, str>),
     ThemeSelected(data::Theme),
     ScaleFactorChanged(data::ScaleFactor),
     SetTimezone(data::UserTimezone),
@@ -131,7 +136,7 @@ impl Flowsurface {
             ui_scale_factor: saved_state.scale_factor,
             volume_size_unit: saved_state.volume_size_unit,
             theme: saved_state.theme,
-            notifications: vec![],
+            notifications: Notifications::new(),
             network: NetworkManager::new(saved_state.proxy_cfg),
         };
 
@@ -173,27 +178,25 @@ impl Flowsurface {
                     exchange::Event::Disconnected(exchange, reason) => {
                         log::info!("a stream disconnected from {exchange} WS: {reason:?}");
                     }
-                    exchange::Event::DepthReceived(
-                        stream,
-                        depth_update_t,
-                        depth,
-                        trades_buffer,
-                    ) => {
+                    exchange::Event::DepthReceived(stream, depth_update_t, depth) => {
                         let task = dashboard
-                            .update_depth_and_trades(
-                                &stream,
-                                depth_update_t,
-                                &depth,
-                                &trades_buffer,
-                                main_window_id,
-                            )
+                            .ingest_depth(&stream, depth_update_t, &depth, main_window_id)
                             .map(move |msg| Message::Dashboard {
                                 layout_id: None,
                                 event: msg,
                             });
 
-                        if let Some(msg) = self.audio_stream.try_play_sound(&stream, &trades_buffer)
-                        {
+                        return task;
+                    }
+                    exchange::Event::TradesReceived(stream, update_t, buffer) => {
+                        let task = dashboard
+                            .ingest_trades(&stream, &buffer, update_t, main_window_id)
+                            .map(move |msg| Message::Dashboard {
+                                layout_id: None,
+                                event: msg,
+                            });
+
+                        if let Some(msg) = self.audio_stream.try_play_sound(&stream, &buffer) {
                             self.notifications.push(Toast::error(msg));
                         }
 
@@ -322,9 +325,9 @@ impl Flowsurface {
                                         tickers_info.get(t).and_then(|opt| *opt)
                                     };
 
-                                    match persist.into_stream_kind(resolver) {
-                                        Ok(stream) => {
-                                            acc.push(stream);
+                                    match persist.into_stream_kinds(resolver) {
+                                        Ok(mut resolved) => {
+                                            acc.append(&mut resolved);
                                             Ok(acc)
                                         }
                                         Err(err) => Err(format!(
@@ -365,9 +368,7 @@ impl Flowsurface {
                 }
             }
             Message::RemoveNotification(index) => {
-                if index < self.notifications.len() {
-                    self.notifications.remove(index);
-                }
+                self.notifications.remove(index);
             }
             Message::SetTimezone(tz) => {
                 self.timezone = tz;
@@ -482,6 +483,12 @@ impl Flowsurface {
                 if let Err(err) = data::open_data_folder() {
                     self.notifications
                         .push(Toast::error(format!("Failed to open data folder: {err}")));
+                }
+            }
+            Message::OpenUrlRequested(url) => {
+                if let Err(err) = data::open_url(url.as_ref()) {
+                    self.notifications
+                        .push(Toast::error(format!("Failed to open link: {err}")));
                 }
             }
             Message::ThemeEditor(msg) => {
@@ -650,7 +657,7 @@ impl Flowsurface {
 
         toast::Manager::new(
             content,
-            &self.notifications,
+            self.notifications.toasts(),
             match sidebar_pos {
                 sidebar::Position::Left => Alignment::Start,
                 sidebar::Position::Right => Alignment::End,
@@ -685,7 +692,7 @@ impl Flowsurface {
             .market_subscriptions()
             .map(Message::MarketWsEvent);
 
-        let tick = iced::time::every(std::time::Duration::from_millis(100)).map(Message::Tick);
+        let tick = iced::window::frames().map(Message::Tick);
 
         let hotkeys = keyboard::listen().filter_map(|event| {
             let keyboard::Event::KeyPressed { key, .. } = event else {
@@ -824,7 +831,7 @@ impl Flowsurface {
                         )
                     };
 
-                    let sidebar_pos = pick_list(
+                    let sidebar_pos_picklist = pick_list(
                         [sidebar::Position::Left, sidebar::Position::Right],
                         Some(sidebar_pos),
                         |pos| {
@@ -863,7 +870,7 @@ impl Flowsurface {
                     };
 
                     let trade_fetch_checkbox = {
-                        let is_active = exchange::fetcher::is_trade_fetch_enabled();
+                        let is_active = connector::fetcher::is_trade_fetch_enabled();
 
                         let checkbox = iced::widget::checkbox(is_active)
                             .label("Fetch trades (Binance)")
@@ -898,9 +905,59 @@ impl Flowsurface {
                         )
                     };
 
+                    let version_info = {
+                        let (version_label, commit_label) = version::app_build_version_parts();
+
+                        let github_link_button = button(text(version_label).size(13))
+                            .padding(0)
+                            .style(style::button::text_link)
+                            .on_press(Message::OpenUrlRequested(Cow::Borrowed(
+                                version::GITHUB_REPOSITORY_URL,
+                            )));
+
+                        let github_button: Element<'_, Message> = iced::widget::tooltip(
+                            github_link_button,
+                            container(
+                                row![
+                                    text("GitHub"),
+                                    style::icon_text(style::Icon::ExternalLink, 12),
+                                ]
+                                .spacing(4)
+                                .align_y(Alignment::Center),
+                            )
+                            .style(style::tooltip)
+                            .padding(8),
+                            TooltipPosition::Top,
+                        )
+                        .into();
+
+                        if let (Some(commit_label), Some(commit_url)) =
+                            (commit_label, version::build_commit_url())
+                        {
+                            let commit_button = button(text(commit_label).size(11))
+                                .padding(0)
+                                .style(style::button::text_link_secondary)
+                                .on_press(Message::OpenUrlRequested(Cow::Owned(commit_url)));
+
+                            column![github_button, commit_button]
+                                .spacing(2)
+                                .align_x(Alignment::End)
+                                .into()
+                        } else {
+                            github_button
+                        }
+                    };
+
+                    let footer = column![
+                        container(version_info)
+                            .width(iced::Length::Fill)
+                            .align_x(Alignment::End),
+                    ]
+                    .spacing(8);
+
                     let column_content = split_column![
                         column![open_data_folder,].spacing(8),
-                        column![text("Sidebar position").size(14), sidebar_pos,].spacing(12),
+                        column![text("Sidebar position").size(14), sidebar_pos_picklist,].spacing(12),
                         column![text("Time zone").size(14), timezone_picklist,].spacing(12),
                         column![text("Market data").size(14), size_in_quote_currency_checkbox,].spacing(12),
                         column![text("Theme").size(14), theme_picklist,].spacing(12),
@@ -910,6 +967,7 @@ impl Flowsurface {
                             column![trade_fetch_checkbox, toggle_theme_editor, toggle_network_editor].spacing(8),
                         ]
                         .spacing(12),
+                        footer,
                         ; spacing = 16, align_x = Alignment::Start
                     ];
 
@@ -1071,12 +1129,12 @@ impl Flowsurface {
                     sidebar::Position::Right => (Alignment::End, padding::right(44).top(76)),
                 };
 
-                let depth_streams_list = dashboard.streams.depth_streams(None);
+                let trade_streams_list = dashboard.streams.trade_streams(None);
 
                 dashboard_modal(
                     base,
                     self.audio_stream
-                        .view(depth_streams_list)
+                        .view(trade_streams_list)
                         .map(Message::AudioStream),
                     Message::Sidebar(dashboard::sidebar::Message::ToggleSidebarMenu(None)),
                     padding,
@@ -1172,6 +1230,7 @@ impl Flowsurface {
             self.sidebar.state.clone(),
             self.ui_scale_factor,
             audio_cfg,
+            connector::fetcher::is_trade_fetch_enabled(),
             self.volume_size_unit,
             proxy_cfg_persisted,
         );

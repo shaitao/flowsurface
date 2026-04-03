@@ -5,6 +5,7 @@ pub mod config;
 pub mod layout;
 pub mod log;
 pub mod panel;
+pub mod stream;
 pub mod tickers_table;
 pub mod util;
 
@@ -114,6 +115,18 @@ pub fn open_data_folder() -> Result<(), InternalError> {
             "Data folder does not exist: {:?}",
             pathbuf
         )))
+    }
+}
+
+pub fn open_url(url: &str) -> Result<(), InternalError> {
+    if let Err(err) = open::that(url) {
+        Err(InternalError::Layout(format!(
+            "Failed to open URL '{}': {}",
+            url, err
+        )))
+    } else {
+        info!("Opened URL: {url}");
+        Ok(())
     }
 }
 
