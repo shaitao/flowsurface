@@ -25,6 +25,24 @@ use iced::{Alignment, Element, Point, Rectangle, Renderer, Size, Theme, Vector, 
 use enum_map::EnumMap;
 use std::time::Instant;
 
+fn filter_integrity_gaps_for_ticker(
+    ticker_info: TickerInfo,
+    timeframe: exchange::Timeframe,
+    missing_keys: &mut Vec<u64>,
+) {
+    if !matches!(
+        ticker_info.exchange().venue(),
+        exchange::adapter::Venue::SSH | exchange::adapter::Venue::SSZ
+    ) {
+        return;
+    }
+
+    let venue = ticker_info.exchange().venue();
+    missing_keys.retain(|timestamp| {
+        exchange::adapter::qmt::is_trading_bucket_start(venue, *timestamp, timeframe)
+    });
+}
+
 impl Chart for KlineChart {
     type IndicatorKind = KlineIndicator;
 
@@ -338,6 +356,14 @@ impl KlineChart {
     }
 
     fn fetch_missing_data(&mut self) -> Option<Action> {
+        let use_qmt_combined_history = matches!(self.kind, KlineChartKind::Footprint { .. })
+            && is_trade_fetch_enabled()
+            && matches!(
+                self.chart.ticker_info.exchange().venue(),
+                exchange::adapter::Venue::SSH | exchange::adapter::Venue::SSZ
+            );
+        let can_start_qmt_combined_request = !use_qmt_combined_history || !self.fetching_trades.0;
+
         match &self.data_source {
             PlotData::TimeBased(timeseries) => {
                 let timeframe_ms = timeseries.interval.to_milliseconds();
@@ -346,8 +372,17 @@ impl KlineChart {
                     let latest = chrono::Utc::now().timestamp_millis() as u64;
                     let earliest = latest.saturating_sub(450 * timeframe_ms);
 
-                    let range = FetchRange::Kline(earliest, latest);
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                    let range = if use_qmt_combined_history {
+                        FetchRange::KlineTrades(earliest, latest)
+                    } else {
+                        FetchRange::Kline(earliest, latest)
+                    };
+                    if can_start_qmt_combined_request
+                        && let Some(action) = request_fetch(&mut self.request_handler, range)
+                    {
+                        if use_qmt_combined_history {
+                            self.fetching_trades = (true, None);
+                        }
                         return Some(action);
                     }
                 }
@@ -357,25 +392,40 @@ impl KlineChart {
                 let visible_span = visible_latest.saturating_sub(visible_earliest);
                 let prefetch_earliest = visible_earliest.saturating_sub(visible_span);
 
-                // priority 1, initial klines for visible range
-                if visible_earliest < kline_earliest {
-                    let range = FetchRange::Kline(prefetch_earliest, kline_earliest);
-
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
-                        return Some(action);
-                    }
-                }
-
-                // priority 2, trades
+                // priority 1, trades for already loaded visible buckets.
+                // This is especially important for QMT footprint charts where
+                // older kline backfill can be slow or fail independently.
                 if let KlineChartKind::Footprint { .. } = self.kind
                     && !self.fetching_trades.0
                     && is_trade_fetch_enabled()
                     && let Some((fetch_from, fetch_to)) =
                         timeseries.suggest_trade_fetch_range(visible_earliest, visible_latest)
                 {
-                    let range = FetchRange::Trades(fetch_from, fetch_to);
+                    let range = if use_qmt_combined_history {
+                        FetchRange::KlineTrades(fetch_from, fetch_to)
+                    } else {
+                        FetchRange::Trades(fetch_from, fetch_to)
+                    };
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         self.fetching_trades = (true, None);
+                        return Some(action);
+                    }
+                }
+
+                // priority 2, initial klines for visible range
+                if visible_earliest < kline_earliest {
+                    let range = if use_qmt_combined_history {
+                        FetchRange::KlineTrades(prefetch_earliest, kline_earliest)
+                    } else {
+                        FetchRange::Kline(prefetch_earliest, kline_earliest)
+                    };
+
+                    if can_start_qmt_combined_request
+                        && let Some(action) = request_fetch(&mut self.request_handler, range)
+                    {
+                        if use_qmt_combined_history {
+                            self.fetching_trades = (true, None);
+                        }
                         return Some(action);
                     }
                 }
@@ -401,9 +451,18 @@ impl KlineChart {
                 let check_earliest = prefetch_earliest.max(kline_earliest);
                 let check_latest = visible_latest.saturating_add(timeframe_ms);
 
-                if let Some(missing_keys) =
+                if let Some(mut missing_keys) =
                     timeseries.check_kline_integrity(check_earliest, check_latest)
                 {
+                    filter_integrity_gaps_for_ticker(
+                        self.chart.ticker_info,
+                        timeseries.interval,
+                        &mut missing_keys,
+                    );
+                    if missing_keys.is_empty() {
+                        return None;
+                    }
+
                     let latest = missing_keys
                         .iter()
                         .max()
@@ -415,8 +474,17 @@ impl KlineChart {
                         .unwrap_or(&visible_earliest)
                         .saturating_sub(timeframe_ms);
 
-                    let range = FetchRange::Kline(earliest, latest);
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                    let range = if use_qmt_combined_history {
+                        FetchRange::KlineTrades(earliest, latest)
+                    } else {
+                        FetchRange::Kline(earliest, latest)
+                    };
+                    if can_start_qmt_combined_request
+                        && let Some(action) = request_fetch(&mut self.request_handler, range)
+                    {
+                        if use_qmt_combined_history {
+                            self.fetching_trades = (true, None);
+                        }
                         return Some(action);
                     }
                 }
@@ -601,6 +669,13 @@ impl KlineChart {
             }
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_trades_existing_buckets(buffer);
+
+                self.indicators
+                    .values_mut()
+                    .filter_map(Option::as_mut)
+                    .for_each(|indi| indi.rebuild_from_source(&self.data_source));
+
+                self.invalidate(None);
             }
         }
     }
@@ -615,14 +690,26 @@ impl KlineChart {
             }
         }
 
+        self.indicators
+            .values_mut()
+            .filter_map(Option::as_mut)
+            .for_each(|indi| indi.rebuild_from_source(&self.data_source));
+
         self.raw_trades.extend(raw_trades);
+
+        self.invalidate(None);
 
         if is_batches_done {
             self.fetching_trades = (false, None);
         }
     }
 
-    pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+    pub fn insert_hist_klines(
+        &mut self,
+        req_id: uuid::Uuid,
+        klines_raw: &[Kline],
+        is_batches_done: bool,
+    ) {
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_klines(klines_raw);
@@ -633,16 +720,31 @@ impl KlineChart {
                     .filter_map(Option::as_mut)
                     .for_each(|indi| indi.on_insert_klines(klines_raw));
 
-                if klines_raw.is_empty() {
-                    self.request_handler
-                        .mark_failed(req_id, "No data received".to_string());
-                } else {
-                    self.request_handler.mark_completed(req_id);
+                if let Some(latest_timestamp) = timeseries.latest_timestamp() {
+                    self.chart.latest_x = latest_timestamp;
+                }
+                if let Some(latest_kline) = timeseries.latest_kline() {
+                    self.chart.last_price =
+                        Some(PriceInfoLabel::new(latest_kline.close, latest_kline.open));
+                }
+
+                if is_batches_done {
+                    if klines_raw.is_empty() {
+                        self.request_handler
+                            .mark_failed(req_id, "No data received".to_string());
+                    } else {
+                        self.request_handler.mark_completed(req_id);
+                    }
                 }
                 self.invalidate(None);
             }
             PlotData::TickBased(_) => {}
         }
+    }
+
+    pub fn mark_request_failed(&mut self, req_id: uuid::Uuid, error: String) {
+        self.fetching_trades = (false, None);
+        self.request_handler.mark_failed(req_id, error);
     }
 
     pub fn insert_open_interest(&mut self, req_id: Option<uuid::Uuid>, oi_data: &[OIData]) {
@@ -1024,12 +1126,13 @@ fn draw_footprint_kline(
     x_position: f32,
     candle_width: f32,
     kline: &Kline,
+    _footprint: &KlineTrades,
     palette: &Extended,
 ) {
     let y_open = price_to_y(kline.open);
+    let y_close = price_to_y(kline.close);
     let y_high = price_to_y(kline.high);
     let y_low = price_to_y(kline.low);
-    let y_close = price_to_y(kline.close);
 
     let body_color = if kline.close >= kline.open {
         palette.success.weak.color
@@ -1468,6 +1571,7 @@ fn draw_clusters(
                 area.candle_center_x,
                 candle_width,
                 kline,
+                footprint,
                 palette,
             );
         }
@@ -1582,6 +1686,7 @@ fn draw_clusters(
                 area.candle_center_x,
                 candle_width,
                 kline,
+                footprint,
                 palette,
             );
         }

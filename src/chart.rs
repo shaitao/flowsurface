@@ -507,6 +507,7 @@ pub fn view<'a, T: Chart>(
         translation_x: state.translation.x,
         max: state.latest_x,
         basis: state.basis,
+        ticker_info: state.ticker_info,
         cell_width: state.cell_width,
         timezone,
         chart_bounds: state.bounds,
@@ -716,6 +717,11 @@ impl ViewState {
         interval_x >= region.x && interval_x <= region.x + region.width
     }
 
+    fn uses_gapless_time_axis(&self) -> bool {
+        matches!(self.basis, Basis::Time(_))
+            && exchange::adapter::qmt::uses_gapless_time_axis(self.ticker_info.exchange().venue())
+    }
+
     fn interval_range(&self, region: &Rectangle) -> (u64, u64) {
         match self.basis {
             Basis::Tick(_) => (
@@ -723,6 +729,28 @@ impl ViewState {
                 self.x_to_interval(region.x),
             ),
             Basis::Time(timeframe) => {
+                if self.uses_gapless_time_axis() {
+                    let left_offset = (region.x / self.cell_width).floor() as i64 - 1;
+                    let right_offset = ((region.x + region.width) / self.cell_width).ceil() as i64 + 1;
+
+                    let earliest = exchange::adapter::qmt::time_axis_bucket_at_offset(
+                        self.ticker_info.exchange().venue(),
+                        self.latest_x,
+                        timeframe,
+                        left_offset,
+                    )
+                    .unwrap_or(self.latest_x);
+                    let latest = exchange::adapter::qmt::time_axis_bucket_at_offset(
+                        self.ticker_info.exchange().venue(),
+                        self.latest_x,
+                        timeframe,
+                        right_offset,
+                    )
+                    .unwrap_or(self.latest_x);
+
+                    return (earliest.min(latest), earliest.max(latest));
+                }
+
                 let interval = timeframe.to_milliseconds();
                 (
                     self.x_to_interval(region.x).saturating_sub(interval / 2),
@@ -743,6 +771,17 @@ impl ViewState {
     fn interval_to_x(&self, value: u64) -> f32 {
         match self.basis {
             Basis::Time(timeframe) => {
+                if self.uses_gapless_time_axis()
+                    && let Some(offset) = exchange::adapter::qmt::time_axis_bucket_offset(
+                        self.ticker_info.exchange().venue(),
+                        self.latest_x,
+                        value,
+                        timeframe,
+                    )
+                {
+                    return (offset as f32) * self.cell_width;
+                }
+
                 let interval = timeframe.to_milliseconds() as f64;
                 let cell_width = f64::from(self.cell_width);
 
@@ -756,6 +795,17 @@ impl ViewState {
     fn x_to_interval(&self, x: f32) -> u64 {
         match self.basis {
             Basis::Time(timeframe) => {
+                if self.uses_gapless_time_axis() {
+                    let offset = (x / self.cell_width).round() as i64;
+                    return exchange::adapter::qmt::time_axis_bucket_at_offset(
+                        self.ticker_info.exchange().venue(),
+                        self.latest_x,
+                        timeframe,
+                        offset,
+                    )
+                    .unwrap_or(self.latest_x);
+                }
+
                 let interval = timeframe.to_milliseconds();
 
                 if x <= 0.0 {
@@ -845,11 +895,22 @@ impl ViewState {
             let pct_text = format!("{:.2}%", pct);
 
             let interval_diff: String = match self.basis {
-                Basis::Time(_) => {
+                Basis::Time(timeframe) => {
                     let (timestamp1, _) = self.snap_x_to_index(p1.x, bounds, region);
                     let (timestamp2, _) = self.snap_x_to_index(p2.x, bounds, region);
 
-                    let diff_ms: u64 = timestamp1.abs_diff(timestamp2);
+                    let diff_ms: u64 = if self.uses_gapless_time_axis() {
+                        exchange::adapter::qmt::time_axis_bucket_offset(
+                            self.ticker_info.exchange().venue(),
+                            timestamp1,
+                            timestamp2,
+                            timeframe,
+                        )
+                        .map(|offset| offset.unsigned_abs() * timeframe.to_milliseconds())
+                        .unwrap_or_else(|| timestamp1.abs_diff(timestamp2))
+                    } else {
+                        timestamp1.abs_diff(timestamp2)
+                    };
                     data::util::format_duration_ms(diff_ms)
                 }
                 Basis::Tick(_) => {
@@ -902,12 +963,23 @@ impl ViewState {
 
             let datapoints_text = match self.basis {
                 Basis::Time(timeframe) => {
-                    let interval_ms = timeframe.to_milliseconds();
                     let (timestamp1, _) = self.snap_x_to_index(p1.x, bounds, region);
                     let (timestamp2, _) = self.snap_x_to_index(p2.x, bounds, region);
 
-                    let diff_ms = timestamp1.abs_diff(timestamp2);
-                    let datapoints = (diff_ms / interval_ms).max(1);
+                    let datapoints = if self.uses_gapless_time_axis() {
+                        exchange::adapter::qmt::time_axis_bucket_offset(
+                            self.ticker_info.exchange().venue(),
+                            timestamp1,
+                            timestamp2,
+                            timeframe,
+                        )
+                        .map(|offset| offset.unsigned_abs().max(1))
+                        .unwrap_or_else(|| {
+                            (timestamp1.abs_diff(timestamp2) / timeframe.to_milliseconds()).max(1)
+                        })
+                    } else {
+                        (timestamp1.abs_diff(timestamp2) / timeframe.to_milliseconds()).max(1)
+                    };
                     format!("{} bars", datapoints)
                 }
                 Basis::Tick(aggregation) => {
@@ -1084,6 +1156,29 @@ impl ViewState {
 
         match self.basis {
             Basis::Time(timeframe) => {
+                if self.uses_gapless_time_axis() {
+                    let chart_x_min = region.x;
+                    let chart_x_max = region.x + region.width;
+                    let chart_x = chart_x_min + x_ratio * (chart_x_max - chart_x_min);
+                    let bucket_offset = (chart_x / self.cell_width).round() as i64;
+                    let snapped_x = (bucket_offset as f32) * self.cell_width;
+                    let snap_ratio = if chart_x_max - chart_x_min > 0.0 {
+                        (snapped_x - chart_x_min) / (chart_x_max - chart_x_min)
+                    } else {
+                        0.5
+                    };
+
+                    let timestamp = exchange::adapter::qmt::time_axis_bucket_at_offset(
+                        self.ticker_info.exchange().venue(),
+                        self.latest_x,
+                        timeframe,
+                        bucket_offset,
+                    )
+                    .unwrap_or(self.latest_x);
+
+                    return (timestamp, snap_ratio);
+                }
+
                 let interval = timeframe.to_milliseconds();
                 let earliest = self.x_to_interval(region.x) as f64;
                 let latest = self.x_to_interval(region.x + region.width) as f64;

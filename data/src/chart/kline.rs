@@ -241,6 +241,7 @@ impl KlineTrades {
         self.trades.clear();
         self.poc = None;
     }
+
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]

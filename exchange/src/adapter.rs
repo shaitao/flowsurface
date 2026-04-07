@@ -453,11 +453,7 @@ pub enum Venue {
 }
 
 impl Venue {
-    pub const ALL: [Venue; 3] = [
-        Venue::Binance,
-        Venue::SSZ,
-        Venue::SSH,
-    ];
+    pub const ALL: [Venue; 3] = [Venue::Binance, Venue::SSZ, Venue::SSH];
 }
 
 impl std::fmt::Display for Venue {
@@ -582,13 +578,23 @@ impl Exchange {
         &[PushFrequency::ServerDefault]
     }
 
-    pub fn supports_heatmap_timeframe(&self, _tf: Timeframe) -> bool {
-        true
+    pub fn supports_heatmap_timeframe(&self, tf: Timeframe) -> bool {
+        match self.venue() {
+            Venue::Binance => Timeframe::HEATMAP.contains(&tf),
+            Venue::SSZ | Venue::SSH => matches!(tf, Timeframe::MS3000),
+        }
+    }
+
+    pub fn supports_custom_minutes_timeframe(&self) -> bool {
+        matches!(self.venue(), Venue::SSZ | Venue::SSH)
     }
 
     pub fn supports_kline_timeframe(&self, tf: Timeframe) -> bool {
         match self.venue() {
-            Venue::Binance | Venue::SSZ | Venue::SSH => Timeframe::KLINE.contains(&tf),
+            Venue::Binance => Timeframe::KLINE.contains(&tf),
+            Venue::SSZ | Venue::SSH => {
+                matches!(tf, Timeframe::D1) || tf.to_milliseconds() >= 60_000
+            }
         }
     }
 
@@ -673,6 +679,19 @@ pub async fn fetch_ticker_metadata(
     }
 }
 
+pub async fn search_ticker_metadata(
+    venue: Venue,
+    query: &str,
+    limit: usize,
+) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError> {
+    match venue {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "On-demand ticker search is only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::search_ticker_metadata(venue, query, limit).await,
+    }
+}
+
 /// Returns a map of tickers to their [`TickerStats`].
 pub async fn fetch_ticker_stats(
     venue: Venue,
@@ -699,6 +718,32 @@ pub async fn fetch_klines(
     match ticker_info.ticker.exchange.venue() {
         Venue::Binance => binance::fetch_klines(ticker_info, timeframe, range).await,
         Venue::SSZ | Venue::SSH => qmt::fetch_klines(ticker_info, timeframe, range).await,
+    }
+}
+
+pub async fn fetch_klines_and_trades(
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    range: Option<(u64, u64)>,
+) -> Result<(Vec<Kline>, Vec<Trade>), AdapterError> {
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "Combined historical kline/trade fetch is only implemented for QMT venues"
+                .to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::fetch_klines_and_trades(ticker_info, timeframe, range).await,
+    }
+}
+
+pub async fn fetch_trades(
+    ticker_info: TickerInfo,
+    range: (u64, u64),
+) -> Result<Vec<Trade>, AdapterError> {
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "Generic historical trade fetch is only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::fetch_trades(ticker_info, range).await,
     }
 }
 

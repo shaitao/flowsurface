@@ -213,7 +213,11 @@ impl TimeSeries<KlineDataPoint> {
             tick_size: self.tick_size,
         };
 
-        new_series.insert_trades_or_create_bucket(trades);
+        if new_series.datapoints.is_empty() {
+            new_series.insert_trades_or_create_bucket(trades);
+        } else {
+            new_series.insert_trades_existing_buckets(trades);
+        }
         new_series
     }
 
@@ -280,11 +284,17 @@ impl TimeSeries<KlineDataPoint> {
         let mut updated_times: Vec<u64> = Vec::new();
 
         for trade in buffer {
-            let rounded_time = (trade.time / aggr_time) * aggr_time;
+            let Some((&bucket_time, _)) = self.datapoints.range(..=trade.time).next_back() else {
+                continue;
+            };
 
-            if let Some(entry) = self.datapoints.get_mut(&rounded_time) {
-                if !updated_times.contains(&rounded_time) {
-                    updated_times.push(rounded_time);
+            if trade.time >= bucket_time.saturating_add(aggr_time) {
+                continue;
+            }
+
+            if let Some(entry) = self.datapoints.get_mut(&bucket_time) {
+                if !updated_times.contains(&bucket_time) {
+                    updated_times.push(bucket_time);
                 }
                 entry.add_trade(trade, self.tick_size);
             }
@@ -371,7 +381,7 @@ impl TimeSeries<KlineDataPoint> {
             .datapoints
             .iter()
             .rev()
-            .find(|(_, dp)| dp.footprint.trades.is_empty())
+            .find(|(_, dp)| dp.footprint.trades.is_empty() && !dp.kline.volume.total().is_zero())
             .map(|(&time, _)| time);
 
         if let Some(target_time) = empty_kline_time {
@@ -462,5 +472,128 @@ impl From<&TimeSeries<KlineDataPoint>> for BTreeMap<u64, exchange::Volume> {
             .iter()
             .map(|(time, dp)| (*time, dp.kline.volume))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_trades_existing_buckets_respects_non_aligned_bucket_starts() {
+        let hour_ms = 3_600_000_u64;
+        let bucket_0930 = 34_200_000_u64;
+        let bucket_1030 = 37_800_000_u64;
+
+        let klines = vec![
+            Kline {
+                time: bucket_0930,
+                open: Price::from_f32(82.0),
+                high: Price::from_f32(82.2),
+                low: Price::from_f32(81.9),
+                close: Price::from_f32(82.1),
+                volume: Volume::empty_buy_sell(),
+            },
+            Kline {
+                time: bucket_1030,
+                open: Price::from_f32(82.1),
+                high: Price::from_f32(82.4),
+                low: Price::from_f32(82.0),
+                close: Price::from_f32(82.3),
+                volume: Volume::empty_buy_sell(),
+            },
+        ];
+
+        let mut timeseries = TimeSeries::<KlineDataPoint>::new(
+            Timeframe::H1,
+            PriceStep::from_f32(0.01),
+            &klines,
+        );
+
+        let trades = vec![
+            Trade {
+                time: bucket_0930 + 15 * 60_000,
+                is_sell: false,
+                price: Price::from_f32(82.05),
+                qty: Qty::from_f32(100.0),
+            },
+            Trade {
+                time: bucket_1030 + 15 * 60_000,
+                is_sell: true,
+                price: Price::from_f32(82.25),
+                qty: Qty::from_f32(200.0),
+            },
+        ];
+
+        timeseries.insert_trades_existing_buckets(&trades);
+
+        assert_eq!(
+            timeseries
+                .datapoints
+                .get(&bucket_0930)
+                .and_then(KlineDataPoint::first_trade_time),
+            Some(bucket_0930 + 15 * 60_000)
+        );
+        assert_eq!(
+            timeseries
+                .datapoints
+                .get(&bucket_1030)
+                .and_then(KlineDataPoint::first_trade_time),
+            Some(bucket_1030 + 15 * 60_000)
+        );
+
+        let unexpected_bucket = (bucket_0930 / hour_ms) * hour_ms;
+        if unexpected_bucket != bucket_0930 {
+            assert!(timeseries.datapoints.get(&unexpected_bucket).is_none());
+        }
+    }
+
+    #[test]
+    fn with_trades_uses_existing_buckets_when_klines_are_present() {
+        let bucket_0930 = 34_200_000_u64;
+        let bucket_1030 = 37_800_000_u64;
+
+        let klines = vec![
+            Kline {
+                time: bucket_0930,
+                open: Price::from_f32(82.0),
+                high: Price::from_f32(82.2),
+                low: Price::from_f32(81.9),
+                close: Price::from_f32(82.1),
+                volume: Volume::empty_buy_sell(),
+            },
+            Kline {
+                time: bucket_1030,
+                open: Price::from_f32(82.1),
+                high: Price::from_f32(82.4),
+                low: Price::from_f32(82.0),
+                close: Price::from_f32(82.3),
+                volume: Volume::empty_buy_sell(),
+            },
+        ];
+
+        let timeseries = TimeSeries::<KlineDataPoint>::new(
+            Timeframe::H1,
+            PriceStep::from_f32(0.01),
+            &klines,
+        );
+
+        let trades = vec![Trade {
+            time: bucket_0930 + 15 * 60_000,
+            is_sell: false,
+            price: Price::from_f32(82.05),
+            qty: Qty::from_f32(100.0),
+        }];
+
+        let with_trades = timeseries.with_trades(&trades);
+
+        assert_eq!(with_trades.datapoints.len(), 2);
+        assert_eq!(
+            with_trades
+                .datapoints
+                .get(&bucket_0930)
+                .and_then(KlineDataPoint::first_trade_time),
+            Some(bucket_0930 + 15 * 60_000)
+        );
     }
 }

@@ -59,17 +59,19 @@ where
             let size_task: Task<(Option<Point>, Option<Size>)> =
                 iced::window::size(window_id).map(|size| (None, Some(size)));
 
-            Task::batch(vec![pos_task, size_task])
-                .collect()
-                .map(move |results| {
-                    let position = results.iter().find_map(|(pos, _)| *pos);
-                    let size = results
-                        .iter()
-                        .find_map(|(_, size)| *size)
-                        .unwrap_or_else(|| Size::new(1024.0, 768.0));
+            Task::batch(vec![pos_task, size_task]).collect().map(move |results| {
+                let position = results.iter().find_map(|(pos, _)| *pos);
+                let size = results
+                    .iter()
+                    .find_map(|(_, size)| *size)
+                    .unwrap_or_else(|| Size::new(1024.0, 768.0));
 
-                    (window_id, (position, size))
-                })
+                let spec = position
+                    .map(|position| WindowSpec::from((&position, &size)))
+                    .filter(|spec| spec.is_restore_safe());
+
+                (window_id, spec)
+            })
         })
         .collect::<Vec<_>>();
 
@@ -79,9 +81,7 @@ where
         .map(move |results| {
             let specs: HashMap<window::Id, WindowSpec> = results
                 .into_iter()
-                .filter_map(|(id, (pos, size))| {
-                    pos.map(|position| (id, WindowSpec::from((&position, &size))))
-                })
+                .filter_map(|(id, spec)| spec.map(|spec| (id, spec)))
                 .collect();
 
             message(specs)

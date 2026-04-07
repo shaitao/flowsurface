@@ -235,7 +235,6 @@ impl FixedWindowBucket {
             .saturating_sub(Instant::now().duration_since(self.last_refill));
         Some(wait_time)
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

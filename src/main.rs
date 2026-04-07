@@ -356,6 +356,46 @@ impl Flowsurface {
                                 }
                             }
                         }
+                        Some(dashboard::Event::SyncTickerSearch(query)) => {
+                            let (task, action) =
+                                self.sidebar
+                                    .update(dashboard::sidebar::Message::TickersTable(
+                                        dashboard::tickers_table::Message::UpdateSearchQuery(query),
+                                    ));
+
+                            match action {
+                                Some(dashboard::sidebar::Action::TickerSelected(
+                                    ticker_info,
+                                    content,
+                                )) => {
+                                    let main_window_id = self.main_window.id;
+
+                                    if let Some(kind) = content {
+                                        return self
+                                            .active_dashboard_mut()
+                                            .init_focused_pane(main_window_id, ticker_info, kind)
+                                            .map(move |msg| Message::Dashboard {
+                                                layout_id: Some(layout_id),
+                                                event: msg,
+                                            });
+                                    }
+
+                                    return self
+                                        .active_dashboard_mut()
+                                        .switch_tickers_in_group(main_window_id, ticker_info)
+                                        .map(move |msg| Message::Dashboard {
+                                            layout_id: Some(layout_id),
+                                            event: msg,
+                                        });
+                                }
+                                Some(dashboard::sidebar::Action::ErrorOccurred(err)) => {
+                                    self.notifications.push(Toast::error(err.to_string()));
+                                }
+                                None => {}
+                            }
+
+                            task.map(Message::Sidebar)
+                        }
                         None => Task::none(),
                     };
 
@@ -873,7 +913,7 @@ impl Flowsurface {
                         let is_active = connector::fetcher::is_trade_fetch_enabled();
 
                         let checkbox = iced::widget::checkbox(is_active)
-                            .label("Fetch trades (Binance)")
+                            .label("Fetch trades")
                             .on_toggle(|checked| {
                                 if checked {
                                     let confirm_dialog = screen::ConfirmDialog::new(

@@ -7,6 +7,7 @@ use super::{Basis, Interaction, Message};
 use data::chart::Autoscale;
 use data::config::timezone::TimeLabelKind;
 use data::util::round_to_tick;
+use exchange::TickerInfo;
 use iced::{
     Alignment, Color, Event, Point, Rectangle, Renderer, Size, Theme, mouse,
     theme::palette::Extended,
@@ -230,6 +231,7 @@ pub struct AxisLabelsX<'a> {
     pub scaling: f32,
     pub translation_x: f32,
     pub basis: Basis,
+    pub ticker_info: TickerInfo,
     pub cell_width: f32,
     pub timezone: data::UserTimezone,
     pub chart_bounds: Rectangle,
@@ -249,6 +251,11 @@ impl AxisLabelsX<'_> {
         let cell_index = (crosshair_pos / self.cell_width).round();
 
         (crosshair_pos, crosshair_ratio as f32, cell_index as i32)
+    }
+
+    fn uses_gapless_time_axis(&self) -> bool {
+        matches!(self.basis, Basis::Time(_))
+            && exchange::adapter::qmt::uses_gapless_time_axis(self.ticker_info.exchange().venue())
     }
 
     fn generate_crosshair(
@@ -297,6 +304,41 @@ impl AxisLabelsX<'_> {
                 }
             }
             Basis::Time(timeframe) => {
+                if self.uses_gapless_time_axis() {
+                    let (crosshair_pos, _, _) = self.calc_crosshair_pos(cursor_pos, region);
+                    let chart_x_min = region.x;
+                    let chart_x_max = region.x + region.width;
+                    let bucket_offset = (crosshair_pos / self.cell_width).round() as i64;
+                    let snapped_position = (bucket_offset as f32) * self.cell_width;
+                    let snap_ratio = if (chart_x_max - chart_x_min).abs() < f32::EPSILON {
+                        0.5
+                    } else {
+                        (snapped_position - chart_x_min) / (chart_x_max - chart_x_min)
+                    };
+                    let snap_x = snap_ratio * bounds.width;
+
+                    if snap_x.is_nan() || snap_x < 0.0 || snap_x > bounds.width {
+                        return None;
+                    }
+
+                    let timestamp = exchange::adapter::qmt::time_axis_bucket_at_offset(
+                        self.ticker_info.exchange().venue(),
+                        self.max,
+                        timeframe,
+                        bucket_offset,
+                    )?;
+                    let label_content = self.timezone.format_with_kind(
+                        timestamp as i64,
+                        TimeLabelKind::Crosshair {
+                            show_millis: timeframe.to_milliseconds() < 10_000,
+                        },
+                    );
+
+                    if let Some(content) = label_content {
+                        return Some(AxisLabel::new_x(snap_x, content, bounds, true, palette));
+                    }
+                }
+
                 let (_, crosshair_ratio, _) = self.calc_crosshair_pos(cursor_pos, region);
 
                 let x_min = self.x_to_interval(region.x);
@@ -357,6 +399,17 @@ impl AxisLabelsX<'_> {
     fn x_to_interval(&self, x: f32) -> u64 {
         match self.basis {
             Basis::Time(timeframe) => {
+                if self.uses_gapless_time_axis() {
+                    let bucket_offset = (x / self.cell_width).round() as i64;
+                    return exchange::adapter::qmt::time_axis_bucket_at_offset(
+                        self.ticker_info.exchange().venue(),
+                        self.max,
+                        timeframe,
+                        bucket_offset,
+                    )
+                    .unwrap_or(self.max);
+                }
+
                 let interval = timeframe.to_milliseconds() as f64;
 
                 if x <= 0.0 {
@@ -511,20 +564,63 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                     }
                 }
                 Basis::Time(timeframe) => {
-                    let x_min_region = self.x_to_interval(region.x);
-                    let x_max_region = self.x_to_interval(region.x + region.width);
+                    if self.uses_gapless_time_axis() {
+                        let chart_x_min = region.x;
+                        let chart_x_max = region.x + region.width;
+                        let mut last_x: Option<f32> = None;
+                        let start_offset = (region.x / self.cell_width).floor() as i64 - 1;
+                        let end_offset = ((region.x + region.width) / self.cell_width).ceil() as i64 + 1;
 
-                    let generated_labels = timeseries::generate_time_labels(
-                        timeframe,
-                        self.timezone,
-                        bounds,
-                        x_min_region,
-                        x_max_region,
-                        label_count as i32,
-                        palette,
-                    );
+                        for bucket_offset in start_offset..=end_offset {
+                            let x_position = (bucket_offset as f32) * self.cell_width;
+                            let snap_ratio = if (chart_x_max - chart_x_min).abs() < f32::EPSILON {
+                                0.5
+                            } else {
+                                (x_position - chart_x_min) / (chart_x_max - chart_x_min)
+                            };
+                            let snap_x = snap_ratio * bounds.width;
 
-                    labels.extend(generated_labels);
+                            if last_x.is_some_and(|lx| (snap_x - lx).abs() < target_spacing) {
+                                continue;
+                            }
+
+                            let Some(timestamp) = exchange::adapter::qmt::time_axis_bucket_at_offset(
+                                self.ticker_info.exchange().venue(),
+                                self.max,
+                                timeframe,
+                                bucket_offset,
+                            ) else {
+                                continue;
+                            };
+
+                            let label_content = self.timezone.format_with_kind(
+                                timestamp as i64,
+                                TimeLabelKind::Axis { timeframe },
+                            );
+
+                            if let Some(content) = label_content {
+                                labels.push(AxisLabel::new_x(
+                                    snap_x, content, bounds, false, palette,
+                                ));
+                                last_x = Some(snap_x);
+                            }
+                        }
+                    } else {
+                        let x_min_region = self.x_to_interval(region.x);
+                        let x_max_region = self.x_to_interval(region.x + region.width);
+
+                        let generated_labels = timeseries::generate_time_labels(
+                            timeframe,
+                            self.timezone,
+                            bounds,
+                            x_min_region,
+                            x_max_region,
+                            label_count as i32,
+                            palette,
+                        );
+
+                        labels.extend(generated_labels);
+                    }
                 }
             }
 

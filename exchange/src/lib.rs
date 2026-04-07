@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod aggregation;
 pub mod connect;
 pub mod depth;
 mod limiter;
@@ -41,28 +42,25 @@ impl std::fmt::Display for PushFrequency {
 
 impl std::fmt::Display for Timeframe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Timeframe::MS100 => "100ms",
-                Timeframe::MS200 => "200ms",
-                Timeframe::MS300 => "300ms",
-                Timeframe::MS500 => "500ms",
-                Timeframe::MS1000 => "1s",
-                Timeframe::MS3000 => "3s",
-                Timeframe::M1 => "1m",
-                Timeframe::M3 => "3m",
-                Timeframe::M5 => "5m",
-                Timeframe::M15 => "15m",
-                Timeframe::M30 => "30m",
-                Timeframe::H1 => "1h",
-                Timeframe::H2 => "2h",
-                Timeframe::H4 => "4h",
-                Timeframe::H12 => "12h",
-                Timeframe::D1 => "1d",
-            }
-        )
+        match self {
+            Timeframe::MS100 => write!(f, "100ms"),
+            Timeframe::MS200 => write!(f, "200ms"),
+            Timeframe::MS300 => write!(f, "300ms"),
+            Timeframe::MS500 => write!(f, "500ms"),
+            Timeframe::MS1000 => write!(f, "1s"),
+            Timeframe::MS3000 => write!(f, "3s"),
+            Timeframe::M1 => write!(f, "1m"),
+            Timeframe::M3 => write!(f, "3m"),
+            Timeframe::M5 => write!(f, "5m"),
+            Timeframe::M15 => write!(f, "15m"),
+            Timeframe::M30 => write!(f, "30m"),
+            Timeframe::H1 => write!(f, "1h"),
+            Timeframe::H2 => write!(f, "2h"),
+            Timeframe::H4 => write!(f, "4h"),
+            Timeframe::H12 => write!(f, "12h"),
+            Timeframe::D1 => write!(f, "1d"),
+            Timeframe::CustomMinutes(minutes) => write!(f, "{minutes}m"),
+        }
     }
 }
 
@@ -84,6 +82,7 @@ pub enum Timeframe {
     H4,
     H12,
     D1,
+    CustomMinutes(u16),
 }
 
 impl Timeframe {
@@ -109,6 +108,9 @@ impl Timeframe {
         Timeframe::MS3000,
     ];
 
+    pub const CUSTOM_MINUTES_MIN: u16 = 1;
+    pub const CUSTOM_MINUTES_MAX: u16 = 720;
+
     /// # Panics
     ///
     /// Will panic if the `Timeframe` is not one of the defined variants
@@ -124,6 +126,7 @@ impl Timeframe {
             Timeframe::H4 => 240,
             Timeframe::H12 => 720,
             Timeframe::D1 => 1440,
+            Timeframe::CustomMinutes(minutes) => minutes,
             _ => panic!("Invalid timeframe: {:?}", self),
         }
     }
@@ -141,6 +144,28 @@ impl Timeframe {
                 u64::from(minutes) * 60_000
             }
         }
+    }
+
+    pub fn from_minutes(minutes: u16) -> Option<Self> {
+        match minutes {
+            1 => Some(Timeframe::M1),
+            3 => Some(Timeframe::M3),
+            5 => Some(Timeframe::M5),
+            15 => Some(Timeframe::M15),
+            30 => Some(Timeframe::M30),
+            60 => Some(Timeframe::H1),
+            120 => Some(Timeframe::H2),
+            240 => Some(Timeframe::H4),
+            720 => Some(Timeframe::H12),
+            Self::CUSTOM_MINUTES_MIN..=Self::CUSTOM_MINUTES_MAX => {
+                Some(Timeframe::CustomMinutes(minutes))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_custom_minutes(self) -> bool {
+        matches!(self, Timeframe::CustomMinutes(_))
     }
 }
 

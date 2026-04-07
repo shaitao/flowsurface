@@ -102,7 +102,10 @@ impl OpenInterestIndicator {
     }
 
     pub fn is_supported_timeframe(timeframe: Timeframe) -> bool {
-        timeframe >= Timeframe::M5 && timeframe <= Timeframe::H4 && timeframe != Timeframe::H2
+        matches!(
+            timeframe,
+            Timeframe::M5 | Timeframe::M15 | Timeframe::M30 | Timeframe::H1 | Timeframe::H4
+        )
     }
 }
 
