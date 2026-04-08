@@ -17,8 +17,8 @@ pub enum TimeLabelKind<'a> {
     /// `HH:MM`, `MM:SS`, or `D` style based on the timeframe.
     Axis { timeframe: exchange::Timeframe },
     /// Formatting for the crosshair tooltip.
-    /// Sub-10-second intervals will show `HH:MM:SS.mmm`,
-    /// while larger intervals will show `Day Mon D HH:MM`.
+    /// Sub-10-second intervals will show `YYYY-MM-DD HH:MM:SS.mmm`,
+    /// while larger intervals will show `YYYY-MM-DD HH:MM`.
     Crosshair { show_millis: bool },
     /// Arbitrary formatting using the given `chrono` specifier string.
     Custom(&'a str),
@@ -41,9 +41,9 @@ impl UserTimezone {
                 }
                 TimeLabelKind::Crosshair { show_millis } => {
                     if show_millis {
-                        time_with_zone.format("%H:%M:%S.%3f").to_string()
+                        time_with_zone.format("%Y-%m-%d %H:%M:%S.%3f").to_string()
                     } else {
-                        time_with_zone.format("%a %b %-d %H:%M").to_string()
+                        time_with_zone.format("%Y-%m-%d %H:%M").to_string()
                     }
                 }
                 TimeLabelKind::Custom(fmt) => time_with_zone.format(fmt).to_string(),

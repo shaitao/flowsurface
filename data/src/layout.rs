@@ -67,3 +67,19 @@ impl From<(&iced_core::Point, &iced_core::Size)> for WindowSpec {
         }
     }
 }
+
+impl WindowSpec {
+    const MIN_VALID_DIMENSION: f32 = 64.0;
+    const MINIMIZED_SENTINEL_THRESHOLD: f32 = -30_000.0;
+
+    pub fn is_restore_safe(&self) -> bool {
+        self.width.is_finite()
+            && self.height.is_finite()
+            && self.pos_x.is_finite()
+            && self.pos_y.is_finite()
+            && self.width >= Self::MIN_VALID_DIMENSION
+            && self.height >= Self::MIN_VALID_DIMENSION
+            && self.pos_x > Self::MINIMIZED_SENTINEL_THRESHOLD
+            && self.pos_y > Self::MINIMIZED_SENTINEL_THRESHOLD
+    }
+}

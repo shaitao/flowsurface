@@ -12,6 +12,7 @@ pub enum RowSelection {
 
 pub enum Action {
     RowSelected(RowSelection),
+    SearchChanged(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,7 +46,10 @@ impl MiniPanel {
 
     pub fn update(&mut self, message: Message) -> Option<Action> {
         match message {
-            Message::SearchChanged(q) => self.search_query = q.to_uppercase(),
+            Message::SearchChanged(q) => {
+                self.search_query = q.to_uppercase();
+                return Some(Action::SearchChanged(self.search_query.clone()));
+            }
             Message::RowSelected(t) => {
                 return Some(Action::RowSelected(t));
             }

@@ -6,7 +6,7 @@ use crate::{
 use data::chart::Basis;
 use exchange::{
     StreamPairKind, TickMultiplier, Timeframe,
-    adapter::{Exchange, hyperliquid::allowed_multipliers_for_min_tick},
+    adapter::Exchange,
     unit::{MinTicksize, PriceStep},
 };
 use iced::{
@@ -24,6 +24,9 @@ const TICK_COUNT_MAX: u16 = 1000;
 
 const TICK_MULTIPLIER_MIN: u16 = 1;
 const TICK_MULTIPLIER_MAX: u16 = 2000;
+
+const CUSTOM_TIMEFRAME_MINUTES_MIN: u16 = Timeframe::CUSTOM_MINUTES_MIN;
+const CUSTOM_TIMEFRAME_MINUTES_MAX: u16 = Timeframe::CUSTOM_MINUTES_MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub enum ModifierKind {
@@ -97,6 +100,16 @@ impl NumericInput {
             .and_then(|s| s.parse::<u16>().ok())
             .map(data::aggr::TickCount)
     }
+
+    pub fn parse_timeframe(self) -> Option<Timeframe> {
+        if self.len == 0 {
+            return None;
+        }
+        std::str::from_utf8(&self.buffer[..self.len as usize])
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .and_then(Timeframe::from_minutes)
+    }
 }
 
 impl Default for NumericInput {
@@ -117,7 +130,11 @@ pub enum ViewMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum SelectedTab {
-    Timeframe,
+    Timeframe {
+        raw_input_buf: NumericInput,
+        parsed_input: Option<Timeframe>,
+        is_input_valid: bool,
+    },
     TickCount {
         raw_input_buf: NumericInput,
         parsed_input: Option<data::aggr::TickCount>,
@@ -138,6 +155,7 @@ pub enum Message {
     TicksizeInputChanged(String),
     TicksizeSelected(TickMultiplier),
     TickCountInputChanged(String),
+    TimeframeInputChanged(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -230,7 +248,30 @@ impl Modifier {
         match message {
             Message::TabSelected(tab) => Some(Action::TabSelected(tab)),
             Message::BasisSelected(basis) => match basis {
-                Basis::Time(_) => Some(Action::BasisSelected(basis)),
+                Basis::Time(new_tf) => {
+                    if let SelectedTab::Timeframe {
+                        raw_input_buf,
+                        parsed_input,
+                        is_input_valid,
+                    } = &mut self.tab
+                    {
+                        if *parsed_input == Some(new_tf) {
+                            *is_input_valid = true;
+                        } else {
+                            *raw_input_buf = NumericInput::default();
+                            *parsed_input = None;
+                            *is_input_valid = true;
+                        }
+
+                        if new_tf.is_custom_minutes() {
+                            *raw_input_buf =
+                                NumericInput::from_str(&new_tf.to_minutes().to_string());
+                            *parsed_input = Some(new_tf);
+                        }
+                    }
+
+                    Some(Action::BasisSelected(basis))
+                }
                 Basis::Tick(new_tc) => {
                     if let SelectedTab::TickCount {
                         raw_input_buf,
@@ -326,6 +367,37 @@ impl Modifier {
                 }
                 None
             }
+            Message::TimeframeInputChanged(value_str) => {
+                if let SelectedTab::Timeframe {
+                    ref mut raw_input_buf,
+                    ref mut parsed_input,
+                    ref mut is_input_valid,
+                } = self.tab
+                {
+                    let numeric_value_str: String =
+                        value_str.chars().filter(char::is_ascii_digit).collect();
+
+                    *raw_input_buf = NumericInput::from_str(&numeric_value_str);
+                    *parsed_input = raw_input_buf.parse_timeframe();
+
+                    if raw_input_buf.is_empty() {
+                        *is_input_valid = true;
+                    } else {
+                        match parsed_input {
+                            Some(tf) => {
+                                let minutes = tf.to_minutes();
+                                *is_input_valid = (CUSTOM_TIMEFRAME_MINUTES_MIN
+                                    ..=CUSTOM_TIMEFRAME_MINUTES_MAX)
+                                    .contains(&minutes);
+                            }
+                            None => {
+                                *is_input_valid = false;
+                            }
+                        }
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -369,7 +441,7 @@ impl Modifier {
 
                 if selected_basis.is_some() {
                     let (timeframe_tab_is_selected, tick_count_tab_is_selected) = match self.tab {
-                        SelectedTab::Timeframe => (true, false),
+                        SelectedTab::Timeframe { .. } => (true, false),
                         SelectedTab::TickCount { .. } => (false, true),
                     };
 
@@ -411,7 +483,23 @@ impl Modifier {
                                     if timeframe_tab_is_selected {
                                         None
                                     } else {
-                                        Some(Message::TabSelected(SelectedTab::Timeframe))
+                                        let timeframe_tab = match self.tab {
+                                            SelectedTab::Timeframe {
+                                                raw_input_buf,
+                                                parsed_input,
+                                                is_input_valid,
+                                            } => SelectedTab::Timeframe {
+                                                raw_input_buf,
+                                                parsed_input,
+                                                is_input_valid,
+                                            },
+                                            _ => SelectedTab::Timeframe {
+                                                raw_input_buf: NumericInput::default(),
+                                                parsed_input: None,
+                                                is_input_valid: true,
+                                            },
+                                        };
+                                        Some(Message::TabSelected(timeframe_tab))
                                     },
                                     !timeframe_tab_is_selected,
                                     is_timeframe_selected,
@@ -459,7 +547,11 @@ impl Modifier {
                 }
 
                 match self.tab {
-                    SelectedTab::Timeframe => {
+                    SelectedTab::Timeframe {
+                        raw_input_buf,
+                        parsed_input,
+                        is_input_valid,
+                    } => {
                         let selected_tf = match selected_basis {
                             Some(Basis::Time(tf)) => Some(tf),
                             _ => None,
@@ -476,6 +568,29 @@ impl Modifier {
                                 items_per_row,
                             );
                             basis_selection_column = basis_selection_column.push(timeframe_grid);
+                        }
+
+                        if supports_custom_kline_minutes(kind, stream_pair.as_ref()) {
+                            let timeframe_to_submit = parsed_input.filter(|tf| {
+                                let minutes = tf.to_minutes();
+                                (CUSTOM_TIMEFRAME_MINUTES_MIN..=CUSTOM_TIMEFRAME_MINUTES_MAX)
+                                    .contains(&minutes)
+                            });
+
+                            let custom_input = numeric_input_box::<_, Message>(
+                                "Custom minutes: ",
+                                &format!(
+                                    "{}-{}",
+                                    CUSTOM_TIMEFRAME_MINUTES_MIN, CUSTOM_TIMEFRAME_MINUTES_MAX
+                                ),
+                                &raw_input_buf.to_display_string(),
+                                is_input_valid,
+                                Message::TimeframeInputChanged,
+                                timeframe_to_submit
+                                    .map(|tf| Message::BasisSelected(Basis::Time(tf))),
+                            );
+
+                            basis_selection_column = basis_selection_column.push(custom_input);
                         }
                     }
                     SelectedTab::TickCount {
@@ -552,13 +667,8 @@ impl Modifier {
                     let allowed_tm = if allows_custom_tsizes {
                         exchange::TickMultiplier::ALL.to_vec()
                     } else if let Some(min_tick) = self.min_ticksize {
-                        let allow = allowed_multipliers_for_min_tick(min_tick);
-
-                        exchange::TickMultiplier::ALL
-                            .iter()
-                            .copied()
-                            .filter(|tm| allow.contains(&tm.0))
-                            .collect()
+                        let _ = min_tick;
+                        exchange::TickMultiplier::ALL.iter().copied().collect()
                     } else {
                         vec![]
                     };
@@ -722,6 +832,25 @@ fn supported_kline_timeframes(stream_pair: Option<&StreamPairKind>) -> Vec<Timef
         .collect()
 }
 
+fn supports_custom_kline_minutes(kind: ModifierKind, stream_pair: Option<&StreamPairKind>) -> bool {
+    if !matches!(
+        kind,
+        ModifierKind::Candlestick(_) | ModifierKind::Footprint(_, _) | ModifierKind::Comparison(_)
+    ) {
+        return false;
+    }
+
+    match stream_pair {
+        Some(StreamPairKind::SingleSource(ticker_info)) => {
+            ticker_info.exchange().supports_custom_minutes_timeframe()
+        }
+        Some(StreamPairKind::MultiSource(ticker_infos)) if !ticker_infos.is_empty() => ticker_infos
+            .iter()
+            .all(|ticker_info| ticker_info.exchange().supports_custom_minutes_timeframe()),
+        _ => false,
+    }
+}
+
 fn supported_heatmap_timeframes(stream_pair: Option<&StreamPairKind>) -> Option<Vec<Timeframe>> {
     let ticker = match stream_pair {
         Some(StreamPairKind::SingleSource(ticker_info)) => Some(*ticker_info),
@@ -746,7 +875,19 @@ impl From<&ModifierKind> for SelectedTab {
             | ModifierKind::Heatmap(basis, _)
             | ModifierKind::Orderbook(basis, _)
             | ModifierKind::Comparison(basis) => match basis {
-                Basis::Time(_) => SelectedTab::Timeframe,
+                Basis::Time(tf) => SelectedTab::Timeframe {
+                    raw_input_buf: if tf.is_custom_minutes() {
+                        NumericInput::from_str(&tf.to_minutes().to_string())
+                    } else {
+                        NumericInput::default()
+                    },
+                    parsed_input: if tf.is_custom_minutes() {
+                        Some(*tf)
+                    } else {
+                        None
+                    },
+                    is_input_valid: true,
+                },
                 Basis::Tick(tc) => SelectedTab::TickCount {
                     raw_input_buf: if tc.is_custom() {
                         NumericInput::from_tick_count(*tc)
