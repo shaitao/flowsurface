@@ -1,5 +1,4 @@
 pub mod adapter;
-pub mod aggregation;
 pub mod connect;
 pub mod depth;
 mod limiter;
@@ -23,7 +22,7 @@ use std::{fmt, hash::Hash};
 ///
 /// Maps user-selected update intervals to exchange-specific depth levels.
 /// Used for some exchanges that determine push frequency based on subscribed depth level
-/// (some adapters may map level/depth choices to server push cadence).
+/// (e.g., Bybit pushes every 300ms for 1000-level depth, 100ms for 200-level).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum PushFrequency {
     #[default]
@@ -42,25 +41,27 @@ impl std::fmt::Display for PushFrequency {
 
 impl std::fmt::Display for Timeframe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Timeframe::MS100 => write!(f, "100ms"),
-            Timeframe::MS200 => write!(f, "200ms"),
-            Timeframe::MS300 => write!(f, "300ms"),
-            Timeframe::MS500 => write!(f, "500ms"),
-            Timeframe::MS1000 => write!(f, "1s"),
-            Timeframe::MS3000 => write!(f, "3s"),
-            Timeframe::M1 => write!(f, "1m"),
-            Timeframe::M3 => write!(f, "3m"),
-            Timeframe::M5 => write!(f, "5m"),
-            Timeframe::M15 => write!(f, "15m"),
-            Timeframe::M30 => write!(f, "30m"),
-            Timeframe::H1 => write!(f, "1h"),
-            Timeframe::H2 => write!(f, "2h"),
-            Timeframe::H4 => write!(f, "4h"),
-            Timeframe::H12 => write!(f, "12h"),
-            Timeframe::D1 => write!(f, "1d"),
-            Timeframe::CustomMinutes(minutes) => write!(f, "{minutes}m"),
-        }
+        write!(
+            f,
+            "{}",
+            match self {
+                Timeframe::MS100 => "100ms",
+                Timeframe::MS200 => "200ms",
+                Timeframe::MS300 => "300ms",
+                Timeframe::MS500 => "500ms",
+                Timeframe::MS1000 => "1s",
+                Timeframe::M1 => "1m",
+                Timeframe::M3 => "3m",
+                Timeframe::M5 => "5m",
+                Timeframe::M15 => "15m",
+                Timeframe::M30 => "30m",
+                Timeframe::H1 => "1h",
+                Timeframe::H2 => "2h",
+                Timeframe::H4 => "4h",
+                Timeframe::H12 => "12h",
+                Timeframe::D1 => "1d",
+            }
+        )
     }
 }
 
@@ -71,7 +72,6 @@ pub enum Timeframe {
     MS300,
     MS500,
     MS1000,
-    MS3000,
     M1,
     M3,
     M5,
@@ -82,7 +82,6 @@ pub enum Timeframe {
     H4,
     H12,
     D1,
-    CustomMinutes(u16),
 }
 
 impl Timeframe {
@@ -99,17 +98,13 @@ impl Timeframe {
         Timeframe::D1,
     ];
 
-    pub const HEATMAP: [Timeframe; 6] = [
+    pub const HEATMAP: [Timeframe; 5] = [
         Timeframe::MS100,
         Timeframe::MS200,
         Timeframe::MS300,
         Timeframe::MS500,
         Timeframe::MS1000,
-        Timeframe::MS3000,
     ];
-
-    pub const CUSTOM_MINUTES_MIN: u16 = 1;
-    pub const CUSTOM_MINUTES_MAX: u16 = 720;
 
     /// # Panics
     ///
@@ -126,7 +121,6 @@ impl Timeframe {
             Timeframe::H4 => 240,
             Timeframe::H12 => 720,
             Timeframe::D1 => 1440,
-            Timeframe::CustomMinutes(minutes) => minutes,
             _ => panic!("Invalid timeframe: {:?}", self),
         }
     }
@@ -138,34 +132,11 @@ impl Timeframe {
             Timeframe::MS300 => 300,
             Timeframe::MS500 => 500,
             Timeframe::MS1000 => 1_000,
-            Timeframe::MS3000 => 3_000,
             _ => {
                 let minutes = self.to_minutes();
                 u64::from(minutes) * 60_000
             }
         }
-    }
-
-    pub fn from_minutes(minutes: u16) -> Option<Self> {
-        match minutes {
-            1 => Some(Timeframe::M1),
-            3 => Some(Timeframe::M3),
-            5 => Some(Timeframe::M5),
-            15 => Some(Timeframe::M15),
-            30 => Some(Timeframe::M30),
-            60 => Some(Timeframe::H1),
-            120 => Some(Timeframe::H2),
-            240 => Some(Timeframe::H4),
-            720 => Some(Timeframe::H12),
-            Self::CUSTOM_MINUTES_MIN..=Self::CUSTOM_MINUTES_MAX => {
-                Some(Timeframe::CustomMinutes(minutes))
-            }
-            _ => None,
-        }
-    }
-
-    pub fn is_custom_minutes(self) -> bool {
-        matches!(self, Timeframe::CustomMinutes(_))
     }
 }
 
@@ -284,7 +255,8 @@ impl fmt::Display for SerTicker {
 pub struct Ticker {
     bytes: [u8; Ticker::MAX_LEN as usize],
     pub exchange: Exchange,
-    // Optional display symbol for UI.
+    // Optional display symbol for UI, mainly used for Hyperliquid spot markets
+    // to show "HYPEUSDC" instead of "@107"
     display_bytes: [u8; Ticker::MAX_LEN as usize],
     has_display_symbol: bool,
 }
@@ -370,7 +342,23 @@ impl Ticker {
 
     pub fn display_symbol_and_type(&self) -> (String, MarketKind) {
         let market_kind = self.market_type();
-        let result = self.display_as_str().to_owned();
+
+        let result = if self.has_display_symbol {
+            // Use the custom display symbol (e.g., "HYPEUSDC" for Hyperliquid spot)
+            self.display_as_str().to_owned()
+        } else {
+            let mut result = self.as_str().to_owned();
+            // Transform Hyperliquid symbols to standardized display format
+            if matches!(self.exchange, Exchange::HyperliquidLinear)
+                && market_kind == MarketKind::LinearPerps
+            {
+                // For Hyperliquid Linear Perps, append USDT to match other exchanges' format
+                // The "P" suffix will be added later in compute_display_data for all perpetual contracts
+                result.push_str("USDT");
+            }
+            result
+        };
+
         (result, market_kind)
     }
 

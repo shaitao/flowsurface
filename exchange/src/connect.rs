@@ -38,7 +38,12 @@ pub fn depth_stream(config: &StreamConfig<TickerInfo>) -> BoxStream<'static, Eve
 
     match config.exchange.venue() {
         Venue::Binance => adapter::binance::connect_depth_stream(ticker, push_freq).boxed(),
-        Venue::SSH | Venue::SSZ => adapter::qmt::connect_depth_stream(ticker, push_freq).boxed(),
+        Venue::Bybit => adapter::bybit::connect_depth_stream(ticker, push_freq).boxed(),
+        Venue::Hyperliquid => {
+            adapter::hyperliquid::connect_depth_stream(ticker, config.tick_mltp, push_freq).boxed()
+        }
+        Venue::Okex => adapter::okex::connect_depth_stream(ticker, push_freq).boxed(),
+        Venue::Mexc => adapter::mexc::connect_depth_stream(ticker, push_freq).boxed(),
     }
 }
 
@@ -47,8 +52,13 @@ pub fn trade_stream(config: &StreamConfig<Vec<TickerInfo>>) -> BoxStream<'static
     let market_kind = config.exchange.market_type();
 
     match config.exchange.venue() {
+        Venue::Bybit => adapter::bybit::connect_trade_stream(tickers, market_kind).boxed(),
         Venue::Binance => adapter::binance::connect_trade_stream(tickers, market_kind).boxed(),
-        Venue::SSH | Venue::SSZ => adapter::qmt::connect_trade_stream(tickers, market_kind).boxed(),
+        Venue::Hyperliquid => {
+            adapter::hyperliquid::connect_trade_stream(tickers, market_kind).boxed()
+        }
+        Venue::Okex => adapter::okex::connect_trade_stream(tickers, market_kind).boxed(),
+        Venue::Mexc => adapter::mexc::connect_trade_stream(tickers, market_kind).boxed(),
     }
 }
 
@@ -60,7 +70,12 @@ pub fn kline_stream(
 
     match config.exchange.venue() {
         Venue::Binance => adapter::binance::connect_kline_stream(streams, market_kind).boxed(),
-        Venue::SSH | Venue::SSZ => adapter::qmt::connect_kline_stream(streams, market_kind).boxed(),
+        Venue::Bybit => adapter::bybit::connect_kline_stream(streams, market_kind).boxed(),
+        Venue::Hyperliquid => {
+            adapter::hyperliquid::connect_kline_stream(streams, market_kind).boxed()
+        }
+        Venue::Okex => adapter::okex::connect_kline_stream(streams, market_kind).boxed(),
+        Venue::Mexc => adapter::mexc::connect_kline_stream(streams, market_kind).boxed(),
     }
 }
 

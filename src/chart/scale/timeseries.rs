@@ -82,11 +82,11 @@ fn calc_time_step(
         0_u64..1_u64 => &MS_TIME_STEPS,
         1..=30 => match timeframe_in_min {
             1 => &M1_TIME_STEPS,
-            2..=3 => &M3_TIME_STEPS,
-            4..=5 => &M5_TIME_STEPS,
+            3 => &M3_TIME_STEPS,
+            5 => &M5_TIME_STEPS,
             15 => &M5_TIME_STEPS[..7],
             30 => &M5_TIME_STEPS[..6],
-            _ => &M5_TIME_STEPS,
+            _ => &HOURLY_TIME_STEPS,
         },
         31.. => &HOURLY_TIME_STEPS,
     };
