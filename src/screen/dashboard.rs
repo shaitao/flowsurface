@@ -936,6 +936,15 @@ impl Dashboard {
                 req_id,
                 is_batches_done,
             } => {
+                log::warn!(
+                    "Dashboard received QMT KlinesAndTrades pane={} stream={:?} req_id={:?} klines={} trades={} done={}",
+                    pane_id,
+                    stream_type,
+                    req_id,
+                    klines.len(),
+                    trades.len(),
+                    is_batches_done
+                );
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     if let StreamKind::Kline {
                         timeframe,
@@ -1224,10 +1233,16 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         streams: Vec<StreamKind>,
     ) -> Task<Message> {
+        let mut initial_fetch = None;
         if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
             state.streams = ResolvedStream::Ready(streams.clone());
+            let content_kind = state.content.kind();
+            initial_fetch =
+                Self::initial_history_fetch_task(self.layout_id, pane_id, &streams, content_kind);
         }
+
         self.refresh_streams(main_window)
+            .chain(initial_fetch.unwrap_or_else(Task::none))
     }
 
     pub fn market_subscriptions(&self) -> Subscription<exchange::Event> {

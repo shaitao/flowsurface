@@ -742,6 +742,31 @@ impl KlineChart {
         }
     }
 
+    pub fn insert_hist_klines_without_request(&mut self, klines_raw: &[Kline]) {
+        match self.data_source {
+            PlotData::TimeBased(ref mut timeseries) => {
+                timeseries.insert_klines(klines_raw);
+                timeseries.insert_trades_existing_buckets(&self.raw_trades);
+
+                self.indicators
+                    .values_mut()
+                    .filter_map(Option::as_mut)
+                    .for_each(|indi| indi.on_insert_klines(klines_raw));
+
+                if let Some(latest_timestamp) = timeseries.latest_timestamp() {
+                    self.chart.latest_x = latest_timestamp;
+                }
+                if let Some(latest_kline) = timeseries.latest_kline() {
+                    self.chart.last_price =
+                        Some(PriceInfoLabel::new(latest_kline.close, latest_kline.open));
+                }
+
+                self.invalidate(None);
+            }
+            PlotData::TickBased(_) => {}
+        }
+    }
+
     pub fn mark_request_failed(&mut self, req_id: uuid::Uuid, error: String) {
         self.fetching_trades = (false, None);
         self.request_handler.mark_failed(req_id, error);

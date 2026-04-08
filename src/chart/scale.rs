@@ -254,8 +254,13 @@ impl AxisLabelsX<'_> {
     }
 
     fn uses_gapless_time_axis(&self) -> bool {
-        matches!(self.basis, Basis::Time(_))
-            && exchange::adapter::qmt::uses_gapless_time_axis(self.ticker_info.exchange().venue())
+        match self.basis {
+            Basis::Time(timeframe) => exchange::adapter::qmt::supports_gapless_time_axis_timeframe(
+                self.ticker_info.exchange().venue(),
+                timeframe,
+            ),
+            Basis::Tick(_) => false,
+        }
     }
 
     fn generate_crosshair(

@@ -7,6 +7,7 @@ use iced::{
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use uuid::Uuid;
 
 static TRADE_FETCH_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -538,12 +539,8 @@ pub fn kline_trades_fetch_task(
             ticker_info,
             timeframe,
         } => {
-            let Some((from, to)) = range else {
-                return update_status;
-            };
-
             let (task, handle) = Task::sip(
-                fetch_qmt_klines_and_trades_batched(ticker_info, timeframe, (from, to)),
+                fetch_qmt_klines_and_trades_batched(ticker_info, timeframe, range),
                 move |(klines, trades, is_batches_done)| {
                     let data = FetchedData::KlinesAndTrades {
                         klines,
@@ -588,12 +585,52 @@ pub fn kline_trades_fetch_task(
 pub fn fetch_qmt_klines_and_trades_batched(
     ticker_info: TickerInfo,
     timeframe: exchange::Timeframe,
-    range: (u64, u64),
+    range: Option<(u64, u64)>,
 ) -> impl Straw<(), (Vec<Kline>, Vec<Trade>, bool), AdapterError> {
     sipper(async move |mut progress| {
-        let (klines, trades) =
-            adapter::fetch_klines_and_trades(ticker_info, timeframe, Some(range)).await?;
-        let () = progress.send((klines, trades, true)).await;
+        let started_at = Instant::now();
+        let day_ranges = adapter::qmt::historical_day_ranges(ticker_info, timeframe, range).await?;
+
+        if day_ranges.is_empty() {
+            log::warn!(
+                "QMT batched fetch {} {} has no day ranges for {:?}",
+                ticker_info.ticker,
+                timeframe,
+                range
+            );
+            return Ok(());
+        }
+
+        log::warn!(
+            "QMT batched fetch {} {} prepared {} day batches for {:?} in {:?}",
+            ticker_info.ticker,
+            timeframe,
+            day_ranges.len(),
+            range,
+            started_at.elapsed()
+        );
+
+        let last_index = day_ranges.len().saturating_sub(1);
+
+        for (index, day_range) in day_ranges.into_iter().enumerate() {
+            let batch_started_at = Instant::now();
+            let (klines, trades) =
+                adapter::fetch_klines_and_trades(ticker_info, timeframe, Some(day_range)).await?;
+            let is_batches_done = index == last_index;
+            log::warn!(
+                "QMT batched fetch {} {} batch {}/{} {:?} -> klines={} trades={} done={} elapsed={:?}",
+                ticker_info.ticker,
+                timeframe,
+                index + 1,
+                last_index + 1,
+                day_range,
+                klines.len(),
+                trades.len(),
+                is_batches_done,
+                batch_started_at.elapsed()
+            );
+            let () = progress.send((klines, trades, is_batches_done)).await;
+        }
 
         Ok(())
     })

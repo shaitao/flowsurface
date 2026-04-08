@@ -153,12 +153,19 @@ struct QmtTickDayCache {
 struct CurrentDayTickCacheEntry {
     day: NaiveDate,
     ticks: Vec<QmtTick>,
+    history_loaded: bool,
 }
 
 #[derive(Debug, Clone)]
 struct TickFetchFailureEntry {
     failed_at: Instant,
     error: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveKlineStream {
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
 }
 
 #[derive(Debug, Deserialize)]
@@ -346,12 +353,17 @@ fn cache_live_tick(ticker: Ticker, tick: &QmtTick) {
 
     let entry = cache
         .entry(ticker)
-        .or_insert_with(|| CurrentDayTickCacheEntry { day, ticks: Vec::new() });
+        .or_insert_with(|| CurrentDayTickCacheEntry {
+            day,
+            ticks: Vec::new(),
+            history_loaded: false,
+        });
 
     if entry.day != day {
         *entry = CurrentDayTickCacheEntry {
             day,
             ticks: Vec::new(),
+            history_loaded: false,
         };
     }
 
@@ -370,17 +382,147 @@ fn merge_current_day_history_and_live(
 
     let entry = cache
         .entry(ticker)
-        .or_insert_with(|| CurrentDayTickCacheEntry { day, ticks: Vec::new() });
+        .or_insert_with(|| CurrentDayTickCacheEntry {
+            day,
+            ticks: Vec::new(),
+            history_loaded: false,
+        });
 
     if entry.day != day {
         *entry = CurrentDayTickCacheEntry {
             day,
             ticks: Vec::new(),
+            history_loaded: false,
         };
     }
 
     entry.ticks = merge_ticks(&history_ticks, entry.ticks.clone());
+    entry.history_loaded = true;
     entry.ticks.clone()
+}
+
+fn current_day_tick_snapshot(ticker: Ticker, day: NaiveDate) -> Option<Vec<QmtTick>> {
+    let Ok(mut cache) = CURRENT_DAY_TICK_CACHE.write() else {
+        return None;
+    };
+    prune_current_day_tick_cache(&mut cache);
+    let entry = cache.get(&ticker)?;
+    if entry.day != day {
+        return None;
+    }
+    Some(entry.ticks.clone())
+}
+
+fn current_day_history_ready(ticker: Ticker, day: NaiveDate) -> bool {
+    let Ok(mut cache) = CURRENT_DAY_TICK_CACHE.write() else {
+        return false;
+    };
+    prune_current_day_tick_cache(&mut cache);
+    cache.get(&ticker)
+        .is_some_and(|entry| entry.day == day && entry.history_loaded)
+}
+
+fn build_live_kline_from_ticks(
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    latest_tick: &QmtTick,
+    ticks: &[QmtTick],
+) -> Option<Kline> {
+    let venue = ticker_info.exchange().venue();
+    let bucket_start = qmt_bucket_start(venue, latest_tick.time, timeframe)?;
+
+    let last_seed_tick = ticks.iter().rev().find(|tick| tick.time < bucket_start).cloned();
+    let mut bucket_ticks = ticks
+        .iter()
+        .filter(|tick| bucket_start <= tick.time && tick.time <= latest_tick.time)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if bucket_ticks.is_empty() {
+        return None;
+    }
+
+    let mut relevant_ticks = Vec::with_capacity(bucket_ticks.len() + usize::from(last_seed_tick.is_some()));
+    if let Some(seed_tick) = last_seed_tick.clone() {
+        relevant_ticks.push(seed_tick);
+    }
+    relevant_ticks.append(&mut bucket_ticks);
+
+    let trades = synthesize_trades_from_ticks(&relevant_ticks, ticker_info);
+    let mut bars = aggregate_trades_to_klines(
+        &trades,
+        &relevant_ticks,
+        ticker_info,
+        timeframe,
+        bucket_start,
+        latest_tick.time,
+    )
+    .ok()?;
+
+    if let Some(kline) = bars.pop() {
+        return Some(kline);
+    }
+
+    let first_bucket_tick = relevant_ticks.iter().find(|tick| tick.time >= bucket_start)?;
+    let close = latest_tick.last_price.filter(|price| *price > 0.0)?;
+    let open = if let Some(day) = china_trading_day(latest_tick.time) {
+        let opening_session_start = qmt_session_bounds(venue, day)
+            .and_then(|sessions| sessions.first().copied())
+            .map(|(session_start, _)| session_start);
+        let opening_bucket = opening_session_start
+            .and_then(|session_start| qmt_bucket_start(venue, session_start, timeframe));
+
+        if opening_bucket == Some(bucket_start) {
+            first_bucket_tick
+                .open
+                .or(first_bucket_tick.last_price)
+                .filter(|price| *price > 0.0)
+        } else {
+            last_seed_tick
+                .as_ref()
+                .and_then(|tick| tick.last_price)
+                .filter(|price| *price > 0.0)
+                .or(first_bucket_tick.last_price.filter(|price| *price > 0.0))
+        }
+    } else {
+        first_bucket_tick.last_price.filter(|price| *price > 0.0)
+    }?;
+
+    let mut high = close;
+    let mut low = close;
+    for tick in relevant_ticks.iter().filter(|tick| tick.time >= bucket_start) {
+        if let Some(last_price) = tick.last_price.filter(|price| *price > 0.0) {
+            high = high.max(last_price);
+            low = low.min(last_price);
+        }
+    }
+
+    let baseline_volume = last_seed_tick.and_then(|tick| tick.volume).unwrap_or(0);
+    let current_volume = latest_tick
+        .volume
+        .unwrap_or(baseline_volume)
+        .saturating_sub(baseline_volume) as f32
+        * QMT_VOLUME_LOT_SIZE;
+
+    Some(Kline::new(
+        bucket_start,
+        open,
+        high,
+        low,
+        close,
+        Volume::TotalOnly(Qty::from_f32(current_volume).round_to_min_qty(ticker_info.min_qty)),
+        ticker_info.min_ticksize,
+    ))
+}
+
+fn build_live_kline_snapshot(
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    latest_tick: &QmtTick,
+) -> Option<Kline> {
+    let day = china_trading_day(latest_tick.time)?;
+    let ticks = current_day_tick_snapshot(ticker_info.ticker, day)?;
+    build_live_kline_from_ticks(ticker_info, timeframe, latest_tick, &ticks)
 }
 
 fn recent_tick_fetch_failure(ticker: Ticker, day: NaiveDate) -> Option<String> {
@@ -539,6 +681,10 @@ pub fn is_trading_bucket_start(venue: Venue, timestamp_ms: u64, timeframe: Timef
 
 pub fn uses_gapless_time_axis(venue: Venue) -> bool {
     matches!(venue, Venue::SSH | Venue::SSZ)
+}
+
+pub fn supports_gapless_time_axis_timeframe(venue: Venue, timeframe: Timeframe) -> bool {
+    uses_gapless_time_axis(venue) && qmt_timeframe_ms(timeframe).is_some()
 }
 
 fn qmt_bucket_starts_for_day(venue: Venue, day: NaiveDate, timeframe: Timeframe) -> Option<Vec<u64>> {
@@ -780,6 +926,19 @@ fn qmt_tick_fetch_bounds(venue: Venue, day: NaiveDate) -> Option<(u64, u64)> {
     Some((sessions[0].0, sessions[1].1))
 }
 
+fn qmt_current_day_history_bounds(day: NaiveDate) -> Option<(u64, u64)> {
+    let offset = china_offset()?;
+    let start = offset
+        .from_local_datetime(&day.and_hms_opt(0, 0, 0)?)
+        .single()?
+        .timestamp_millis() as u64;
+    let end = offset
+        .from_local_datetime(&day.and_hms_opt(16, 0, 0)?)
+        .single()?
+        .timestamp_millis() as u64;
+    Some((start, end))
+}
+
 fn qmt_latest_history_chunk_range(
     venue: Venue,
     requested_start: u64,
@@ -806,6 +965,13 @@ fn qmt_latest_history_chunk_range(
 
 fn qmt_kline_seed_start(venue: Venue, start_ms: u64) -> Option<u64> {
     let start_day = china_trading_day(start_ms)?;
+
+    if current_china_day() == Some(start_day)
+        && let Some((current_day_start, _)) = qmt_tick_fetch_bounds(venue, start_day)
+        && start_ms <= current_day_start
+    {
+        return qmt_current_day_history_bounds(start_day).map(|(start, _)| start);
+    }
 
     if is_qmt_trading_day(venue, start_day)
         && let Some((current_day_start, _)) = qmt_tick_fetch_bounds(venue, start_day)
@@ -1420,6 +1586,18 @@ mod tests {
     }
 
     #[test]
+    fn supports_gapless_time_axis_timeframe_excludes_heatmap_ms3000() {
+        assert!(!supports_gapless_time_axis_timeframe(
+            Venue::SSH,
+            Timeframe::MS3000
+        ));
+        assert!(supports_gapless_time_axis_timeframe(
+            Venue::SSH,
+            Timeframe::M3
+        ));
+    }
+
+    #[test]
     fn qmt_kline_seed_start_uses_same_day_session_start_mid_session() {
         let start = china_ms(2026, 4, 9, 10, 15, 0);
         let expected = china_ms(2026, 4, 9, 9, 30, 0);
@@ -1558,6 +1736,103 @@ mod tests {
         assert_eq!(merged[0].volume, live_tick.volume);
         assert_eq!(merged[0].transaction_num, live_tick.transaction_num);
         assert_eq!(merged[0].last_price, live_tick.last_price);
+    }
+
+    #[test]
+    fn current_day_history_ready_only_after_merge() {
+        let ticker = Ticker::new("600309.SH", super::super::Exchange::SSH);
+        let day = current_china_day().expect("current china day");
+        let timestamp = china_offset()
+            .expect("china offset")
+            .from_local_datetime(&day.and_hms_opt(10, 0, 0).expect("valid time"))
+            .single()
+            .expect("valid datetime")
+            .timestamp_millis() as u64;
+
+        if let Ok(mut cache) = CURRENT_DAY_TICK_CACHE.write() {
+            cache.clear();
+        }
+
+        let live_tick = sample_tick(timestamp);
+        cache_live_tick(ticker, &live_tick);
+        assert!(!current_day_history_ready(ticker, day));
+
+        let _ = merge_current_day_history_and_live(ticker, day, vec![live_tick]);
+        assert!(current_day_history_ready(ticker, day));
+    }
+
+    #[test]
+    fn build_live_kline_from_ticks_reconstructs_current_bucket() {
+        let ticker_info = sample_ticker_info();
+        let bucket_start = china_ms(2026, 4, 9, 10, 0, 0);
+
+        let mut seed_tick = sample_tick(bucket_start - 1_000);
+        seed_tick.last_price = Some(82.10);
+        seed_tick.volume = Some(1_000);
+        seed_tick.transaction_num = Some(10);
+
+        let mut tick1 = sample_tick(bucket_start + 1_000);
+        tick1.open = Some(82.00);
+        tick1.last_price = Some(82.00);
+        tick1.high = Some(82.00);
+        tick1.low = Some(82.00);
+        tick1.volume = Some(1_010);
+        tick1.transaction_num = Some(11);
+
+        let mut tick2 = sample_tick(bucket_start + 4_000);
+        tick2.open = Some(82.00);
+        tick2.last_price = Some(82.08);
+        tick2.high = Some(82.08);
+        tick2.low = Some(82.00);
+        tick2.volume = Some(1_030);
+        tick2.transaction_num = Some(13);
+
+        let kline = build_live_kline_from_ticks(
+            ticker_info,
+            Timeframe::M30,
+            &tick2,
+            &[seed_tick, tick1, tick2.clone()],
+        )
+        .expect("expected live kline snapshot");
+
+        assert_eq!(kline.time, bucket_start);
+        assert_eq!(kline.open.to_f32(), 82.00);
+        assert_eq!(kline.close.to_f32(), 82.08);
+        assert_eq!(kline.high.to_f32(), 82.08);
+        assert_eq!(kline.low.to_f32(), 82.00);
+        assert!((f32::from(kline.volume.total()) - 3_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn build_live_kline_from_ticks_rolls_to_next_bucket() {
+        let ticker_info = sample_ticker_info();
+        let first_bucket = china_ms(2026, 4, 9, 9, 30, 0);
+        let second_bucket = china_ms(2026, 4, 9, 10, 0, 0);
+
+        let mut tick1 = sample_tick(first_bucket + 1_000);
+        tick1.open = Some(82.00);
+        tick1.last_price = Some(82.02);
+        tick1.volume = Some(1_000);
+        tick1.transaction_num = Some(10);
+
+        let mut tick2 = sample_tick(second_bucket + 2_000);
+        tick2.open = Some(82.05);
+        tick2.last_price = Some(82.06);
+        tick2.high = Some(82.06);
+        tick2.low = Some(82.05);
+        tick2.volume = Some(1_020);
+        tick2.transaction_num = Some(11);
+
+        let kline = build_live_kline_from_ticks(
+            ticker_info,
+            Timeframe::M30,
+            &tick2,
+            &[tick1, tick2.clone()],
+        )
+        .expect("expected next bucket kline");
+
+        assert_eq!(kline.time, second_bucket);
+        assert_eq!(kline.close.to_f32(), 82.06);
     }
 }
 
@@ -1772,8 +2047,15 @@ pub fn connect_trade_stream(
                         OpCode::Text => {
                             match serde_json::from_slice::<BridgeWsMessage>(&message.payload[..]) {
                                 Ok(BridgeWsMessage::Tick(tick)) => {
+                                    let day = china_trading_day(tick.time);
                                     cache_live_tick(ticker_info.ticker, &tick);
-                                    if let Some(trade) = trade_state.update(tick, ticker_info) {
+                                    let history_ready = day.is_some_and(|day| {
+                                        current_day_history_ready(ticker_info.ticker, day)
+                                    });
+
+                                    if let Some(trade) = trade_state.update(tick, ticker_info)
+                                        && history_ready
+                                    {
                                         trade_buffers
                                             .entry(ticker_info.ticker)
                                             .or_default()
@@ -1854,17 +2136,151 @@ pub fn connect_kline_stream(
     streams: Vec<(TickerInfo, Timeframe)>,
     _market_type: super::MarketKind,
 ) -> impl Stream<Item = Event> {
-    channel(1, move |mut output| async move {
+    channel(100, move |mut output| async move {
         let Some((ticker_info, _)) = streams.first().copied() else {
             return;
         };
+        let exchange = ticker_info.exchange();
 
-        let _ = output
-            .send(Event::Disconnected(
-                ticker_info.exchange(),
-                "QMT live kline stream is not implemented yet. Use historical fetch plus live tick/trade stream.".to_string(),
-            ))
-            .await;
+        if streams.is_empty() {
+            return;
+        }
+
+        let unique_tickers = streams
+            .iter()
+            .map(|(ticker_info, _)| ticker_info.ticker)
+            .collect::<HashSet<_>>();
+        if unique_tickers.len() != 1 {
+            let _ = output
+                .send(Event::Disconnected(
+                    exchange,
+                    qmt_single_ticker_message("kline stream"),
+                ))
+                .await;
+            return;
+        }
+
+        let live_streams = streams
+            .iter()
+            .copied()
+            .map(|(ticker_info, timeframe)| LiveKlineStream {
+                ticker_info,
+                timeframe,
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = State::Disconnected;
+
+        loop {
+            match &mut state {
+                State::Disconnected => {
+                    let (domain, url) = match qmt_bridge_ws_url(
+                        "/ws/tick",
+                        &[("symbol", ticker_info.ticker.to_string())],
+                    ) {
+                        Ok(parts) => parts,
+                        Err(error) => {
+                            let _ = output
+                                .send(Event::Disconnected(exchange, error.to_string()))
+                                .await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
+
+                    match connect_ws(&domain, &url).await {
+                        Ok(websocket) => {
+                            state = State::Connected(websocket);
+                            let _ = output.send(Event::Connected(exchange)).await;
+                        }
+                        Err(error) => {
+                            let _ = output
+                                .send(Event::Disconnected(exchange, error.to_string()))
+                                .await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+                State::Connected(ws) => match ws.read_frame().await {
+                    Ok(message) => match message.opcode {
+                        OpCode::Text => {
+                            match serde_json::from_slice::<BridgeWsMessage>(&message.payload[..]) {
+                                Ok(BridgeWsMessage::Tick(tick)) => {
+                                    let day = china_trading_day(tick.time);
+                                    cache_live_tick(ticker_info.ticker, &tick);
+                                    let history_ready = day.is_some_and(|day| {
+                                        current_day_history_ready(ticker_info.ticker, day)
+                                    });
+
+                                    if !history_ready {
+                                        continue;
+                                    }
+
+                                    for stream in &live_streams {
+                                        if let Some(kline) = build_live_kline_snapshot(
+                                            stream.ticker_info,
+                                            stream.timeframe,
+                                            &tick,
+                                        ) {
+                                            let _ = output
+                                                .send(Event::KlineReceived(
+                                                    StreamKind::Kline {
+                                                        ticker_info: stream.ticker_info,
+                                                        timeframe: stream.timeframe,
+                                                    },
+                                                    kline,
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                }
+                                Ok(BridgeWsMessage::Status(status))
+                                    if status.error.is_some()
+                                        || status.phase.as_deref() == Some("callback_error") =>
+                                {
+                                    state = State::Disconnected;
+                                    let message =
+                                        status.error.or(status.phase).unwrap_or_else(|| {
+                                            "QMT bridge reported an error".to_string()
+                                        });
+                                    let _ =
+                                        output.send(Event::Disconnected(exchange, message)).await;
+                                }
+                                Ok(BridgeWsMessage::Status(_)) => {}
+                                Err(error) => {
+                                    state = State::Disconnected;
+                                    let _ = output
+                                        .send(Event::Disconnected(
+                                            exchange,
+                                            format!("Invalid QMT tick payload: {error}"),
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                        OpCode::Close => {
+                            state = State::Disconnected;
+                            let _ = output
+                                .send(Event::Disconnected(
+                                    exchange,
+                                    "QMT websocket closed".to_string(),
+                                ))
+                                .await;
+                        }
+                        _ => {}
+                    },
+                    Err(error) => {
+                        state = State::Disconnected;
+                        let _ = output
+                            .send(Event::Disconnected(
+                                exchange,
+                                format!("QMT websocket read failed: {error}"),
+                            ))
+                            .await;
+                    }
+                },
+            }
+        }
     })
 }
 
@@ -1955,12 +2371,61 @@ pub async fn fetch_klines_and_trades(
     fetch_tick_derived_history(ticker_info, timeframe, range, true).await
 }
 
+pub async fn historical_day_ranges(
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    range: Option<(u64, u64)>,
+) -> Result<Vec<(u64, u64)>, AdapterError> {
+    let (requested_start, requested_end) = range
+        .or_else(|| qmt_default_kline_range(timeframe))
+        .ok_or_else(|| {
+            AdapterError::InvalidRequest(format!(
+                "unsupported QMT timeframe for historical klines: {timeframe}"
+            ))
+        })?;
+
+    let venue = ticker_info.exchange().venue();
+    let calendar_seed_start = requested_start.saturating_sub(QMT_KLINE_SEED_CALENDAR_LOOKBACK_MS);
+    if let Err(error) = ensure_trading_calendar(venue, calendar_seed_start, requested_end).await {
+        log::warn!(
+            "QMT trading calendar seed fetch failed for {}: {error}",
+            ticker_info.ticker
+        );
+    }
+
+    let Some((start_day, end_day)) =
+        trading_day_range_from_timestamps(requested_start, requested_end)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut day_ranges = Vec::new();
+    for day in qmt_trading_days_between(venue, start_day, end_day).into_iter().rev() {
+        let Some((day_start, day_end)) = qmt_tick_fetch_bounds(venue, day) else {
+            continue;
+        };
+
+        if requested_end > day_start && requested_start < day_end {
+            if current_china_day() == Some(day) {
+                if let Some(range) = qmt_current_day_history_bounds(day) {
+                    day_ranges.push(range);
+                }
+            } else {
+                day_ranges.push((day_start, day_end));
+            }
+        }
+    }
+
+    Ok(day_ranges)
+}
+
 async fn fetch_tick_derived_history(
     ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(u64, u64)>,
     latest_day_only: bool,
 ) -> Result<(Vec<Kline>, Vec<Trade>), AdapterError> {
+    let total_started_at = Instant::now();
     let (requested_start, requested_end) = range
         .or_else(|| qmt_default_kline_range(timeframe))
         .ok_or_else(|| {
@@ -1997,13 +2462,34 @@ async fn fetch_tick_derived_history(
     };
 
     let tick_fetch_start = qmt_kline_seed_start(venue, start).unwrap_or(start);
+    let fetch_started_at = Instant::now();
     let ticks = fetch_ticks(ticker_info, (tick_fetch_start, end)).await?;
+    let fetch_elapsed = fetch_started_at.elapsed();
+    let derive_started_at = Instant::now();
     let trades = synthesize_trades_from_ticks(&ticks, ticker_info);
     let klines = aggregate_trades_to_klines(&trades, &ticks, ticker_info, timeframe, start, end)?;
-    let filtered_trades = trades
+    let filtered_trades: Vec<Trade> = trades
         .into_iter()
         .filter(|trade| start <= trade.time && trade.time <= end)
         .collect();
+    let derive_elapsed = derive_started_at.elapsed();
+
+    log::warn!(
+        "QMT derived history {} {} latest_day_only={} requested={:?} effective=({}..{}) seed_start={} ticks={} trades={} klines={} fetch_elapsed={:?} derive_elapsed={:?} total_elapsed={:?}",
+        ticker_info.ticker,
+        timeframe,
+        latest_day_only,
+        range,
+        start,
+        end,
+        tick_fetch_start,
+        ticks.len(),
+        filtered_trades.len(),
+        klines.len(),
+        fetch_elapsed,
+        derive_elapsed,
+        total_started_at.elapsed()
+    );
 
     Ok((klines, filtered_trades))
 }
@@ -2102,7 +2588,7 @@ async fn fetch_current_day_ticks(
         )));
     }
 
-    let Some(range) = qmt_tick_fetch_bounds(ticker_info.exchange().venue(), day) else {
+    let Some(range) = qmt_current_day_history_bounds(day) else {
         return Ok(Vec::new());
     };
 

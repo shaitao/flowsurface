@@ -399,19 +399,23 @@ impl State {
                     }
                     chart.insert_hist_klines(id, klines, is_batches_done);
                 } else {
-                    let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
-                    let layout = chart.chart_layout();
+                    if chart.basis() == Basis::Time(timeframe) {
+                        chart.insert_hist_klines_without_request(klines);
+                    } else {
+                        let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
+                        let layout = chart.chart_layout();
 
-                    *chart = KlineChart::new(
-                        layout,
-                        Basis::Time(timeframe),
-                        tick_size,
-                        klines,
-                        raw_trades,
-                        indicators,
-                        ticker_info,
-                        chart.kind(),
-                    );
+                        *chart = KlineChart::new(
+                            layout,
+                            Basis::Time(timeframe),
+                            tick_size,
+                            klines,
+                            raw_trades,
+                            indicators,
+                            ticker_info,
+                            chart.kind(),
+                        );
+                    }
                 }
             }
             Content::Comparison(chart) => {
