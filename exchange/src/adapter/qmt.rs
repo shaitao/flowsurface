@@ -1414,6 +1414,9 @@ fn split_synthetic_qty(total_qty: Qty) -> (Qty, Qty) {
     (buy_qty, sell_qty)
 }
 
+/// Tick rule: infer trade direction from price movement between consecutive ticks.
+/// Uptick (price rose) → Buy, downtick (price fell) → Sell, unchanged → Split.
+/// Used as fallback when the quote rule (BBA comparison) is inconclusive.
 fn tick_rule_side(previous_tick: &QmtTick, current_tick: &QmtTick) -> SyntheticTradeSide {
     match (
         previous_tick.valid_last_price(),
