@@ -677,14 +677,14 @@ where
         match tz {
             UserTimezone::Utc => {
                 if let Some(dt) = chrono::Utc.timestamp_millis_opt(ts_i64).single() {
-                    dt.format("%Y-%m-%d %H:%M").to_string()
+                    dt.format("%a %b %-d %H:%M").to_string()
                 } else {
                     ts_ms.to_string()
                 }
             }
             UserTimezone::Local => {
                 if let Some(dt) = chrono::Local.timestamp_millis_opt(ts_i64).single() {
-                    dt.format("%Y-%m-%d %H:%M").to_string()
+                    dt.format("%a %b %-d %H:%M").to_string()
                 } else {
                     ts_ms.to_string()
                 }

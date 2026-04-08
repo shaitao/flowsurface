@@ -99,13 +99,13 @@ impl OpenInterestIndicator {
 
     pub fn is_supported_exchange(exchange: Exchange) -> bool {
         exchange.is_perps()
+            && exchange != Exchange::HyperliquidLinear
+            && exchange != Exchange::MexcLinear
+            && exchange != Exchange::MexcInverse
     }
 
     pub fn is_supported_timeframe(timeframe: Timeframe) -> bool {
-        matches!(
-            timeframe,
-            Timeframe::M5 | Timeframe::M15 | Timeframe::M30 | Timeframe::H1 | Timeframe::H4
-        )
+        timeframe >= Timeframe::M5 && timeframe <= Timeframe::H4 && timeframe != Timeframe::H2
     }
 }
 

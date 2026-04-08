@@ -204,17 +204,6 @@ impl ComparisonChart {
         }
     }
 
-    pub fn mark_request_failed(
-        &mut self,
-        ticker_info: TickerInfo,
-        req_id: uuid::Uuid,
-        error: String,
-    ) {
-        if let Some(handler) = self.request_handler.get_mut(&ticker_info) {
-            handler.mark_failed(req_id, error);
-        }
-    }
-
     pub fn update_latest_kline(&mut self, ticker_info: &TickerInfo, kline: &Kline) {
         let idx = self.get_or_create_series_idx(ticker_info);
         let series = &mut self.series[idx];

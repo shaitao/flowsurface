@@ -68,11 +68,7 @@ where
                         .find_map(|(_, size)| *size)
                         .unwrap_or_else(|| Size::new(1024.0, 768.0));
 
-                    let spec = position
-                        .map(|position| WindowSpec::from((&position, &size)))
-                        .filter(|spec| spec.is_restore_safe());
-
-                    (window_id, spec)
+                    (window_id, (position, size))
                 })
         })
         .collect::<Vec<_>>();
@@ -83,7 +79,9 @@ where
         .map(move |results| {
             let specs: HashMap<window::Id, WindowSpec> = results
                 .into_iter()
-                .filter_map(|(id, spec)| spec.map(|spec| (id, spec)))
+                .filter_map(|(id, (pos, size))| {
+                    pos.map(|position| (id, WindowSpec::from((&position, &size))))
+                })
                 .collect();
 
             message(specs)

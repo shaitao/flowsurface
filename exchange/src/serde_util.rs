@@ -20,7 +20,6 @@ pub(crate) fn value_as_f32(value: &Value) -> Option<f32> {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn value_as_u64(value: &Value) -> Option<u64> {
     match value {
         Value::String(s) => s.parse::<u64>().ok(),
