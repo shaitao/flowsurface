@@ -13,7 +13,11 @@ use data::{
 };
 use exchange::{
     Ticker, TickerInfo, TickerStats,
-    adapter::{Exchange, MarketKind, Venue, fetch_ticker_metadata, fetch_ticker_stats},
+    adapter::{
+        Exchange, MarketKind, Venue, fetch_ticker_metadata, fetch_ticker_stats,
+        search_ticker_metadata,
+    },
+    unit::{Price, Qty},
 };
 use iced::{
     Alignment, Element, Length, Renderer, Size, Subscription, Task, Theme,
@@ -54,17 +58,35 @@ const TOP_BAR_HEIGHT: f32 = 40.0;
 const SORT_AND_FILTER_HEIGHT: f32 = 200.0;
 
 const COMPACT_ROW_HEIGHT: f32 = 28.0;
+const QMT_SEARCH_RESULT_LIMIT: usize = 40;
 
 const EXCHANGE_UNAVAILABLE_TOOLTIP: &str =
     "Metadata unavailable for this session.\nRestart app to retry. Check logs for details.";
 
 fn available_markets(venue: Venue) -> &'static [MarketKind] {
     match venue {
-        Venue::Binance | Venue::Bybit | Venue::Okex => &MarketKind::ALL,
-        Venue::Hyperliquid => &[MarketKind::Spot, MarketKind::LinearPerps],
-        // Skip metadata fetch for Mexc spot as it requires protobuf for websocket
-        // TODO: include after protobuf implementation and Mexc spot markets ready to stream
-        Venue::Mexc => &[MarketKind::LinearPerps, MarketKind::InversePerps],
+        Venue::Binance => &MarketKind::ALL,
+        Venue::SSH | Venue::SSZ => &[MarketKind::Spot],
+    }
+}
+
+fn venue_supports_bootstrap_metadata(venue: Venue) -> bool {
+    matches!(venue, Venue::Binance)
+}
+
+fn venue_supports_periodic_stats(venue: Venue) -> bool {
+    matches!(venue, Venue::Binance)
+}
+
+fn venue_uses_qmt_search(venue: Venue) -> bool {
+    matches!(venue, Venue::SSH | Venue::SSZ)
+}
+
+fn placeholder_ticker_stats() -> TickerStats {
+    TickerStats {
+        mark_price: Price::from_units(0),
+        daily_price_chg: 0.0,
+        daily_volume: Qty::ZERO,
     }
 }
 
@@ -92,6 +114,8 @@ pub enum Message {
     FetchStats,
     UpdateMetadata(Venue, HashMap<Ticker, Option<TickerInfo>>),
     UpdateStats(Venue, HashMap<Ticker, TickerStats>),
+    QmtSearchResults(Venue, String, HashMap<Ticker, Option<TickerInfo>>),
+    QmtSearchFailed(Venue, String, data::InternalError),
     MetadataFetchFailed(Venue, data::InternalError),
     StatsFetchFailed(Venue, data::InternalError),
 }
@@ -112,6 +136,7 @@ pub struct TickersTable {
     show_favorites: bool,
     show_sort_options: bool,
     row_index: FxHashMap<Ticker, usize>,
+    ephemeral_qmt_tickers: FxHashSet<Ticker>,
     stats_fetch_state: StatsFetchState,
 }
 
@@ -124,6 +149,7 @@ impl TickersTable {
         let fetch_metadata = Venue::ALL
             .iter()
             .copied()
+            .filter(|venue| venue_supports_bootstrap_metadata(*venue))
             .map(|venue| {
                 let markets_to_fetch = available_markets(venue);
 
@@ -143,27 +169,28 @@ impl TickersTable {
             })
             .collect::<Vec<_>>();
 
-        (
-            Self {
-                ticker_rows: Vec::new(),
-                display_cache: FxHashMap::default(),
-                favorited_tickers: settings.favorited_tickers.iter().cloned().collect(),
-                search_query: String::new(),
-                show_sort_options: false,
-                selected_sort_option: settings.selected_sort_option,
-                expand_ticker_card: None,
-                scroll_offset: AbsoluteOffset::default(),
-                is_shown: false,
-                tickers_info: FxHashMap::default(),
-                unavailable_exchanges: FxHashSet::default(),
-                selected_exchanges: settings.selected_exchanges.iter().cloned().collect(),
-                selected_markets: settings.selected_markets.iter().cloned().collect(),
-                show_favorites: settings.show_favorites,
-                row_index: FxHashMap::default(),
-                stats_fetch_state: StatsFetchState::default(),
-            },
-            Task::batch(fetch_metadata),
-        )
+        let mut table = Self {
+            ticker_rows: Vec::new(),
+            display_cache: FxHashMap::default(),
+            favorited_tickers: settings.favorited_tickers.iter().cloned().collect(),
+            search_query: String::new(),
+            show_sort_options: false,
+            selected_sort_option: settings.selected_sort_option,
+            expand_ticker_card: None,
+            scroll_offset: AbsoluteOffset::default(),
+            is_shown: false,
+            tickers_info: FxHashMap::default(),
+            unavailable_exchanges: FxHashSet::default(),
+            selected_exchanges: settings.selected_exchanges.iter().cloned().collect(),
+            selected_markets: settings.selected_markets.iter().cloned().collect(),
+            show_favorites: settings.show_favorites,
+            row_index: FxHashMap::default(),
+            ephemeral_qmt_tickers: FxHashSet::default(),
+            stats_fetch_state: StatsFetchState::default(),
+        };
+        table.seed_qmt_favorites();
+
+        (table, Task::batch(fetch_metadata))
     }
 
     pub fn settings(&self) -> Settings {
@@ -179,7 +206,12 @@ impl TickersTable {
     pub fn update(&mut self, message: Message) -> Option<Action> {
         match message {
             Message::UpdateSearchQuery(query) => {
-                self.search_query = query.to_uppercase();
+                self.search_query = query.trim().to_uppercase();
+                self.clear_ephemeral_qmt_rows();
+
+                if let Some(task) = self.build_qmt_search_task(&self.search_query) {
+                    return Some(Action::Fetch(task));
+                }
             }
             Message::ChangeSortOption(option) => {
                 self.change_sort_option(option);
@@ -218,6 +250,12 @@ impl TickersTable {
 
                     self.stats_fetch_state
                         .on_exchange_enabled(exch, Instant::now());
+
+                    if venue_uses_qmt_search(exch) {
+                        if let Some(task) = self.build_qmt_search_task(&self.search_query) {
+                            return Some(Action::Fetch(task));
+                        }
+                    }
                 }
             }
             Message::DebounceExchangeFetchTick => {
@@ -297,12 +335,31 @@ impl TickersTable {
                     self.tickers_info.insert(ticker, ticker_info);
                 }
 
-                if self.selected_exchanges.contains(&venue) {
+                if self.selected_exchanges.contains(&venue) && venue_supports_periodic_stats(venue)
+                {
                     let venues = std::iter::once(venue).collect::<FxHashSet<_>>();
                     if let Some(task) = self.build_stats_fetch_task(venues) {
                         return Some(Action::Fetch(task));
                     }
                 }
+            }
+            Message::QmtSearchResults(venue, query, info) => {
+                if self.search_query != query {
+                    return None;
+                }
+
+                self.unavailable_exchanges.remove(&venue);
+                self.ingest_qmt_search_results(info);
+                self.sort_ticker_rows();
+            }
+            Message::QmtSearchFailed(venue, query, err) => {
+                if self.search_query != query {
+                    return None;
+                }
+                self.unavailable_exchanges.insert(venue);
+                self.selected_exchanges.remove(&venue);
+                self.stats_fetch_state.on_exchange_disabled(venue);
+                return Some(Action::ErrorOccurred(err));
             }
             Message::MetadataFetchFailed(venue, err) => {
                 self.unavailable_exchanges.insert(venue);
@@ -337,10 +394,130 @@ impl TickersTable {
             .filter(|venue| {
                 self.selected_exchanges.contains(venue)
                     && !self.unavailable_exchanges.contains(venue)
+                    && venue_supports_periodic_stats(*venue)
             })
             .collect::<FxHashSet<_>>();
 
         self.build_stats_fetch_task(selected_venues)
+    }
+
+    fn build_qmt_search_task(&self, query: &str) -> Option<Task<Message>> {
+        if query.len() < 2 {
+            return None;
+        }
+
+        let tasks = self
+            .selected_exchanges
+            .iter()
+            .copied()
+            .filter(|venue| {
+                venue_uses_qmt_search(*venue) && !self.unavailable_exchanges.contains(venue)
+            })
+            .map(|venue| {
+                let request_query = query.to_string();
+                let response_query = request_query.clone();
+                Task::perform(
+                    async move {
+                        search_ticker_metadata(venue, &request_query, QMT_SEARCH_RESULT_LIMIT).await
+                    },
+                    move |result| match result {
+                        Ok(ticker_info) => {
+                            Message::QmtSearchResults(venue, response_query.clone(), ticker_info)
+                        }
+                        Err(err) => {
+                            log::error!(
+                                "QMT ticker search failed for {venue:?} / {response_query}: {err}"
+                            );
+                            Message::QmtSearchFailed(
+                                venue,
+                                response_query.clone(),
+                                InternalError::Fetch(format!(
+                                    "{venue:?} search: {}",
+                                    err.ui_message()
+                                )),
+                            )
+                        }
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        (!tasks.is_empty()).then_some(Task::batch(tasks))
+    }
+
+    fn seed_qmt_favorites(&mut self) {
+        let favorites = self.favorited_tickers.iter().copied().collect::<Vec<_>>();
+        for ticker in favorites {
+            if !venue_uses_qmt_search(ticker.exchange.venue()) {
+                continue;
+            }
+            self.ensure_ticker_entry(TickerInfo::new(ticker, 0.01, 1.0, None), false);
+        }
+        self.sort_ticker_rows();
+    }
+
+    fn clear_ephemeral_qmt_rows(&mut self) {
+        if self.ephemeral_qmt_tickers.is_empty() {
+            return;
+        }
+
+        let stale = self.ephemeral_qmt_tickers.clone();
+        self.ticker_rows.retain(|row| !stale.contains(&row.ticker));
+        for ticker in stale {
+            self.display_cache.remove(&ticker);
+            self.row_index.remove(&ticker);
+            self.tickers_info.remove(&ticker);
+            self.ephemeral_qmt_tickers.remove(&ticker);
+        }
+        self.rebuild_index();
+    }
+
+    fn ingest_qmt_search_results(&mut self, info: HashMap<Ticker, Option<TickerInfo>>) {
+        for (ticker, maybe_info) in info {
+            let Some(ticker_info) = maybe_info else {
+                self.tickers_info.insert(ticker, None);
+                continue;
+            };
+
+            self.ensure_ticker_entry(ticker_info, !self.favorited_tickers.contains(&ticker));
+        }
+    }
+
+    fn ensure_ticker_entry(&mut self, ticker_info: TickerInfo, ephemeral: bool) {
+        let ticker = ticker_info.ticker;
+        self.tickers_info.insert(ticker, Some(ticker_info));
+
+        let precision = Some(ticker_info.min_ticksize);
+        if let Some(&idx) = self.row_index.get(&ticker) {
+            let row = &mut self.ticker_rows[idx];
+            row.is_favorited = self.favorited_tickers.contains(&ticker);
+            self.display_cache.insert(
+                ticker,
+                compute_display_data(&ticker, &row.stats, None, precision),
+            );
+        } else {
+            let row = TickerRowData {
+                exchange: ticker.exchange,
+                ticker,
+                stats: placeholder_ticker_stats(),
+                previous_stats: None,
+                is_favorited: self.favorited_tickers.contains(&ticker),
+            };
+            self.ticker_rows.push(row);
+            self.row_index.insert(ticker, self.ticker_rows.len() - 1);
+            self.display_cache.insert(
+                ticker,
+                compute_display_data(&ticker, &placeholder_ticker_stats(), None, precision),
+            );
+        }
+
+        if venue_uses_qmt_search(ticker.exchange.venue()) {
+            if ephemeral {
+                self.ephemeral_qmt_tickers.insert(ticker);
+            } else {
+                self.ephemeral_qmt_tickers.remove(&ticker);
+            }
+        }
     }
 
     fn build_stats_fetch_task(&mut self, venues: FxHashSet<Venue>) -> Option<Task<Message>> {
@@ -389,8 +566,18 @@ impl TickersTable {
 
             if row.is_favorited {
                 self.favorited_tickers.insert(ticker);
+                self.ephemeral_qmt_tickers.remove(&ticker);
             } else {
                 self.favorited_tickers.remove(&ticker);
+
+                if venue_uses_qmt_search(ticker.exchange.venue()) {
+                    if self.search_query.is_empty() {
+                        self.ephemeral_qmt_tickers.insert(ticker);
+                        self.clear_ephemeral_qmt_rows();
+                        return;
+                    }
+                    self.ephemeral_qmt_tickers.insert(ticker);
+                }
             }
         }
     }
@@ -1155,6 +1342,30 @@ impl TickersTable {
             selection_enabled,
         );
 
+        let uses_qmt_search = self
+            .selected_exchanges
+            .iter()
+            .copied()
+            .any(venue_uses_qmt_search);
+        let empty_state = if total_n == 0 {
+            let message = if uses_qmt_search && search_query.trim().len() < 2 {
+                "Type at least 2 characters to search QMT tickers."
+            } else if uses_qmt_search {
+                "No QMT tickers matched your search."
+            } else {
+                "No tickers available."
+            };
+
+            Some(
+                container(text(message).size(12))
+                    .padding([8, 4])
+                    .width(Length::Fill)
+                    .center_x(Length::Fill),
+            )
+        } else {
+            None
+        };
+
         let mut content = column![top_bar]
             .spacing(8)
             .padding(padding::right(8))
@@ -1163,6 +1374,9 @@ impl TickersTable {
             content = content
                 .push(sel)
                 .push(rule::horizontal(1.0).style(style::split_ruler));
+        }
+        if let Some(empty_state) = empty_state {
+            content = content.push(empty_state);
         }
         content = content.push(list);
 
@@ -1545,7 +1759,7 @@ fn fetch_ticker_stats_task(
     tickers_info: &FxHashMap<Ticker, Option<TickerInfo>>,
 ) -> Task<Message> {
     let markets_to_fetch = available_markets(venue);
-    let requires_contract_sizes = matches!(venue, Venue::Binance | Venue::Mexc);
+    let requires_contract_sizes = matches!(venue, Venue::Binance);
 
     let contract_sizes = requires_contract_sizes.then(|| {
         tickers_info

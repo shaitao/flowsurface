@@ -296,7 +296,7 @@ impl PaneSetup {
                 Some(tm)
             }
             ContentKind::FootprintChart => {
-                Some(current_tick_multiplier.unwrap_or(TickMultiplier(50)))
+                Some(current_tick_multiplier.unwrap_or(TickMultiplier(1)))
             }
             ContentKind::CandlestickChart
             | ContentKind::ComparisonChart

@@ -47,6 +47,7 @@ pub enum Effect {
     RequestFetch(Vec<FetchSpec>),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
+    SyncTickerSearch(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -377,6 +378,7 @@ impl State {
         timeframe: Timeframe,
         ticker_info: TickerInfo,
         klines: &[Kline],
+        is_batches_done: bool,
     ) {
         match &mut self.content {
             Content::Kline {
@@ -395,21 +397,25 @@ impl State {
                         );
                         return;
                     }
-                    chart.insert_hist_klines(id, klines);
+                    chart.insert_hist_klines(id, klines, is_batches_done);
                 } else {
-                    let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
-                    let layout = chart.chart_layout();
+                    if chart.basis() == Basis::Time(timeframe) {
+                        chart.insert_hist_klines_without_request(klines);
+                    } else {
+                        let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
+                        let layout = chart.chart_layout();
 
-                    *chart = KlineChart::new(
-                        layout,
-                        Basis::Time(timeframe),
-                        tick_size,
-                        klines,
-                        raw_trades,
-                        indicators,
-                        ticker_info,
-                        chart.kind(),
-                    );
+                        *chart = KlineChart::new(
+                            layout,
+                            Basis::Time(timeframe),
+                            tick_size,
+                            klines,
+                            raw_trades,
+                            indicators,
+                            ticker_info,
+                            chart.kind(),
+                        );
+                    }
                 }
             }
             Content::Comparison(chart) => {
@@ -438,6 +444,31 @@ impl State {
             _ => {
                 log::error!("pane content not candlestick or footprint");
             }
+        }
+    }
+
+    pub fn mark_fetch_failed(
+        &mut self,
+        stream: Option<StreamKind>,
+        req_id: Option<uuid::Uuid>,
+        error: String,
+    ) {
+        let Some(req_id) = req_id else {
+            return;
+        };
+
+        match (&mut self.content, stream) {
+            (Content::Kline { chart, .. }, _) => {
+                if let Some(chart) = chart {
+                    chart.mark_request_failed(req_id, error);
+                }
+            }
+            (Content::Comparison(chart), Some(StreamKind::Kline { ticker_info, .. })) => {
+                if let Some(chart) = chart {
+                    chart.mark_request_failed(ticker_info, req_id, error);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -825,7 +856,7 @@ impl State {
                         data::chart::KlineChartKind::Footprint { .. } => {
                             let basis = chart.basis();
                             let tick_multiply =
-                                self.settings.tick_multiply.unwrap_or(TickMultiplier(10));
+                                self.settings.tick_multiply.unwrap_or(TickMultiplier(1));
 
                             let kind = ModifierKind::Footprint(basis, tick_multiply);
                             let stream_pair = self.stream_pair();
@@ -1294,28 +1325,34 @@ impl State {
                 {
                     self.modal = Some(Modal::MiniTickersList(mini_panel.clone()));
 
-                    let crate::modal::pane::mini_tickers_list::Action::RowSelected(sel) = action;
-                    match sel {
-                        crate::modal::pane::mini_tickers_list::RowSelection::Add(ti) => {
-                            if let Content::Comparison(chart) = &mut self.content
-                                && let Some(c) = chart
-                            {
-                                let rebuilt = c.add_ticker(&ti);
-                                self.streams = ResolvedStream::Ready(rebuilt);
-                                return Some(Effect::RefreshStreams);
-                            }
+                    match action {
+                        crate::modal::pane::mini_tickers_list::Action::SearchChanged(query) => {
+                            return Some(Effect::SyncTickerSearch(query));
                         }
-                        crate::modal::pane::mini_tickers_list::RowSelection::Remove(ti) => {
-                            if let Content::Comparison(chart) = &mut self.content
-                                && let Some(c) = chart
-                            {
-                                let rebuilt = c.remove_ticker(&ti);
-                                self.streams = ResolvedStream::Ready(rebuilt);
-                                return Some(Effect::RefreshStreams);
+                        crate::modal::pane::mini_tickers_list::Action::RowSelected(sel) => {
+                            match sel {
+                                crate::modal::pane::mini_tickers_list::RowSelection::Add(ti) => {
+                                    if let Content::Comparison(chart) = &mut self.content
+                                        && let Some(c) = chart
+                                    {
+                                        let rebuilt = c.add_ticker(&ti);
+                                        self.streams = ResolvedStream::Ready(rebuilt);
+                                        return Some(Effect::RefreshStreams);
+                                    }
+                                }
+                                crate::modal::pane::mini_tickers_list::RowSelection::Remove(ti) => {
+                                    if let Content::Comparison(chart) = &mut self.content
+                                        && let Some(c) = chart
+                                    {
+                                        let rebuilt = c.remove_ticker(&ti);
+                                        self.streams = ResolvedStream::Ready(rebuilt);
+                                        return Some(Effect::RefreshStreams);
+                                    }
+                                }
+                                crate::modal::pane::mini_tickers_list::RowSelection::Switch(ti) => {
+                                    return Some(Effect::SwitchTickersInGroup(ti));
+                                }
                             }
-                        }
-                        crate::modal::pane::mini_tickers_list::RowSelection::Switch(ti) => {
-                            return Some(Effect::SwitchTickersInGroup(ti));
                         }
                     }
                 }

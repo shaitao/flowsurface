@@ -11,10 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 pub mod binance;
-pub mod bybit;
-pub mod hyperliquid;
-pub mod mexc;
-pub mod okex;
+pub mod qmt;
 
 /// Buffer trades and flush in this interval
 const TRADE_BUCKET_INTERVAL: Duration = Duration::from_micros(33_333);
@@ -450,21 +447,13 @@ pub struct StreamSpecs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum Venue {
-    Bybit,
     Binance,
-    Hyperliquid,
-    Okex,
-    Mexc,
+    SSZ,
+    SSH,
 }
 
 impl Venue {
-    pub const ALL: [Venue; 5] = [
-        Venue::Bybit,
-        Venue::Binance,
-        Venue::Hyperliquid,
-        Venue::Okex,
-        Venue::Mexc,
-    ];
+    pub const ALL: [Venue; 3] = [Venue::Binance, Venue::SSZ, Venue::SSH];
 }
 
 impl std::fmt::Display for Venue {
@@ -473,11 +462,9 @@ impl std::fmt::Display for Venue {
             f,
             "{}",
             match self {
-                Venue::Bybit => "Bybit",
                 Venue::Binance => "Binance",
-                Venue::Hyperliquid => "Hyperliquid",
-                Venue::Okex => "OKX",
-                Venue::Mexc => "MEXC",
+                Venue::SSZ => "SSZ",
+                Venue::SSH => "SSH",
             }
         )
     }
@@ -487,16 +474,12 @@ impl FromStr for Venue {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.eq_ignore_ascii_case("bybit") {
-            Ok(Self::Bybit)
-        } else if s.eq_ignore_ascii_case("binance") {
+        if s.eq_ignore_ascii_case("binance") {
             Ok(Self::Binance)
-        } else if s.eq_ignore_ascii_case("hyperliquid") {
-            Ok(Self::Hyperliquid)
-        } else if s.eq_ignore_ascii_case("okx") || s.eq_ignore_ascii_case("okex") {
-            Ok(Self::Okex)
-        } else if s.eq_ignore_ascii_case("mexc") {
-            Ok(Self::Mexc)
+        } else if s.eq_ignore_ascii_case("ssz") {
+            Ok(Self::SSZ)
+        } else if s.eq_ignore_ascii_case("ssh") {
+            Ok(Self::SSH)
         } else {
             Err(format!("Invalid venue: {}", s))
         }
@@ -508,22 +491,23 @@ pub enum Exchange {
     BinanceLinear,
     BinanceInverse,
     BinanceSpot,
-    BybitLinear,
-    BybitInverse,
-    BybitSpot,
-    HyperliquidLinear,
-    HyperliquidSpot,
-    OkexLinear,
-    OkexInverse,
-    OkexSpot,
-    MexcLinear,
-    MexcInverse,
-    MexcSpot,
+    SSZ,
+    SSH,
 }
 
 impl std::fmt::Display for Exchange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.venue(), self.market_type())
+        write!(
+            f,
+            "{}",
+            match self {
+                Exchange::BinanceLinear => "Binance Linear",
+                Exchange::BinanceInverse => "Binance Inverse",
+                Exchange::BinanceSpot => "Binance Spot",
+                Exchange::SSZ => "SSZ",
+                Exchange::SSH => "SSH",
+            }
+        )
     }
 }
 
@@ -531,42 +515,24 @@ impl FromStr for Exchange {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut parts = s.split_whitespace();
-        let Some(venue_part) = parts.next() else {
-            return Err(format!("Invalid exchange: {}", s));
-        };
-        let Some(market_part) = parts.next() else {
-            return Err(format!("Invalid exchange: {}", s));
-        };
-
-        if parts.next().is_some() {
-            return Err(format!("Invalid exchange: {}", s));
+        match s {
+            "Binance Linear" | "BinanceLinear" => Ok(Exchange::BinanceLinear),
+            "Binance Inverse" | "BinanceInverse" => Ok(Exchange::BinanceInverse),
+            "Binance Spot" | "BinanceSpot" => Ok(Exchange::BinanceSpot),
+            "SSZ" | "SSZ Spot" | "SSZSpot" => Ok(Exchange::SSZ),
+            "SSH" | "SSH Spot" | "SSHSpot" => Ok(Exchange::SSH),
+            _ => Err(format!("Invalid exchange: {}", s)),
         }
-
-        let venue = Venue::from_str(venue_part).map_err(|_| format!("Invalid exchange: {}", s))?;
-        let market =
-            MarketKind::from_str(market_part).map_err(|_| format!("Invalid exchange: {}", s))?;
-
-        Self::from_venue_and_market(venue, market).ok_or_else(|| format!("Invalid exchange: {}", s))
     }
 }
 
 impl Exchange {
-    pub const ALL: [Exchange; 14] = [
+    pub const ALL: [Exchange; 5] = [
         Exchange::BinanceLinear,
         Exchange::BinanceInverse,
         Exchange::BinanceSpot,
-        Exchange::BybitLinear,
-        Exchange::BybitInverse,
-        Exchange::BybitSpot,
-        Exchange::HyperliquidLinear,
-        Exchange::HyperliquidSpot,
-        Exchange::OkexLinear,
-        Exchange::OkexInverse,
-        Exchange::OkexSpot,
-        Exchange::MexcLinear,
-        Exchange::MexcInverse,
-        Exchange::MexcSpot,
+        Exchange::SSZ,
+        Exchange::SSH,
     ];
 
     pub fn from_venue_and_market(venue: Venue, market: MarketKind) -> Option<Self> {
@@ -577,90 +543,63 @@ impl Exchange {
 
     pub fn market_type(&self) -> MarketKind {
         match self {
-            Exchange::BinanceLinear
-            | Exchange::BybitLinear
-            | Exchange::HyperliquidLinear
-            | Exchange::OkexLinear
-            | Exchange::MexcLinear => MarketKind::LinearPerps,
-            Exchange::BinanceInverse
-            | Exchange::BybitInverse
-            | Exchange::OkexInverse
-            | Exchange::MexcInverse => MarketKind::InversePerps,
-            Exchange::BinanceSpot
-            | Exchange::BybitSpot
-            | Exchange::HyperliquidSpot
-            | Exchange::OkexSpot
-            | Exchange::MexcSpot => MarketKind::Spot,
+            Exchange::BinanceLinear => MarketKind::LinearPerps,
+            Exchange::BinanceInverse => MarketKind::InversePerps,
+            Exchange::BinanceSpot | Exchange::SSZ | Exchange::SSH => MarketKind::Spot,
         }
     }
 
     pub fn venue(&self) -> Venue {
         match self {
-            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => Venue::Bybit,
             Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
                 Venue::Binance
             }
-            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => Venue::Hyperliquid,
-            Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => Venue::Okex,
-            Exchange::MexcLinear | Exchange::MexcInverse | Exchange::MexcSpot => Venue::Mexc,
+            Exchange::SSZ => Venue::SSZ,
+            Exchange::SSH => Venue::SSH,
         }
     }
 
     pub fn is_depth_client_aggr(&self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot
+            Exchange::BinanceLinear
+                | Exchange::BinanceInverse
+                | Exchange::BinanceSpot
+                | Exchange::SSZ
+                | Exchange::SSH
         )
     }
 
     pub fn is_custom_push_freq(&self) -> bool {
-        matches!(
-            self,
-            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot
-        )
+        false
+    }
+
+    pub fn allowed_push_freqs(&self) -> &[PushFrequency] {
+        &[PushFrequency::ServerDefault]
     }
 
     pub fn supports_heatmap_timeframe(&self, tf: Timeframe) -> bool {
-        match self {
-            Exchange::BybitSpot
-            | Exchange::MexcSpot
-            | Exchange::MexcInverse
-            | Exchange::MexcLinear => {
-                tf != Timeframe::MS100 && tf != Timeframe::MS300 && tf != Timeframe::MS500
-            }
-            Exchange::BybitLinear | Exchange::BybitInverse => tf != Timeframe::MS200,
-            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-                tf != Timeframe::MS100 && tf != Timeframe::MS200 && tf != Timeframe::MS300
-            }
-            _ => true,
+        match self.venue() {
+            Venue::Binance => Timeframe::HEATMAP.contains(&tf),
+            Venue::SSZ | Venue::SSH => matches!(tf, Timeframe::MS3000),
         }
+    }
+
+    pub fn supports_custom_minutes_timeframe(&self) -> bool {
+        matches!(self.venue(), Venue::SSZ | Venue::SSH)
     }
 
     pub fn supports_kline_timeframe(&self, tf: Timeframe) -> bool {
         match self.venue() {
-            Venue::Binance | Venue::Bybit | Venue::Hyperliquid | Venue::Okex => {
-                Timeframe::KLINE.contains(&tf)
-            }
-            Venue::Mexc => {
-                Timeframe::KLINE.contains(&tf)
-                    && !matches!(tf, Timeframe::M3 | Timeframe::H2 | Timeframe::H12)
+            Venue::Binance => Timeframe::KLINE.contains(&tf),
+            Venue::SSZ | Venue::SSH => {
+                matches!(tf, Timeframe::D1) || tf.to_milliseconds() >= 60_000
             }
         }
     }
 
     pub fn is_perps(&self) -> bool {
-        matches!(
-            self,
-            Exchange::BinanceLinear
-                | Exchange::BinanceInverse
-                | Exchange::BybitLinear
-                | Exchange::BybitInverse
-                | Exchange::HyperliquidLinear
-                | Exchange::OkexLinear
-                | Exchange::OkexInverse
-                | Exchange::MexcLinear
-                | Exchange::MexcInverse
-        )
+        matches!(self, Exchange::BinanceLinear | Exchange::BinanceInverse)
     }
 
     pub fn stream_ticksize(
@@ -724,9 +663,6 @@ impl<I> StreamConfig<I> {
 
 /// Returns a map of tickers to their [`TickerInfo`].
 /// If metadata for a ticker can't be fetched/parsed expectedly, it will still be included in the map as `None`.
-///
-/// `Binance`, `Bybit`, and `Hyperliquid` are fetched per market, while
-/// `Okex` and `Mexc` handle market branching internally due to combined perps endpoints.
 pub async fn fetch_ticker_metadata(
     venue: Venue,
     markets: &[MarketKind],
@@ -739,29 +675,24 @@ pub async fn fetch_ticker_metadata(
             }
             Ok(out)
         }
-        Venue::Bybit => {
-            let mut out = HashMap::default();
-            for market in markets {
-                out.extend(bybit::fetch_ticker_metadata(*market).await?);
-            }
-            Ok(out)
-        }
-        Venue::Hyperliquid => {
-            let mut out = HashMap::default();
-            for market in markets {
-                out.extend(hyperliquid::fetch_ticker_metadata(*market).await?);
-            }
-            Ok(out)
-        }
-        Venue::Okex => okex::fetch_ticker_metadata(markets).await,
-        Venue::Mexc => mexc::fetch_ticker_metadata(markets).await,
+        Venue::SSZ | Venue::SSH => qmt::fetch_ticker_metadata(venue).await,
+    }
+}
+
+pub async fn search_ticker_metadata(
+    venue: Venue,
+    query: &str,
+    limit: usize,
+) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError> {
+    match venue {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "On-demand ticker search is only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::search_ticker_metadata(venue, query, limit).await,
     }
 }
 
 /// Returns a map of tickers to their [`TickerStats`].
-///
-/// `Binance`, `Bybit`, and `Hyperliquid` are fetched per market, while
-/// `Okex` and `Mexc` handle market branching internally due to combined perps endpoints.
 pub async fn fetch_ticker_stats(
     venue: Venue,
     markets: &[MarketKind],
@@ -775,22 +706,7 @@ pub async fn fetch_ticker_stats(
             }
             Ok(out)
         }
-        Venue::Bybit => {
-            let mut out = HashMap::default();
-            for market in markets {
-                out.extend(bybit::fetch_ticker_stats(*market).await?);
-            }
-            Ok(out)
-        }
-        Venue::Hyperliquid => {
-            let mut out = HashMap::default();
-            for market in markets {
-                out.extend(hyperliquid::fetch_ticker_stats(*market).await?);
-            }
-            Ok(out)
-        }
-        Venue::Okex => okex::fetch_ticker_stats(markets).await,
-        Venue::Mexc => mexc::fetch_ticker_stats(markets, contract_sizes.as_ref()).await,
+        Venue::SSZ | Venue::SSH => qmt::fetch_ticker_stats(venue).await,
     }
 }
 
@@ -801,10 +717,34 @@ pub async fn fetch_klines(
 ) -> Result<Vec<Kline>, AdapterError> {
     match ticker_info.ticker.exchange.venue() {
         Venue::Binance => binance::fetch_klines(ticker_info, timeframe, range).await,
-        Venue::Bybit => bybit::fetch_klines(ticker_info, timeframe, range).await,
-        Venue::Hyperliquid => hyperliquid::fetch_klines(ticker_info, timeframe, range).await,
-        Venue::Okex => okex::fetch_klines(ticker_info, timeframe, range).await,
-        Venue::Mexc => mexc::fetch_klines(ticker_info, timeframe, range).await,
+        Venue::SSZ | Venue::SSH => qmt::fetch_klines(ticker_info, timeframe, range).await,
+    }
+}
+
+pub async fn fetch_klines_and_trades(
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    range: Option<(u64, u64)>,
+) -> Result<(Vec<Kline>, Vec<Trade>), AdapterError> {
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "Combined historical kline/trade fetch is only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => {
+            qmt::fetch_klines_and_trades(ticker_info, timeframe, range).await
+        }
+    }
+}
+
+pub async fn fetch_trades(
+    ticker_info: TickerInfo,
+    range: (u64, u64),
+) -> Result<Vec<Trade>, AdapterError> {
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "Generic historical trade fetch is only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::fetch_trades(ticker_info, range).await,
     }
 }
 
@@ -818,12 +758,6 @@ pub async fn fetch_open_interest(
     match exchange {
         Exchange::BinanceLinear | Exchange::BinanceInverse => {
             binance::fetch_historical_oi(ticker_info, range, timeframe).await
-        }
-        Exchange::BybitLinear | Exchange::BybitInverse => {
-            bybit::fetch_historical_oi(ticker_info, range, timeframe).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse => {
-            okex::fetch_historical_oi(ticker_info, range, timeframe).await
         }
         _ => Err(AdapterError::InvalidRequest(format!(
             "Open interest data not available for {exchange}"
