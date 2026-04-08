@@ -186,6 +186,7 @@ struct LiveKlineStream {
 struct BridgeSearchItem {
     symbol: String,
     #[serde(default)]
+    #[allow(dead_code)]
     display_name: Option<String>,
     min_ticksize: f32,
     min_qty: f32,
@@ -604,9 +605,7 @@ fn is_qmt_trading_day(venue: Venue, day: NaiveDate) -> bool {
 }
 
 fn china_trading_day(timestamp_ms: u64) -> Option<chrono::NaiveDate> {
-    let adjusted =
-        chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)? + chrono::Duration::hours(8);
-    Some(adjusted.date_naive())
+    china_datetime(timestamp_ms).map(|dt| dt.date_naive())
 }
 
 fn china_offset() -> Option<FixedOffset> {
@@ -2251,10 +2250,6 @@ pub fn connect_kline_stream(
         };
         let exchange = ticker_info.exchange();
 
-        if streams.is_empty() {
-            return;
-        }
-
         let unique_tickers = streams
             .iter()
             .map(|(ticker_info, _)| ticker_info.ticker)
@@ -2434,7 +2429,6 @@ pub async fn search_ticker_metadata(
         serde_json::from_str(&text).map_err(|e| AdapterError::ParseError(e.to_string()))?;
     let mut map = HashMap::new();
     for item in parsed.items {
-        let _ = item.display_name.as_deref();
         let Some(exchange) = qmt_exchange_from_symbol(&item.symbol) else {
             continue;
         };
@@ -2588,7 +2582,7 @@ async fn fetch_tick_derived_history(
         .collect();
     let derive_elapsed = derive_started_at.elapsed();
 
-    log::warn!(
+    log::info!(
         "QMT derived history {} {} latest_day_only={} requested={:?} effective=({}..{}) seed_start={} ticks={} trades={} klines={} fetch_elapsed={:?} derive_elapsed={:?} total_elapsed={:?}",
         ticker_info.ticker,
         timeframe,
