@@ -98,30 +98,42 @@ fn qmt_bridge_ws_url(
 #[serde(rename_all = "camelCase")]
 struct QmtTick {
     time: u64,
-    #[serde(default)]
-    last_price: Option<f32>,
-    #[serde(default)]
-    open: Option<f32>,
-    #[serde(default)]
-    high: Option<f32>,
-    #[serde(default)]
-    low: Option<f32>,
-    #[serde(default)]
-    last_close: Option<f32>,
-    #[serde(default)]
-    amount: Option<f32>,
-    #[serde(default)]
-    volume: Option<u64>,
-    #[serde(default)]
-    transaction_num: Option<u64>,
-    #[serde(default)]
+    last_price: f32,
+    open: f32,
+    high: f32,
+    low: f32,
+    last_close: f32,
+    volume: u64,
     ask_price: Vec<f32>,
-    #[serde(default)]
     bid_price: Vec<f32>,
-    #[serde(default)]
     ask_vol: Vec<f32>,
-    #[serde(default)]
     bid_vol: Vec<f32>,
+}
+
+impl QmtTick {
+    fn valid_last_price(&self) -> Option<f32> {
+        positive_f32(self.last_price)
+    }
+
+    fn valid_open(&self) -> Option<f32> {
+        positive_f32(self.open)
+    }
+
+    fn valid_high(&self) -> Option<f32> {
+        positive_f32(self.high)
+    }
+
+    fn valid_low(&self) -> Option<f32> {
+        positive_f32(self.low)
+    }
+
+    fn valid_last_close(&self) -> Option<f32> {
+        positive_f32(self.last_close)
+    }
+}
+
+fn positive_f32(value: f32) -> Option<f32> {
+    (value > 0.0).then_some(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,7 +495,7 @@ fn build_live_kline_from_ticks(
     let first_bucket_tick = relevant_ticks
         .iter()
         .find(|tick| tick.time >= bucket_start)?;
-    let close = latest_tick.last_price.filter(|price| *price > 0.0)?;
+    let close = latest_tick.valid_last_price()?;
     let open = if let Some(day) = china_trading_day(latest_tick.time) {
         let opening_session_start = qmt_session_bounds(venue, day)
             .and_then(|sessions| sessions.first().copied())
@@ -493,18 +505,16 @@ fn build_live_kline_from_ticks(
 
         if opening_bucket == Some(bucket_start) {
             first_bucket_tick
-                .open
-                .or(first_bucket_tick.last_price)
-                .filter(|price| *price > 0.0)
+                .valid_open()
+                .or_else(|| first_bucket_tick.valid_last_price())
         } else {
             last_seed_tick
                 .as_ref()
-                .and_then(|tick| tick.last_price)
-                .filter(|price| *price > 0.0)
-                .or(first_bucket_tick.last_price.filter(|price| *price > 0.0))
+                .and_then(|tick| tick.valid_last_price())
+                .or_else(|| first_bucket_tick.valid_last_price())
         }
     } else {
-        first_bucket_tick.last_price.filter(|price| *price > 0.0)
+        first_bucket_tick.valid_last_price()
     }?;
 
     let mut high = close;
@@ -513,18 +523,15 @@ fn build_live_kline_from_ticks(
         .iter()
         .filter(|tick| tick.time >= bucket_start)
     {
-        if let Some(last_price) = tick.last_price.filter(|price| *price > 0.0) {
+        if let Some(last_price) = tick.valid_last_price() {
             high = high.max(last_price);
             low = low.min(last_price);
         }
     }
 
-    let baseline_volume = last_seed_tick.and_then(|tick| tick.volume).unwrap_or(0);
-    let current_volume = latest_tick
-        .volume
-        .unwrap_or(baseline_volume)
-        .saturating_sub(baseline_volume) as f32
-        * QMT_VOLUME_LOT_SIZE;
+    let baseline_volume = last_seed_tick.as_ref().map_or(0, |tick| tick.volume);
+    let current_volume =
+        latest_tick.volume.saturating_sub(baseline_volume) as f32 * QMT_VOLUME_LOT_SIZE;
 
     Some(Kline::new(
         bucket_start,
@@ -1091,11 +1098,7 @@ fn build_daily_seed_prices(ticks: &[QmtTick]) -> HashMap<NaiveDate, f32> {
             continue;
         }
 
-        if let Some(price) = tick
-            .last_close
-            .or(tick.last_price)
-            .filter(|price| *price > 0.0)
-        {
+        if let Some(price) = tick.valid_last_close().or_else(|| tick.valid_last_price()) {
             seeds.insert(day, price);
         }
     }
@@ -1194,7 +1197,7 @@ fn aggregate_trades_to_klines(
             continue;
         };
 
-        if let Some(last_price) = tick.last_price.filter(|price| *price > 0.0) {
+        if let Some(last_price) = tick.valid_last_price() {
             bar.high = bar.high.max(last_price);
             bar.low = bar.low.min(last_price);
         }
@@ -1217,25 +1220,19 @@ fn aggregate_trades_to_klines(
         let day_changed =
             china_trading_day(previous_tick.time) != china_trading_day(current_tick.time);
 
-        if let Some(current_high) = current_tick.high.filter(|price| *price > 0.0) {
+        if let Some(current_high) = current_tick.valid_high() {
             let high_increased = day_changed
-                || matches!(
-                    previous_tick.high,
-                    Some(previous_high) if current_high > previous_high + f32::EPSILON
-                )
-                || previous_tick.high.is_none();
+                || previous_tick.valid_high().is_none()
+                || current_high > previous_tick.high + f32::EPSILON;
             if high_increased {
                 bar.high = bar.high.max(current_high);
             }
         }
 
-        if let Some(current_low) = current_tick.low.filter(|price| *price > 0.0) {
+        if let Some(current_low) = current_tick.valid_low() {
             let low_decreased = day_changed
-                || matches!(
-                    previous_tick.low,
-                    Some(previous_low) if current_low + f32::EPSILON < previous_low
-                )
-                || previous_tick.low.is_none();
+                || previous_tick.valid_low().is_none()
+                || current_low + f32::EPSILON < previous_tick.low;
             if low_decreased {
                 bar.low = bar.low.min(current_low);
             }
@@ -1267,7 +1264,7 @@ fn aggregate_trades_to_klines(
             continue;
         }
 
-        if let Some(open_price) = tick.open.filter(|price| *price > 0.0) {
+        if let Some(open_price) = tick.valid_open() {
             bar.open = open_price;
             bar.high = bar.high.max(open_price);
             bar.low = bar.low.min(open_price);
@@ -1355,57 +1352,32 @@ fn classify_synthetic_trade_side(
     }
 }
 
+fn synthetic_trade_qty_from_volume(previous_tick: &QmtTick, current_tick: &QmtTick) -> Option<f32> {
+    let day_changed = china_trading_day(previous_tick.time) != china_trading_day(current_tick.time);
+
+    if current_tick.volume < previous_tick.volume {
+        return day_changed
+            .then_some(current_tick.volume)
+            .filter(|volume| *volume > 0)
+            .map(|volume| volume as f32 * QMT_VOLUME_LOT_SIZE);
+    }
+
+    (current_tick.volume > previous_tick.volume)
+        .then_some(current_tick.volume - previous_tick.volume)
+        .map(|delta| delta as f32 * QMT_VOLUME_LOT_SIZE)
+}
+
 fn synthesize_trades_for_tick_pair(
     previous_tick: &QmtTick,
     current_tick: &QmtTick,
     ticker_info: TickerInfo,
 ) -> Vec<Trade> {
-    let day_changed = china_trading_day(previous_tick.time) != china_trading_day(current_tick.time);
-
-    let volume_reset = matches!(
-        (previous_tick.volume, current_tick.volume),
-        (Some(prev), Some(curr)) if curr < prev
-    );
-    let amount_reset = matches!(
-        (previous_tick.amount, current_tick.amount),
-        (Some(prev), Some(curr)) if curr + f32::EPSILON < prev
-    );
-    let txn_reset = matches!(
-        (previous_tick.transaction_num, current_tick.transaction_num),
-        (Some(prev), Some(curr)) if curr < prev
-    );
-    let counters_reset = volume_reset || amount_reset || txn_reset;
-
-    if counters_reset && !day_changed {
-        return Vec::new();
-    }
-
-    let baseline_volume = if counters_reset && day_changed {
-        Some(0)
-    } else {
-        previous_tick.volume
-    };
-    let qty_raw = match (current_tick.volume, baseline_volume) {
-        (Some(curr), Some(base)) if curr > base => Some((curr - base) as f32 * QMT_VOLUME_LOT_SIZE),
-        (Some(curr), None) if curr > 0 => Some(curr as f32 * QMT_VOLUME_LOT_SIZE),
-        _ => None,
-    };
-
-    let Some(qty_raw) = qty_raw else {
+    let Some(qty_raw) = synthetic_trade_qty_from_volume(previous_tick, current_tick) else {
         return Vec::new();
     };
-
-    if qty_raw <= 0.0 {
-        return Vec::new();
-    }
-
-    let Some(raw_price) = current_tick.last_price else {
+    let Some(raw_price) = current_tick.valid_last_price() else {
         return Vec::new();
     };
-
-    if raw_price <= 0.0 {
-        return Vec::new();
-    }
 
     let price = Price::from_f32(raw_price).round_to_min_tick(ticker_info.min_ticksize);
     let qty = Qty::from_f32(qty_raw).round_to_min_qty(ticker_info.min_qty);
@@ -1489,14 +1461,12 @@ mod tests {
     fn sample_tick(time: u64) -> QmtTick {
         QmtTick {
             time,
-            last_price: Some(82.0),
-            open: None,
-            high: Some(82.0),
-            low: Some(82.0),
-            last_close: Some(82.38),
-            amount: Some(0.0),
-            volume: Some(0),
-            transaction_num: Some(0),
+            last_price: 82.0,
+            open: 0.0,
+            high: 82.0,
+            low: 82.0,
+            last_close: 82.38,
+            volume: 0,
             ask_price: Vec::new(),
             bid_price: Vec::new(),
             ask_vol: Vec::new(),
@@ -1508,17 +1478,13 @@ mod tests {
     fn synthesize_trade_uses_last_price_with_volume_qty() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
-        previous.amount = Some(24_196_695.0);
-        previous.volume = Some(2_958);
-        previous.transaction_num = Some(258);
+        previous.volume = 2_958;
         previous.bid_price = vec![82.06];
         previous.ask_price = vec![82.08];
 
         let mut current = sample_tick(1_775_525_404_000);
-        current.last_price = Some(82.08);
-        current.amount = Some(25_976_594.0);
-        current.volume = Some(3_175);
-        current.transaction_num = Some(284);
+        current.last_price = 82.08;
+        current.volume = 3_175;
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
         let trade = trades
@@ -1535,16 +1501,14 @@ mod tests {
     fn synthesize_trade_requires_current_last_price() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
-        previous.last_price = Some(82.00);
-        previous.volume = Some(2_958);
-        previous.transaction_num = Some(258);
+        previous.last_price = 82.00;
+        previous.volume = 2_958;
         previous.bid_price = vec![81.99];
         previous.ask_price = vec![82.01];
 
         let mut current = sample_tick(1_775_525_404_000);
-        current.last_price = None;
-        current.volume = Some(3_175);
-        current.transaction_num = Some(284);
+        current.last_price = 0.0;
+        current.volume = 3_175;
 
         assert!(synthesize_trades_for_tick_pair(&previous, &current, ticker_info).is_empty());
     }
@@ -1553,15 +1517,13 @@ mod tests {
     fn synthesize_trade_uses_previous_bid_for_sell_classification() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
-        previous.volume = Some(100);
-        previous.transaction_num = Some(10);
+        previous.volume = 100;
         previous.bid_price = vec![82.00];
         previous.ask_price = vec![82.02];
 
         let mut current = sample_tick(1_775_525_404_000);
-        current.last_price = Some(82.00);
-        current.volume = Some(101);
-        current.transaction_num = Some(11);
+        current.last_price = 82.00;
+        current.volume = 101;
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
 
@@ -1574,15 +1536,13 @@ mod tests {
     fn synthesize_trade_splits_inside_previous_spread_without_fallback() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
-        previous.volume = Some(100);
-        previous.transaction_num = Some(10);
+        previous.volume = 100;
         previous.bid_price = vec![82.00];
         previous.ask_price = vec![82.02];
 
         let mut current = sample_tick(1_775_525_404_000);
-        current.last_price = Some(82.01);
-        current.volume = Some(101);
-        current.transaction_num = Some(11);
+        current.last_price = 82.01;
+        current.volume = 101;
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
 
@@ -1597,15 +1557,33 @@ mod tests {
     fn synthesize_trade_requires_previous_top_of_book_without_fallback() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
-        previous.volume = Some(100);
-        previous.transaction_num = Some(10);
+        previous.volume = 100;
 
         let mut current = sample_tick(1_775_525_404_000);
-        current.last_price = Some(82.01);
-        current.volume = Some(101);
-        current.transaction_num = Some(11);
+        current.last_price = 82.01;
+        current.volume = 101;
 
         assert!(synthesize_trades_for_tick_pair(&previous, &current, ticker_info).is_empty());
+    }
+
+    #[test]
+    fn synthesize_trade_uses_volume_delta_as_single_quantity_source() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.volume = 100;
+        previous.bid_price = vec![82.00];
+        previous.ask_price = vec![82.02];
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = 82.02;
+        current.volume = 101;
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 1);
+        assert!(!trades[0].is_sell);
+        assert_eq!(trades[0].price.to_f32(), 82.02);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
     }
 
     #[test]
@@ -1630,14 +1608,14 @@ mod tests {
         ];
 
         let mut tick1 = sample_tick(start + 1_000);
-        tick1.last_price = Some(82.00);
-        tick1.high = Some(82.00);
-        tick1.low = Some(82.00);
+        tick1.last_price = 82.00;
+        tick1.high = 82.00;
+        tick1.low = 82.00;
 
         let mut tick2 = sample_tick(start + 13_000);
-        tick2.last_price = Some(82.09);
-        tick2.high = Some(82.37);
-        tick2.low = Some(81.80);
+        tick2.last_price = 82.09;
+        tick2.high = 82.37;
+        tick2.low = 81.80;
 
         let bars = aggregate_trades_to_klines(
             &trades,
@@ -1678,16 +1656,16 @@ mod tests {
         ];
 
         let mut tick1 = sample_tick(start + 1_000);
-        tick1.open = Some(81.80);
-        tick1.last_price = Some(82.00);
-        tick1.high = Some(82.00);
-        tick1.low = Some(81.80);
+        tick1.open = 81.80;
+        tick1.last_price = 82.00;
+        tick1.high = 82.00;
+        tick1.low = 81.80;
 
         let mut tick2 = sample_tick(start + 13_000);
-        tick2.open = Some(81.80);
-        tick2.last_price = Some(82.09);
-        tick2.high = Some(82.37);
-        tick2.low = Some(81.80);
+        tick2.open = 81.80;
+        tick2.last_price = 82.09;
+        tick2.high = 82.37;
+        tick2.low = 81.80;
 
         let bars = aggregate_trades_to_klines(
             &trades,
@@ -1830,19 +1808,16 @@ mod tests {
     #[test]
     fn merge_ticks_keeps_order_and_deduplicates() {
         let mut tick1 = sample_tick(china_ms(2026, 4, 9, 9, 30, 1));
-        tick1.volume = Some(100);
-        tick1.transaction_num = Some(1);
-        tick1.last_price = Some(82.01);
+        tick1.volume = 100;
+        tick1.last_price = 82.01;
 
         let mut tick2 = sample_tick(china_ms(2026, 4, 9, 9, 30, 2));
-        tick2.volume = Some(120);
-        tick2.transaction_num = Some(2);
-        tick2.last_price = Some(82.02);
+        tick2.volume = 120;
+        tick2.last_price = 82.02;
 
         let mut tick3 = sample_tick(china_ms(2026, 4, 9, 9, 30, 3));
-        tick3.volume = Some(140);
-        tick3.transaction_num = Some(3);
-        tick3.last_price = Some(82.03);
+        tick3.volume = 140;
+        tick3.last_price = 82.03;
 
         let merged = merge_ticks(&[tick2.clone()], vec![tick1.clone(), tick2, tick3.clone()]);
 
@@ -1857,21 +1832,18 @@ mod tests {
         let ts = china_ms(2026, 4, 9, 9, 30, 2);
 
         let mut history_tick = sample_tick(ts);
-        history_tick.volume = Some(120);
-        history_tick.transaction_num = Some(2);
-        history_tick.last_price = Some(82.02);
+        history_tick.volume = 120;
+        history_tick.last_price = 82.02;
 
         let mut live_tick = sample_tick(ts);
-        live_tick.volume = Some(130);
-        live_tick.transaction_num = Some(3);
-        live_tick.last_price = Some(82.03);
+        live_tick.volume = 130;
+        live_tick.last_price = 82.03;
 
         let merged = merge_ticks(&[history_tick], vec![live_tick.clone()]);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].time, ts);
         assert_eq!(merged[0].volume, live_tick.volume);
-        assert_eq!(merged[0].transaction_num, live_tick.transaction_num);
         assert_eq!(merged[0].last_price, live_tick.last_price);
     }
 
@@ -1904,29 +1876,26 @@ mod tests {
         let bucket_start = china_ms(2026, 4, 9, 10, 0, 0);
 
         let mut seed_tick = sample_tick(bucket_start - 1_000);
-        seed_tick.last_price = Some(82.10);
-        seed_tick.volume = Some(1_000);
-        seed_tick.transaction_num = Some(10);
+        seed_tick.last_price = 82.10;
+        seed_tick.volume = 1_000;
         seed_tick.bid_price = vec![81.99];
         seed_tick.ask_price = vec![82.00];
 
         let mut tick1 = sample_tick(bucket_start + 1_000);
-        tick1.open = Some(82.00);
-        tick1.last_price = Some(82.00);
-        tick1.high = Some(82.00);
-        tick1.low = Some(82.00);
-        tick1.volume = Some(1_010);
-        tick1.transaction_num = Some(11);
+        tick1.open = 82.00;
+        tick1.last_price = 82.00;
+        tick1.high = 82.00;
+        tick1.low = 82.00;
+        tick1.volume = 1_010;
         tick1.bid_price = vec![82.06];
         tick1.ask_price = vec![82.08];
 
         let mut tick2 = sample_tick(bucket_start + 4_000);
-        tick2.open = Some(82.00);
-        tick2.last_price = Some(82.08);
-        tick2.high = Some(82.08);
-        tick2.low = Some(82.00);
-        tick2.volume = Some(1_030);
-        tick2.transaction_num = Some(13);
+        tick2.open = 82.00;
+        tick2.last_price = 82.08;
+        tick2.high = 82.08;
+        tick2.low = 82.00;
+        tick2.volume = 1_030;
 
         let kline = build_live_kline_from_ticks(
             ticker_info,
@@ -1951,20 +1920,18 @@ mod tests {
         let second_bucket = china_ms(2026, 4, 9, 10, 0, 0);
 
         let mut tick1 = sample_tick(first_bucket + 1_000);
-        tick1.open = Some(82.00);
-        tick1.last_price = Some(82.02);
-        tick1.volume = Some(1_000);
-        tick1.transaction_num = Some(10);
+        tick1.open = 82.00;
+        tick1.last_price = 82.02;
+        tick1.volume = 1_000;
         tick1.bid_price = vec![82.04];
         tick1.ask_price = vec![82.06];
 
         let mut tick2 = sample_tick(second_bucket + 2_000);
-        tick2.open = Some(82.05);
-        tick2.last_price = Some(82.06);
-        tick2.high = Some(82.06);
-        tick2.low = Some(82.05);
-        tick2.volume = Some(1_020);
-        tick2.transaction_num = Some(11);
+        tick2.open = 82.05;
+        tick2.last_price = 82.06;
+        tick2.high = 82.06;
+        tick2.low = 82.05;
+        tick2.volume = 1_020;
 
         let kline = build_live_kline_from_ticks(
             ticker_info,
