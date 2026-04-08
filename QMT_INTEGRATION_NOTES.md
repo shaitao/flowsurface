@@ -961,11 +961,22 @@ Current rule:
 
 - footprint wick should use the actual kline `high/low`
 
-### 4. Heatmap still has no real history backfill
+### 4. Heatmap history is replayed from current-day tick snapshots, not native historical depth
 
-The heatmap currently accumulates from live data after pane open.
+The heatmap no longer starts as pure live-only accumulation after pane open.
 
-It does not yet have proper historical depth reconstruction.
+Current behavior:
+
+- on QMT heatmap open, fetch current-day historical ticks once
+- derive synthetic trades from those ticks
+- derive L1 depth snapshots from those ticks when valid `bid/ask` is present
+- replay that history first, then continue with live websocket updates
+
+Important limit:
+
+- this is still not native historical order-book backfill
+- it is only current-day replay reconstructed from tick snapshots
+- multi-day / true historical depth remains unavailable
 
 ### 4a. Heatmap with QMT should be treated as low-frequency live accumulation
 
@@ -976,7 +987,7 @@ Because the source cadence is effectively `3s`:
 
 This matters when comparing it to crypto venues where sub-second accumulation is meaningful.
 
-### 4b. QMT heatmap must not blindly reuse the generic QMT gapless time axis
+### 4b. QMT heatmap lunch-gap compression must use an axis-only `3s` mapper
 
 Comparing against Binance heatmap was useful here.
 
@@ -991,25 +1002,74 @@ QMT heatmap is conceptually the same kind of view:
 - live depth accumulation
 - live trade accumulation
 - current meaningful basis is `3s`
-- no historical depth reconstruction yet
+- current-day replay comes from tick-derived snapshots, not native depth history
 
 The trap is that QMT also has a session-aware gapless time-axis helper for trading-day charts.
 
 Important detail:
 
 - the generic QMT gapless helpers depend on timeframe support from `qmt_timeframe_ms(...)`
-- millisecond heatmap bases such as `MS3000` are intentionally not supported by those helpers
+- synthetic kline helpers should still reject millisecond heatmap bases such as `MS3000`
 
 Failure mode when this is wired incorrectly:
 
-- heatmap enters the gapless-axis branch
-- visible time range collapses around `latest_x`
-- the chart looks "stuck" even while `DepthReceived` events are still arriving
+- enabling `MS3000` in the wrong helper path can accidentally widen kline/session code that was never meant for heatmap
+- faking midday buckets would hide the lunch break by inventing data instead of only compressing coordinates
 
 Current rule:
 
-- only use QMT gapless axis logic for timeframes explicitly supported by the QMT session bucket helpers
-- QMT heatmap `3s` should stay on the ordinary linear time axis, like Binance heatmap does
+- keep `qmt_timeframe_ms(...)` unchanged for synthetic-kline logic
+- add a dedicated heatmap-axis `3s` bucket mapper only for `time_axis_bucket_offset(...) / time_axis_bucket_at_offset(...)`
+- compress the lunch gap on the X axis only
+- never fabricate midday depth or trade data just to make the chart look continuous
+
+### 4c. Heatmap history sync must not start before the chart is initialized
+
+A sequencing bug existed around pane initialization.
+
+Failure mode:
+
+- the pane still held `Content::Heatmap { chart: None, .. }`
+- `ResolveStreams` fired before `ResolveContent`
+- heatmap history sync started against the placeholder pane
+- the app panicked
+
+Current rule:
+
+- only start heatmap history sync after the real heatmap chart exists
+- pane-side sync helpers should fail soft if the chart is still missing
+
+### 4d. Heatmap history replay must ignore stale requests after pane retarget
+
+Another easy mistake is to trust `pane_id` alone.
+
+Failure mode:
+
+- pane starts a QMT heatmap history fetch for ticker A
+- before it returns, the pane switches to ticker B
+- old ticker A history or fetch failure arrives late
+- the late result corrupts ticker B's pane state or cancels its current sync
+
+Current rule:
+
+- apply heatmap history/failure only if the pane still matches the original stream
+- stale results should be dropped silently instead of touching the current pane
+
+### 4e. Heatmap basis or tick-size changes must reload current-day history
+
+Changing heatmap basis or tick size clears local replayed state.
+
+Failure mode:
+
+- user changes basis or tick size
+- chart clears trades / depth / replay buffers
+- subscriptions refresh, but no new history replay is triggered
+- pane stays on `Waiting for data...`
+
+Current rule:
+
+- basis / tick-size changes must trigger a fresh current-day heatmap history sync
+- `pause_buffer` must also be cleared during those resets so old depth does not leak into the new configuration
 
 ### 5. Footprint history should not be blocked by a separate trade-fetch path
 
@@ -1085,7 +1145,9 @@ Why this matters:
 - Never merge history/live cumulative ticks by summing fields; merge by `timestamp` override only
 - If a historical day timed out, let the short cooldown absorb repeated UI retries instead of hammering QMT immediately again
 - When debugging QMT heatmap, compare its data path to Binance heatmap first; both are `Depth + Trades` accumulation views
-- Do not assume QMT session-aware gapless time-axis helpers apply to heatmap millisecond bases
+- For QMT heatmap history replay, drop `volume=0` and empty-top-of-book ticks before deriving depth/trades
+- Do not reuse generic synthetic-kline timeframe helpers just to make heatmap `3s` axis gapless
+- When basis or tick size changes on a QMT heatmap, replay current-day history again instead of waiting for live data to refill the pane
 - If the bridge moves off `127.0.0.1:8765`, update `QMT_BRIDGE_BASE`
 - Expect only one active live QMT symbol on the websocket path today
 
@@ -1095,6 +1157,6 @@ Why this matters:
 - synthetic side classification is heuristic only
 - no true Level 2 transaction stream is available here, so synthetic trades are still approximations
 - holiday handling still depends on `exchange_calendars` being installed if QMT calendar APIs are unavailable
-- heatmap still has no true historical depth backfill
+- heatmap still has no true multi-day or native historical depth backfill
 - live websocket path is still effectively one active symbol at a time
 - if current-day history never reaches the merged-ready state, synthetic live trades / live kline updates can remain intentionally silent even while raw depth still updates

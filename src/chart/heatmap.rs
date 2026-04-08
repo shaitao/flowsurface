@@ -33,7 +33,7 @@ use iced::{
 
 use enum_map::EnumMap;
 use rustc_hash::FxHashMap;
-use std::time::Instant;
+use std::{collections::BTreeMap, time::Instant};
 
 const MIN_SCALING: f32 = 0.6;
 const MAX_SCALING: f32 = 1.2;
@@ -106,7 +106,7 @@ impl Chart for HeatmapChart {
     }
 
     fn is_empty(&self) -> bool {
-        self.heatmap.is_empty()
+        self.heatmap.is_empty() && self.trades.datapoints.is_empty()
     }
 }
 
@@ -151,6 +151,10 @@ pub struct HeatmapChart {
     trades: TimeSeries<HeatmapDataPoint>,
     indicators: EnumMap<HeatmapIndicator, Option<IndicatorData>>,
     pause_buffer: Vec<(u64, Box<[Trade]>, Depth)>,
+    pending_history_trades: BTreeMap<u64, Vec<Trade>>,
+    pending_history_depths: BTreeMap<u64, Depth>,
+    history_sync_pending: bool,
+    replay_cutoff_time: Option<u64>,
     heatmap: HistoricalDepth,
     visual_config: Config,
     study_configurator: study::Configurator<HeatmapStudy>,
@@ -194,6 +198,10 @@ impl HeatmapChart {
             chart: view_state,
             indicators,
             pause_buffer: vec![],
+            pending_history_trades: BTreeMap::new(),
+            pending_history_depths: BTreeMap::new(),
+            history_sync_pending: false,
+            replay_cutoff_time: None,
             heatmap,
             trades: TimeSeries::<HeatmapDataPoint>::new(basis, step),
             visual_config: config.unwrap_or_default(),
@@ -204,17 +212,28 @@ impl HeatmapChart {
     }
 
     pub fn insert_trades(&mut self, buffer: &[Trade], update_t: u64) {
-        let rounded_update_t = self.round_to_basis_time(update_t);
-
-        let entry = self.trades.datapoints.entry(rounded_update_t).or_default();
-
-        let tick_size = self.chart.tick_size;
-        for trade in buffer {
-            entry.add_trade(trade, tick_size);
+        if self.history_sync_pending {
+            self.pending_history_trades
+                .entry(update_t)
+                .or_default()
+                .extend_from_slice(buffer);
+            return;
         }
+
+        self.insert_live_trades_after_replay(buffer, update_t);
     }
 
     pub fn insert_depth(&mut self, depth: &Depth, depth_update_t: u64) {
+        if self.history_sync_pending {
+            self.pending_history_depths
+                .insert(depth_update_t, depth.clone());
+            return;
+        }
+
+        if self.should_skip_live_depth(depth_update_t) {
+            return;
+        }
+
         let rounded_depth_update = self.round_to_basis_time(depth_update_t);
 
         let chart = &mut self.chart;
@@ -305,6 +324,11 @@ impl HeatmapChart {
         self.trades.datapoints.clear();
         self.heatmap =
             HistoricalDepth::new(self.chart.ticker_info.min_qty, self.chart.tick_size, basis);
+        self.pause_buffer.clear();
+        self.pending_history_trades.clear();
+        self.pending_history_depths.clear();
+        self.history_sync_pending = false;
+        self.replay_cutoff_time = None;
 
         let chart = &mut self.chart;
         chart.translation = Vector::new(
@@ -366,6 +390,11 @@ impl HeatmapChart {
 
         self.trades.datapoints.clear();
         self.heatmap = HistoricalDepth::new(self.chart.ticker_info.min_qty, step, basis);
+        self.pause_buffer.clear();
+        self.pending_history_trades.clear();
+        self.pending_history_depths.clear();
+        self.history_sync_pending = false;
+        self.replay_cutoff_time = None;
     }
 
     pub fn tick_size(&self) -> PriceStep {
@@ -404,6 +433,90 @@ impl HeatmapChart {
 
     pub fn last_update(&self) -> Instant {
         self.last_tick
+    }
+
+    pub fn begin_history_sync(&mut self) {
+        self.pending_history_trades.clear();
+        self.pending_history_depths.clear();
+        self.history_sync_pending = true;
+        self.replay_cutoff_time = None;
+    }
+
+    pub fn apply_history_replay(&mut self, trades: &[Trade], depths: &[(u64, Depth)]) {
+        let history_cutoff = trades
+            .iter()
+            .map(|trade| trade.time)
+            .chain(depths.iter().map(|(time, _)| *time))
+            .max();
+
+        for trade in trades {
+            self.insert_trade_at_time(trade, trade.time);
+        }
+
+        for (time, depth) in depths {
+            self.process_depth_at(self.round_to_basis_time(*time), depth);
+        }
+
+        self.history_sync_pending = false;
+        self.replay_cutoff_time = history_cutoff;
+        self.flush_pending_history_updates();
+        self.cleanup_old_data();
+        self.invalidate(Some(Instant::now()));
+    }
+
+    pub fn cancel_history_sync(&mut self) {
+        self.history_sync_pending = false;
+        self.replay_cutoff_time = None;
+        self.flush_pending_history_updates();
+        self.invalidate(Some(Instant::now()));
+    }
+
+    fn flush_pending_history_updates(&mut self) {
+        let pending_trades = std::mem::take(&mut self.pending_history_trades);
+        for (update_t, trades) in pending_trades {
+            self.insert_live_trades_after_replay(&trades, update_t);
+        }
+
+        let pending_depths = std::mem::take(&mut self.pending_history_depths);
+        for (update_t, depth) in pending_depths {
+            if self.should_skip_live_depth(update_t) {
+                continue;
+            }
+            self.process_depth_at(self.round_to_basis_time(update_t), &depth);
+        }
+    }
+
+    fn should_skip_live_depth(&self, update_t: u64) -> bool {
+        self.replay_cutoff_time
+            .is_some_and(|cutoff| update_t <= cutoff)
+    }
+
+    fn insert_live_trades_after_replay(&mut self, buffer: &[Trade], update_t: u64) {
+        match self.replay_cutoff_time {
+            Some(cutoff) => {
+                for trade in buffer.iter().filter(|trade| trade.time > cutoff) {
+                    self.insert_trade_at_time(trade, update_t);
+                }
+            }
+            None => {
+                for trade in buffer {
+                    self.insert_trade_at_time(trade, update_t);
+                }
+            }
+        }
+    }
+
+    fn insert_trade_at_time(&mut self, trade: &Trade, update_t: u64) {
+        let rounded_update_t = self.round_to_basis_time(update_t);
+        let entry = self.trades.datapoints.entry(rounded_update_t).or_default();
+        entry.add_trade(trade, self.chart.tick_size);
+
+        let chart = &mut self.chart;
+        if rounded_update_t >= chart.latest_x {
+            chart.latest_x = rounded_update_t;
+            chart.base_price_y = trade.price.round_to_step(chart.tick_size);
+            chart.last_price = Some(PriceInfoLabel::Neutral(trade.price));
+        }
     }
 
     fn calc_qty_scales(
@@ -1026,5 +1139,107 @@ fn draw_volume_profile(
             font: style::AZERET_MONO,
             ..canvas::Text::default()
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data::chart::ViewConfig;
+    use exchange::{
+        Ticker,
+        adapter::Exchange,
+        depth::Depth,
+        unit::{Price, Qty},
+    };
+    use std::collections::BTreeMap;
+
+    fn sample_chart() -> HeatmapChart {
+        let ticker = Ticker::new("600309.SH", Exchange::SSH);
+        let ticker_info = TickerInfo::new(ticker, 0.01, 1.0, None);
+
+        HeatmapChart::new(
+            ViewConfig::default(),
+            Basis::Time(exchange::Timeframe::MS3000),
+            PriceStep::from_f32(0.01),
+            &[HeatmapIndicator::Volume],
+            ticker_info,
+            None,
+            vec![],
+        )
+    }
+
+    fn sample_trade(time: u64, qty: f32) -> Trade {
+        Trade {
+            time,
+            is_sell: false,
+            price: Price::from_f32(82.0),
+            qty: Qty::from_f32(qty),
+        }
+    }
+
+    fn sample_depth(price: f32, qty: f32) -> Depth {
+        let mut bids = BTreeMap::new();
+        bids.insert(Price::from_f32(price), Qty::from_f32(qty));
+        Depth {
+            bids,
+            asks: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn history_replay_deduplicates_buffered_live_updates_before_cutoff() {
+        let mut chart = sample_chart();
+        chart.begin_history_sync();
+
+        chart.insert_trades(&[sample_trade(3_000, 100.0)], 3_000);
+        chart.insert_trades(&[sample_trade(6_000, 120.0)], 6_000);
+        chart.insert_depth(&sample_depth(81.99, 500.0), 3_000);
+        chart.insert_depth(&sample_depth(82.00, 600.0), 6_000);
+
+        chart.apply_history_replay(
+            &[sample_trade(3_000, 100.0)],
+            &[(3_000, sample_depth(81.99, 500.0))],
+        );
+
+        let bucket_3 = chart
+            .trades
+            .datapoints
+            .get(&3_000)
+            .expect("expected history bucket");
+        let bucket_6 = chart
+            .trades
+            .datapoints
+            .get(&6_000)
+            .expect("expected live bucket");
+
+        assert_eq!(bucket_3.buy_sell.0, Qty::from_f32(100.0));
+        assert_eq!(bucket_6.buy_sell.0, Qty::from_f32(120.0));
+        assert_eq!(chart.chart.latest_x, 6_000);
+    }
+
+    #[test]
+    fn cancel_history_sync_replays_buffered_live_updates() {
+        let mut chart = sample_chart();
+        chart.begin_history_sync();
+
+        chart.insert_trades(&[sample_trade(6_000, 120.0)], 6_000);
+        chart.insert_depth(&sample_depth(82.00, 600.0), 6_000);
+
+        chart.cancel_history_sync();
+
+        let bucket = chart
+            .trades
+            .datapoints
+            .get(&6_000)
+            .expect("expected buffered trade bucket");
+        assert_eq!(bucket.buy_sell.0, Qty::from_f32(120.0));
+        assert_eq!(
+            chart
+                .heatmap
+                .latest_order_runs(Price::from_f32(82.00), Price::from_f32(82.00), 6_000)
+                .count(),
+            1
+        );
     }
 }

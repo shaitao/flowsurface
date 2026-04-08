@@ -1,5 +1,5 @@
 use exchange::adapter::{self, AdapterError, Exchange, StreamKind};
-use exchange::{Kline, OpenInterest, TickerInfo, Trade};
+use exchange::{Kline, OpenInterest, TickerInfo, Trade, depth::Depth};
 use iced::{
     Task,
     task::{Handle, Straw, sipper},
@@ -41,6 +41,10 @@ pub enum FetchedData {
     OI {
         data: Vec<OpenInterest>,
         req_id: Option<uuid::Uuid>,
+    },
+    HeatmapHistory {
+        trades: Vec<Trade>,
+        depths: Vec<(u64, Depth)>,
     },
 }
 
@@ -200,6 +204,7 @@ pub enum InfoKind {
     FetchingKlines,
     FetchingTrades(usize),
     FetchingOI,
+    FetchingHeatmap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -575,6 +580,51 @@ pub fn kline_trades_fetch_task(
 
             on_trade_handle(handle.abort_on_drop());
             task
+        }
+        _ => Task::none(),
+    };
+
+    update_status.chain(fetch_task)
+}
+
+pub fn heatmap_history_fetch_task(
+    layout_id: Uuid,
+    pane_id: Uuid,
+    stream: StreamKind,
+) -> Task<FetchUpdate> {
+    let update_status = Task::done(FetchUpdate::Status {
+        pane_id,
+        status: FetchTaskStatus::Loading(InfoKind::FetchingHeatmap),
+    });
+
+    let fetch_task = match stream {
+        StreamKind::Depth { ticker_info, .. } | StreamKind::Trades { ticker_info } => {
+            Task::perform(
+                iced::futures::TryFutureExt::map_err(
+                    adapter::fetch_heatmap_history(ticker_info),
+                    |err| {
+                        log::error!("Heatmap history fetch failed: {err}");
+                        err.ui_message()
+                    },
+                ),
+                move |result| match result {
+                    Ok((trades, depths)) => {
+                        let data = FetchedData::HeatmapHistory { trades, depths };
+                        FetchUpdate::Data {
+                            layout_id,
+                            pane_id,
+                            data,
+                            stream,
+                        }
+                    }
+                    Err(err) => FetchUpdate::Error {
+                        pane_id,
+                        req_id: None,
+                        stream: Some(stream),
+                        error: err,
+                    },
+                },
+            )
         }
         _ => Task::none(),
     };

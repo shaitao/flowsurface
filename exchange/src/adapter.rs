@@ -748,6 +748,17 @@ pub async fn fetch_trades(
     }
 }
 
+pub async fn fetch_heatmap_history(
+    ticker_info: TickerInfo,
+) -> Result<(Vec<Trade>, Vec<(u64, Depth)>), AdapterError> {
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "Heatmap history replay is only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::fetch_heatmap_history(ticker_info).await,
+    }
+}
+
 pub async fn fetch_open_interest(
     ticker_info: TickerInfo,
     timeframe: Timeframe,

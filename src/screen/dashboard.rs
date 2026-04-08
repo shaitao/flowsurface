@@ -149,9 +149,28 @@ impl Dashboard {
     fn initial_history_fetch_task(
         layout_id: uuid::Uuid,
         pane_id: uuid::Uuid,
+        state: &mut pane::State,
         streams: &[StreamKind],
         content_kind: ContentKind,
     ) -> Option<Task<Message>> {
+        if matches!(content_kind, ContentKind::HeatmapChart)
+            && let Some(stream) = Self::qmt_heatmap_history_stream(streams)
+        {
+            if !matches!(
+                &state.content,
+                pane::Content::Heatmap { chart: Some(_), .. }
+            ) {
+                log::debug!(
+                    "Delaying QMT heatmap history fetch until the heatmap chart is initialized"
+                );
+                return None;
+            }
+            state.begin_heatmap_history_sync();
+            return Some(
+                fetcher::heatmap_history_fetch_task(layout_id, pane_id, stream).map(Message::from),
+            );
+        }
+
         for stream in streams {
             if let StreamKind::Kline { ticker_info, .. } = stream {
                 let task = if matches!(content_kind, ContentKind::FootprintChart)
@@ -176,6 +195,32 @@ impl Dashboard {
         }
 
         None
+    }
+
+    fn pane_still_matches_stream(
+        &self,
+        main_window: window::Id,
+        pane_id: uuid::Uuid,
+        stream: &StreamKind,
+    ) -> bool {
+        self.iter_all_panes(main_window)
+            .find(|(_, _, state)| state.unique_id() == pane_id)
+            .map(|(_, _, state)| state)
+            .is_some_and(|state| state.matches_stream(stream))
+    }
+
+    fn qmt_heatmap_history_stream(streams: &[StreamKind]) -> Option<StreamKind> {
+        streams.iter().find_map(|stream| match stream {
+            StreamKind::Depth { ticker_info, .. } | StreamKind::Trades { ticker_info }
+                if matches!(
+                    ticker_info.exchange(),
+                    exchange::adapter::Exchange::SSH | exchange::adapter::Exchange::SSZ
+                ) =>
+            {
+                Some(*stream)
+            }
+            _ => None,
+        })
     }
 
     fn default_pane_config() -> Configuration<pane::State> {
@@ -291,8 +336,19 @@ impl Dashboard {
                 stream,
                 error,
             } => {
+                if let Some(stream) = stream
+                    && !self.pane_still_matches_stream(main_window.id, pane_id, &stream)
+                {
+                    log::debug!(
+                        "Ignoring stale fetch failure for pane={} stream={stream:?}",
+                        pane_id
+                    );
+                    return (Task::none(), None);
+                }
+
                 if let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
                     state.mark_fetch_failed(stream, req_id, error.clone());
+                    state.cancel_heatmap_history_sync();
                     Self::set_idle_pane_status(state);
                     state.notifications.push(Toast::error(error));
                 } else {
@@ -302,6 +358,7 @@ impl Dashboard {
             Message::ErrorOccurred(pane_id, err) => match pane_id {
                 Some(id) => {
                     if let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, id) {
+                        state.cancel_heatmap_history_sync();
                         Self::set_idle_pane_status(state);
                         state.notifications.push(Toast::error(err.to_string()));
                     }
@@ -435,6 +492,9 @@ impl Dashboard {
                             }
                         });
 
+                    let mut initial_fetch = None;
+                    let mut streams_to_add = None;
+
                     if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         state.link_group = group;
                         state.modal = None;
@@ -449,17 +509,22 @@ impl Dashboard {
                                 state.set_content_and_streams(vec![ticker_info], content_kind);
                             Self::maybe_notify_qmt_trade_fetch_hint(state);
                             Self::set_idle_pane_status(state);
-                            self.streams.extend(streams.iter());
-
-                            if let Some(task) = Self::initial_history_fetch_task(
+                            initial_fetch = Self::initial_history_fetch_task(
                                 *layout_id,
                                 pane_id,
+                                state,
                                 &streams,
                                 content_kind,
-                            ) {
-                                return (task, None);
-                            }
+                            );
+                            streams_to_add = Some(streams);
                         }
+                    }
+
+                    if let Some(streams) = streams_to_add {
+                        self.streams.extend(streams.iter());
+                    }
+                    if let Some(task) = initial_fetch {
+                        return (task, None);
                     }
                 }
                 pane::Message::Popout => {
@@ -476,6 +541,25 @@ impl Dashboard {
 
                         let task = match effect {
                             pane::Effect::RefreshStreams => self.refresh_streams(main_window.id),
+                            pane::Effect::ReloadHeatmapHistory => {
+                                let pane_id = state.unique_id();
+                                let ready_streams = state
+                                    .streams
+                                    .ready_iter()
+                                    .map(|iter| iter.copied().collect::<Vec<_>>())
+                                    .unwrap_or_default();
+                                let content_kind = state.content.kind();
+                                let history_task = Self::initial_history_fetch_task(
+                                    *layout_id,
+                                    pane_id,
+                                    state,
+                                    &ready_streams,
+                                    content_kind,
+                                )
+                                .unwrap_or_else(Task::none);
+
+                                self.refresh_streams(main_window.id).chain(history_task)
+                            }
                             pane::Effect::RequestFetch(reqs) => {
                                 let pane_id = state.unique_id();
                                 let ready_streams = state
@@ -805,6 +889,7 @@ impl Dashboard {
         match pane_id {
             Some(id) => {
                 if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, id) {
+                    state.cancel_heatmap_history_sync();
                     Self::set_idle_pane_status(state);
                     state.notifications.push(Toast::error(err.to_string()));
                 }
@@ -822,16 +907,22 @@ impl Dashboard {
         ticker_info: TickerInfo,
         content_kind: ContentKind,
     ) -> Task<Message> {
+        let layout_id = self.layout_id;
         let mut initial_fetch = None;
+        let mut streams_to_add = None;
         if let Some(state) = self.get_mut_pane(main_window, window, selected_pane) {
             let pane_id = state.unique_id();
 
             let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
             Self::maybe_notify_qmt_trade_fetch_hint(state);
             Self::set_idle_pane_status(state);
-            self.streams.extend(streams.iter());
             initial_fetch =
-                Self::initial_history_fetch_task(self.layout_id, pane_id, &streams, content_kind);
+                Self::initial_history_fetch_task(layout_id, pane_id, state, &streams, content_kind);
+            streams_to_add = Some(streams);
+        }
+
+        if let Some(streams) = streams_to_add {
+            self.streams.extend(streams.iter());
         }
 
         initial_fetch.unwrap_or_else(Task::none)
@@ -843,6 +934,7 @@ impl Dashboard {
         ticker_info: TickerInfo,
         content_kind: ContentKind,
     ) -> Task<Message> {
+        let layout_id = self.layout_id;
         if self.focus.is_none()
             && self.panes.len() == 1
             && let Some((pane_id, _)) = self.panes.iter().next()
@@ -852,6 +944,7 @@ impl Dashboard {
 
         let mut initial_fetch = None;
         let mut handled_focus = false;
+        let mut streams_to_add = None;
         if let Some((window, selected_pane)) = self.focus
             && let Some(state) = self.get_mut_pane(main_window, window, selected_pane)
         {
@@ -866,9 +959,13 @@ impl Dashboard {
             Self::set_idle_pane_status(state);
 
             let pane_id = state.unique_id();
-            self.streams.extend(streams.iter());
             initial_fetch =
-                Self::initial_history_fetch_task(self.layout_id, pane_id, &streams, content_kind);
+                Self::initial_history_fetch_task(layout_id, pane_id, state, &streams, content_kind);
+            streams_to_add = Some(streams);
+        }
+
+        if let Some(streams) = streams_to_add {
+            self.streams.extend(streams.iter());
         }
 
         if let Some(task) = initial_fetch {
@@ -962,6 +1059,14 @@ impl Dashboard {
         data: FetchedData,
         stream_type: StreamKind,
     ) -> Task<Message> {
+        if !self.pane_still_matches_stream(main_window, pane_id, &stream_type) {
+            log::debug!(
+                "Ignoring stale fetched data for pane={} stream={stream_type:?}",
+                pane_id
+            );
+            return Task::none();
+        }
+
         match data {
             FetchedData::Trades { batch, until_time } => {
                 let last_trade_time = batch.last().map_or(0, |trade| trade.time);
@@ -1038,6 +1143,12 @@ impl Dashboard {
                     {
                         pane_state.insert_hist_klines(req_id, timeframe, ticker_info, &data, true);
                     }
+                }
+            }
+            FetchedData::HeatmapHistory { trades, depths } => {
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.insert_heatmap_history(&trades, &depths);
+                    Self::set_idle_pane_status(pane_state);
                 }
             }
             FetchedData::OI { data, req_id } => {
@@ -1270,14 +1381,36 @@ impl Dashboard {
                 }
                 Some(pane::Action::ResolveContent) => match state.stream_pair_kind() {
                     Some(StreamPairKind::MultiSource(tickers)) => {
-                        state.set_content_and_streams(tickers, state.content.kind());
+                        let pane_id = state.unique_id();
+                        let content_kind = state.content.kind();
+                        let streams = state.set_content_and_streams(tickers, content_kind);
                         Self::maybe_notify_qmt_trade_fetch_hint(state);
                         Self::set_idle_pane_status(state);
+                        if let Some(task) = Self::initial_history_fetch_task(
+                            layout_id,
+                            pane_id,
+                            state,
+                            &streams,
+                            content_kind,
+                        ) {
+                            tasks.push(task);
+                        }
                     }
                     Some(StreamPairKind::SingleSource(ticker)) => {
-                        state.set_content_and_streams(vec![ticker], state.content.kind());
+                        let pane_id = state.unique_id();
+                        let content_kind = state.content.kind();
+                        let streams = state.set_content_and_streams(vec![ticker], content_kind);
                         Self::maybe_notify_qmt_trade_fetch_hint(state);
                         Self::set_idle_pane_status(state);
+                        if let Some(task) = Self::initial_history_fetch_task(
+                            layout_id,
+                            pane_id,
+                            state,
+                            &streams,
+                            content_kind,
+                        ) {
+                            tasks.push(task);
+                        }
                     }
                     None => {}
                 },
@@ -1293,6 +1426,7 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         streams: Vec<StreamKind>,
     ) -> Task<Message> {
+        let layout_id = self.layout_id;
         let mut initial_fetch = None;
         if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
             state.streams = ResolvedStream::Ready(streams.clone());
@@ -1300,7 +1434,7 @@ impl Dashboard {
             Self::set_idle_pane_status(state);
             let content_kind = state.content.kind();
             initial_fetch =
-                Self::initial_history_fetch_task(self.layout_id, pane_id, &streams, content_kind);
+                Self::initial_history_fetch_task(layout_id, pane_id, state, &streams, content_kind);
         }
 
         self.refresh_streams(main_window)

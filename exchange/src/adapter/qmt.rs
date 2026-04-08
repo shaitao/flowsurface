@@ -389,6 +389,13 @@ fn qmt_tick_has_traded_volume(tick: &QmtTick) -> bool {
     tick.volume > 0
 }
 
+fn qmt_tick_has_top_of_book(tick: &QmtTick) -> bool {
+    tick.valid_bid1().is_some()
+        && tick.valid_ask1().is_some()
+        && tick.bid_vol.first().is_some_and(|qty| *qty > 0.0)
+        && tick.ask_vol.first().is_some_and(|qty| *qty > 0.0)
+}
+
 fn qmt_synthetic_warning_enabled(previous_tick: &QmtTick, current_tick: &QmtTick) -> bool {
     qmt_tick_has_traded_volume(previous_tick) && qmt_tick_has_traded_volume(current_tick)
 }
@@ -728,6 +735,13 @@ fn qmt_timeframe_ms(timeframe: Timeframe) -> Option<u64> {
     }
 }
 
+fn qmt_gapless_axis_timeframe_ms(timeframe: Timeframe) -> Option<u64> {
+    match timeframe {
+        Timeframe::MS3000 => Some(timeframe.to_milliseconds()),
+        _ => qmt_timeframe_ms(timeframe),
+    }
+}
+
 fn qmt_default_kline_range(timeframe: Timeframe) -> Option<(u64, u64)> {
     let interval_ms = qmt_timeframe_ms(timeframe)?;
     let end = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -807,53 +821,144 @@ pub fn uses_gapless_time_axis(venue: Venue) -> bool {
 }
 
 pub fn supports_gapless_time_axis_timeframe(venue: Venue, timeframe: Timeframe) -> bool {
-    uses_gapless_time_axis(venue) && qmt_timeframe_ms(timeframe).is_some()
+    uses_gapless_time_axis(venue) && qmt_gapless_axis_timeframe_ms(timeframe).is_some()
 }
 
-fn qmt_bucket_starts_for_day(
+fn qmt_gapless_axis_bucket_start(
     venue: Venue,
-    day: NaiveDate,
+    timestamp_ms: u64,
     timeframe: Timeframe,
-) -> Option<Vec<u64>> {
-    if !is_qmt_trading_day(venue, day) {
+) -> Option<u64> {
+    let dt = china_datetime(timestamp_ms)?;
+    if !is_qmt_trading_day(venue, dt.date_naive()) {
         return None;
     }
 
     if timeframe == Timeframe::D1 {
         let offset = china_offset()?;
         return offset
-            .from_local_datetime(&day.and_hms_opt(0, 0, 0)?)
+            .from_local_datetime(&dt.date_naive().and_hms_opt(0, 0, 0)?)
             .single()
-            .map(|value| vec![value.timestamp_millis() as u64]);
+            .map(|value| value.timestamp_millis() as u64);
     }
 
-    let interval_ms = qmt_timeframe_ms(timeframe)?;
-    let sessions = qmt_session_bounds(venue, day)?;
-    let mut starts = Vec::new();
+    let interval_ms = qmt_gapless_axis_timeframe_ms(timeframe)?;
+    let sessions = qmt_session_bounds(venue, dt.date_naive())?;
+    let final_session_end = sessions.last().map(|(_, session_end)| *session_end)?;
+    let mut effective_ts = timestamp_ms;
+    if final_session_end <= timestamp_ms
+        && timestamp_ms <= final_session_end.saturating_add(QMT_CLOSE_BUCKET_GRACE_MS)
+    {
+        effective_ts = final_session_end.saturating_sub(1);
+    }
 
     for (session_start, session_end) in sessions {
-        let mut bucket = session_start;
-        while bucket < session_end {
-            starts.push(bucket);
-            bucket = bucket.saturating_add(interval_ms);
+        if session_start <= effective_ts && effective_ts < session_end {
+            return Some(
+                session_start + ((effective_ts - session_start) / interval_ms) * interval_ms,
+            );
         }
     }
 
-    Some(starts)
+    None
 }
 
-fn qmt_bucket_position(
+fn qmt_session_bucket_count(session_start: u64, session_end: u64, interval_ms: u64) -> u64 {
+    if interval_ms == 0 || session_end <= session_start {
+        return 0;
+    }
+
+    (session_end - session_start).div_ceil(interval_ms)
+}
+
+fn qmt_gapless_axis_buckets_per_day(
+    venue: Venue,
+    day: NaiveDate,
+    timeframe: Timeframe,
+) -> Option<i64> {
+    if timeframe == Timeframe::D1 {
+        return is_qmt_trading_day(venue, day).then_some(1);
+    }
+
+    let interval_ms = qmt_gapless_axis_timeframe_ms(timeframe)?;
+    let sessions = qmt_session_bounds(venue, day)?;
+    let buckets = sessions
+        .into_iter()
+        .map(|(session_start, session_end)| {
+            qmt_session_bucket_count(session_start, session_end, interval_ms)
+        })
+        .sum::<u64>();
+
+    i64::try_from(buckets).ok()
+}
+
+fn qmt_gapless_axis_bucket_position(
     venue: Venue,
     timestamp_ms: u64,
     timeframe: Timeframe,
 ) -> Option<(NaiveDate, usize)> {
     let day = china_trading_day(timestamp_ms)?;
-    let bucket = qmt_bucket_start(venue, timestamp_ms, timeframe)?;
-    let starts = qmt_bucket_starts_for_day(venue, day, timeframe)?;
-    starts
-        .iter()
-        .position(|candidate| *candidate == bucket)
-        .map(|index| (day, index))
+    let bucket = qmt_gapless_axis_bucket_start(venue, timestamp_ms, timeframe)?;
+
+    if timeframe == Timeframe::D1 {
+        return Some((day, 0));
+    }
+
+    let interval_ms = qmt_gapless_axis_timeframe_ms(timeframe)?;
+    let sessions = qmt_session_bounds(venue, day)?;
+    let mut bucket_index = 0usize;
+
+    for (session_start, session_end) in sessions {
+        let session_bucket_count = usize::try_from(qmt_session_bucket_count(
+            session_start,
+            session_end,
+            interval_ms,
+        ))
+        .ok()?;
+
+        if session_start <= bucket && bucket < session_end {
+            let offset_in_session = usize::try_from((bucket - session_start) / interval_ms).ok()?;
+            return Some((day, bucket_index + offset_in_session));
+        }
+
+        bucket_index = bucket_index.saturating_add(session_bucket_count);
+    }
+
+    None
+}
+
+fn qmt_gapless_axis_bucket_at_index(
+    venue: Venue,
+    day: NaiveDate,
+    timeframe: Timeframe,
+    bucket_index: usize,
+) -> Option<u64> {
+    if timeframe == Timeframe::D1 {
+        if bucket_index != 0 || !is_qmt_trading_day(venue, day) {
+            return None;
+        }
+
+        let offset = china_offset()?;
+        return offset
+            .from_local_datetime(&day.and_hms_opt(0, 0, 0)?)
+            .single()
+            .map(|value| value.timestamp_millis() as u64);
+    }
+
+    let interval_ms = qmt_gapless_axis_timeframe_ms(timeframe)?;
+    let sessions = qmt_session_bounds(venue, day)?;
+    let mut remaining = u64::try_from(bucket_index).ok()?;
+
+    for (session_start, session_end) in sessions {
+        let session_bucket_count =
+            qmt_session_bucket_count(session_start, session_end, interval_ms);
+        if remaining < session_bucket_count {
+            return Some(session_start + remaining * interval_ms);
+        }
+        remaining -= session_bucket_count;
+    }
+
+    None
 }
 
 fn qmt_trading_day_distance(venue: Venue, from_day: NaiveDate, to_day: NaiveDate) -> i64 {
@@ -913,10 +1018,11 @@ pub fn time_axis_bucket_offset(
         return None;
     }
 
-    let (anchor_day, anchor_bucket_index) = qmt_bucket_position(venue, anchor_ms, timeframe)?;
-    let (target_day, target_bucket_index) = qmt_bucket_position(venue, target_ms, timeframe)?;
-    let buckets_per_day =
-        i64::try_from(qmt_bucket_starts_for_day(venue, anchor_day, timeframe)?.len()).ok()?;
+    let (anchor_day, anchor_bucket_index) =
+        qmt_gapless_axis_bucket_position(venue, anchor_ms, timeframe)?;
+    let (target_day, target_bucket_index) =
+        qmt_gapless_axis_bucket_position(venue, target_ms, timeframe)?;
+    let buckets_per_day = qmt_gapless_axis_buckets_per_day(venue, anchor_day, timeframe)?;
     if buckets_per_day <= 0 {
         return None;
     }
@@ -938,9 +1044,9 @@ pub fn time_axis_bucket_at_offset(
         return None;
     }
 
-    let (anchor_day, anchor_bucket_index) = qmt_bucket_position(venue, anchor_ms, timeframe)?;
-    let buckets_per_day =
-        i64::try_from(qmt_bucket_starts_for_day(venue, anchor_day, timeframe)?.len()).ok()?;
+    let (anchor_day, anchor_bucket_index) =
+        qmt_gapless_axis_bucket_position(venue, anchor_ms, timeframe)?;
+    let buckets_per_day = qmt_gapless_axis_buckets_per_day(venue, anchor_day, timeframe)?;
     if buckets_per_day <= 0 {
         return None;
     }
@@ -949,9 +1055,7 @@ pub fn time_axis_bucket_at_offset(
     let day_offset = total_offset.div_euclid(buckets_per_day);
     let bucket_index = usize::try_from(total_offset.rem_euclid(buckets_per_day)).ok()?;
     let day = qmt_shift_trading_day(venue, anchor_day, day_offset)?;
-    qmt_bucket_starts_for_day(venue, day, timeframe)?
-        .get(bucket_index)
-        .copied()
+    qmt_gapless_axis_bucket_at_index(venue, day, timeframe, bucket_index)
 }
 
 fn qmt_trading_bucket_starts(
@@ -1416,7 +1520,7 @@ fn split_synthetic_qty(total_qty: Qty) -> (Qty, Qty) {
 
 /// Tick rule: infer trade direction from price movement between consecutive ticks.
 /// Uptick (price rose) → Buy, downtick (price fell) → Sell, unchanged → Split.
-/// Used as fallback when the quote rule (BBA comparison) is inconclusive.
+/// Used only when the current tick has no usable top of book.
 fn tick_rule_side(previous_tick: &QmtTick, current_tick: &QmtTick) -> SyntheticTradeSide {
     match (
         previous_tick.valid_last_price(),
@@ -1456,7 +1560,7 @@ fn classify_with_bba(
     if synthetic_price <= bid1 {
         return SyntheticTradeSide::Sell;
     }
-    tick_rule_side(previous_tick, current_tick)
+    SyntheticTradeSide::Split
 }
 
 fn classify_synthetic_trade_side(
@@ -1479,15 +1583,8 @@ fn classify_synthetic_trade_side(
         );
     }
 
-    if let (Some(bid1), Some(ask1)) = (previous_tick.valid_bid1(), previous_tick.valid_ask1()) {
-        return classify_with_bba(
-            previous_tick,
-            current_tick,
-            bid1,
-            ask1,
-            synthetic_price,
-            warning_enabled,
-        );
+    if !qmt_tick_has_traded_volume(previous_tick) {
+        return SyntheticTradeSide::Split;
     }
 
     tick_rule_side(previous_tick, current_tick)
@@ -1698,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_trade_uses_tick_rule_inside_spread_uptick() {
+    fn synthesize_trade_splits_inside_spread_even_on_uptick() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
         previous.volume = 100;
@@ -1711,28 +1808,30 @@ mod tests {
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
 
-        assert_eq!(trades.len(), 1);
+        assert_eq!(trades.len(), 2);
         assert!(!trades[0].is_sell);
-        assert_eq!(f32::from(trades[0].qty), 100.0);
+        assert!(trades[1].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 50.0);
+        assert_eq!(f32::from(trades[1].qty), 50.0);
     }
 
     #[test]
-    fn synthesize_trade_falls_back_to_previous_bba_with_tick_rule() {
+    fn synthesize_trade_no_bba_ignores_stale_bba_and_uses_tick_rule() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
-        previous.last_price = 82.00;
+        previous.last_price = 82.03;
         previous.volume = 100;
         previous.bid_price = vec![82.00];
         previous.ask_price = vec![82.02];
 
         let mut current = sample_tick(1_775_525_404_000);
-        current.last_price = 82.01;
+        current.last_price = 82.02;
         current.volume = 101;
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
 
         assert_eq!(trades.len(), 1);
-        assert!(!trades[0].is_sell);
+        assert!(trades[0].is_sell);
         assert_eq!(f32::from(trades[0].qty), 100.0);
     }
 
@@ -1757,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_trade_falls_back_to_previous_bba_unchanged_price_splits() {
+    fn synthesize_trade_no_bba_unchanged_price_splits() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
         previous.last_price = 82.00;
@@ -1803,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_trade_tick_rule_downtick_inside_spread_sells() {
+    fn synthesize_trade_splits_inside_spread_even_on_downtick() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
         previous.last_price = 82.02;
@@ -1817,9 +1916,11 @@ mod tests {
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
 
-        assert_eq!(trades.len(), 1);
-        assert!(trades[0].is_sell);
-        assert_eq!(f32::from(trades[0].qty), 100.0);
+        assert_eq!(trades.len(), 2);
+        assert!(!trades[0].is_sell);
+        assert!(trades[1].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 50.0);
+        assert_eq!(f32::from(trades[1].qty), 50.0);
     }
 
     #[test]
@@ -1845,13 +1946,13 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_trade_stale_bba_downtick_sells() {
+    fn synthesize_trade_no_bba_with_zero_volume_baseline_splits() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
-        previous.last_price = 82.02;
-        previous.volume = 100;
+        previous.last_price = 82.00;
+        previous.volume = 0;
         previous.bid_price = vec![82.00];
-        previous.ask_price = vec![82.03];
+        previous.ask_price = vec![82.02];
 
         let mut current = sample_tick(1_775_525_404_000);
         current.last_price = 82.01;
@@ -1859,29 +1960,11 @@ mod tests {
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
 
-        assert_eq!(trades.len(), 1);
-        assert!(trades[0].is_sell);
-        assert_eq!(f32::from(trades[0].qty), 100.0);
-    }
-
-    #[test]
-    fn synthesize_trade_stale_bba_at_ask_buys() {
-        let ticker_info = sample_ticker_info();
-        let mut previous = sample_tick(1_775_525_401_000);
-        previous.last_price = 82.00;
-        previous.volume = 100;
-        previous.bid_price = vec![82.00];
-        previous.ask_price = vec![82.02];
-
-        let mut current = sample_tick(1_775_525_404_000);
-        current.last_price = 82.02;
-        current.volume = 101;
-
-        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
-
-        assert_eq!(trades.len(), 1);
+        assert_eq!(trades.len(), 2);
         assert!(!trades[0].is_sell);
-        assert_eq!(f32::from(trades[0].qty), 100.0);
+        assert!(trades[1].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 5_050.0);
+        assert_eq!(f32::from(trades[1].qty), 5_050.0);
     }
 
     #[test]
@@ -2032,8 +2115,8 @@ mod tests {
     }
 
     #[test]
-    fn supports_gapless_time_axis_timeframe_excludes_heatmap_ms3000() {
-        assert!(!supports_gapless_time_axis_timeframe(
+    fn supports_gapless_time_axis_timeframe_includes_heatmap_ms3000() {
+        assert!(supports_gapless_time_axis_timeframe(
             Venue::SSH,
             Timeframe::MS3000
         ));
@@ -2041,6 +2124,29 @@ mod tests {
             Venue::SSH,
             Timeframe::M3
         ));
+    }
+
+    #[test]
+    fn qmt_heatmap_gapless_axis_skips_lunch_gap() {
+        let before_lunch = china_ms(2026, 4, 9, 11, 29, 57);
+        let after_lunch = china_ms(2026, 4, 9, 13, 0, 0);
+
+        assert_eq!(
+            time_axis_bucket_offset(Venue::SSH, before_lunch, after_lunch, Timeframe::MS3000),
+            Some(1)
+        );
+        assert_eq!(
+            time_axis_bucket_offset(Venue::SSH, after_lunch, before_lunch, Timeframe::MS3000),
+            Some(-1)
+        );
+        assert_eq!(
+            time_axis_bucket_at_offset(Venue::SSH, before_lunch, Timeframe::MS3000, 1),
+            Some(after_lunch)
+        );
+        assert_eq!(
+            time_axis_bucket_at_offset(Venue::SSH, after_lunch, Timeframe::MS3000, -1),
+            Some(before_lunch)
+        );
     }
 
     #[test]
@@ -2231,9 +2337,9 @@ mod tests {
         first_trade_tick.last_price = 85.0;
         let opening_trades = trade_state.update(first_trade_tick, ticker_info);
 
-        assert_eq!(opening_trades.len(), 1);
-        assert!(!opening_trades[0].is_sell);
-        assert_eq!(f32::from(opening_trades[0].qty), 449_400.0);
+        assert_eq!(opening_trades.len(), 2);
+        assert_eq!(f32::from(opening_trades[0].qty), 224_700.0);
+        assert_eq!(f32::from(opening_trades[1].qty), 224_700.0);
 
         let zero_after_open = sample_tick(china_ms(2026, 4, 9, 9, 25, 4));
         assert!(trade_state.update(zero_after_open, ticker_info).is_empty());
@@ -2376,6 +2482,26 @@ fn tick_to_depth_payload(tick: &QmtTick) -> DepthPayload {
     }
 }
 
+fn build_depth_history_from_ticks(
+    ticks: &[QmtTick],
+    ticker_info: TickerInfo,
+) -> Vec<(u64, crate::depth::Depth)> {
+    let mut depth_cache = LocalDepthCache::default();
+    let mut snapshots = Vec::new();
+
+    for tick in ticks {
+        let payload = tick_to_depth_payload(tick);
+        if payload.bids.is_empty() && payload.asks.is_empty() {
+            continue;
+        }
+
+        depth_cache.update(DepthUpdate::Snapshot(payload), ticker_info.min_ticksize);
+        snapshots.push((tick.time, depth_cache.depth.as_ref().clone()));
+    }
+
+    snapshots
+}
+
 fn trade_flush_map(ticker_info: TickerInfo) -> FxHashMap<Ticker, (TickerInfo, ())> {
     FxHashMap::from_iter([(ticker_info.ticker, (ticker_info, ()))])
 }
@@ -2435,6 +2561,9 @@ pub fn connect_depth_stream(
                                 Ok(BridgeWsMessage::Tick(tick)) => {
                                     cache_live_tick(ticker_info.ticker, &tick);
                                     let payload = tick_to_depth_payload(&tick);
+                                    if payload.bids.is_empty() && payload.asks.is_empty() {
+                                        continue;
+                                    }
                                     depth_cache.update(
                                         DepthUpdate::Snapshot(payload),
                                         ticker_info.min_ticksize,
@@ -3016,6 +3145,46 @@ pub async fn fetch_trades(
         .into_iter()
         .filter(|trade| start <= trade.time && trade.time <= end)
         .collect())
+}
+
+pub async fn fetch_heatmap_history(
+    ticker_info: TickerInfo,
+) -> Result<(Vec<Trade>, Vec<(u64, crate::depth::Depth)>), AdapterError> {
+    let Some(day) = current_china_day() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    let Some(range) = qmt_current_day_history_bounds(day) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    let fetch_started_at = Instant::now();
+    let ticks = fetch_ticks(ticker_info, range).await?;
+    let fetch_elapsed = fetch_started_at.elapsed();
+    let total_ticks = ticks.len();
+
+    let replay_ticks = ticks
+        .into_iter()
+        .filter(|tick| qmt_tick_has_traded_volume(tick) && qmt_tick_has_top_of_book(tick))
+        .collect::<Vec<_>>();
+
+    let derive_started_at = Instant::now();
+    let trades = synthesize_trades_from_ticks(&replay_ticks, ticker_info);
+    let depths = build_depth_history_from_ticks(&replay_ticks, ticker_info);
+    let derive_elapsed = derive_started_at.elapsed();
+
+    log::info!(
+        "QMT heatmap history {} ticks={} replay_ticks={} trades={} depths={} fetch_elapsed={:?} derive_elapsed={:?}",
+        ticker_info.ticker,
+        total_ticks,
+        replay_ticks.len(),
+        trades.len(),
+        depths.len(),
+        fetch_elapsed,
+        derive_elapsed,
+    );
+
+    Ok((trades, depths))
 }
 
 async fn fetch_ticks(

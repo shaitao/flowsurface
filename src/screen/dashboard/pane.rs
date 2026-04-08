@@ -31,8 +31,9 @@ use data::{
     stream::PersistStreamKind,
 };
 use exchange::{
-    Kline, OpenInterest, StreamPairKind, TickMultiplier, TickerInfo, Timeframe,
+    Kline, OpenInterest, StreamPairKind, TickMultiplier, TickerInfo, Timeframe, Trade,
     adapter::{MarketKind, StreamKind, StreamTicksize},
+    depth::Depth,
     unit::PriceStep,
 };
 use iced::{
@@ -44,6 +45,7 @@ use std::time::Instant;
 #[derive(Debug, Clone)]
 pub enum Effect {
     RefreshStreams,
+    ReloadHeatmapHistory,
     RequestFetch(Vec<FetchSpec>),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
@@ -447,6 +449,55 @@ impl State {
         }
     }
 
+    pub fn begin_heatmap_history_sync(&mut self) {
+        match &mut self.content {
+            Content::Heatmap { chart, .. } => {
+                let Some(chart) = chart else {
+                    log::warn!(
+                        "Skipping heatmap history sync start because the chart is not initialized"
+                    );
+                    return;
+                };
+                chart.begin_history_sync();
+            }
+            _ => {
+                log::error!("pane content not heatmap");
+            }
+        }
+    }
+
+    pub fn insert_heatmap_history(&mut self, trades: &[Trade], depths: &[(u64, Depth)]) {
+        match &mut self.content {
+            Content::Heatmap { chart, .. } => {
+                let Some(chart) = chart else {
+                    log::warn!(
+                        "Dropping heatmap history replay because the chart is not initialized"
+                    );
+                    return;
+                };
+                chart.apply_history_replay(trades, depths);
+            }
+            _ => {
+                log::error!("pane content not heatmap");
+            }
+        }
+    }
+
+    pub fn cancel_heatmap_history_sync(&mut self) {
+        match &mut self.content {
+            Content::Heatmap { chart, .. } => {
+                let Some(chart) = chart else {
+                    log::warn!(
+                        "Skipping heatmap history sync cancel because the chart is not initialized"
+                    );
+                    return;
+                };
+                chart.cancel_history_sync();
+            }
+            _ => {}
+        }
+    }
+
     pub fn mark_fetch_failed(
         &mut self,
         stream: Option<StreamKind>,
@@ -772,7 +823,7 @@ impl State {
                         .settings
                         .selected_basis
                         .unwrap_or(Basis::default_heatmap_time(ticker_info));
-                    let tick_multiply = self.settings.tick_multiply.unwrap_or(TickMultiplier(5));
+                    let tick_multiply = self.settings.tick_multiply.unwrap_or(TickMultiplier(1));
 
                     let kind = ModifierKind::Heatmap(basis, tick_multiply);
                     let price_step = ticker_info
@@ -965,6 +1016,9 @@ impl State {
             Status::Loading(InfoKind::FetchingOI) => {
                 top_left_buttons = top_left_buttons.push(text("Fetching Open Interest..."));
             }
+            Status::Loading(InfoKind::FetchingHeatmap) => {
+                top_left_buttons = top_left_buttons.push(text("Fetching Heatmap..."));
+            }
             Status::Stale(msg) => {
                 top_left_buttons = top_left_buttons.push(text(msg));
             }
@@ -1110,6 +1164,7 @@ impl State {
                             modal::stream::Action::TicksizeSelected(tm) => {
                                 modifier.update_kind_with_multiplier(tm);
                                 self.settings.tick_multiply = Some(tm);
+                                let mut reload_heatmap_history = false;
 
                                 if let Some(ticker) = self.stream_pair() {
                                     match &mut self.content {
@@ -1123,6 +1178,7 @@ impl State {
                                             c.change_tick_size(
                                                 tm.multiply_with_min_tick_step(ticker),
                                             );
+                                            reload_heatmap_history = true;
                                         }
                                         Content::Ladder(Some(p)) => {
                                             p.set_tick_size(tm.multiply_with_min_tick_step(ticker));
@@ -1147,7 +1203,9 @@ impl State {
                                         }
                                     }
                                 }
-                                if !is_client {
+                                if reload_heatmap_history {
+                                    effect = Some(Effect::ReloadHeatmapHistory);
+                                } else if !is_client {
                                     effect = Some(Effect::RefreshStreams);
                                 }
                             }
@@ -1183,7 +1241,7 @@ impl State {
                                             }
                                         }
 
-                                        effect = Some(Effect::RefreshStreams);
+                                        effect = Some(Effect::ReloadHeatmapHistory);
                                     }
                                     Content::Kline { chart: Some(c), .. } => {
                                         if let Some(base_ticker) = base_ticker {

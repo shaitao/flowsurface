@@ -283,7 +283,15 @@ impl PaneSetup {
             };
 
         let tick_multiplier = match content_kind {
-            ContentKind::HeatmapChart | ContentKind::Ladder => {
+            ContentKind::HeatmapChart => {
+                let tm = if let Some(tm) = current_tick_multiplier {
+                    tm
+                } else {
+                    TickMultiplier(1)
+                };
+                Some(tm)
+            }
+            ContentKind::Ladder => {
                 let tm = if !is_client_aggr && prev_is_client_aggr {
                     TickMultiplier(10)
                 } else if let Some(tm) = current_tick_multiplier {
