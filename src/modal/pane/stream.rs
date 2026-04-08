@@ -264,7 +264,8 @@ impl Modifier {
                         }
 
                         if new_tf.is_custom_minutes() {
-                            *raw_input_buf = NumericInput::from_str(&new_tf.to_minutes().to_string());
+                            *raw_input_buf =
+                                NumericInput::from_str(&new_tf.to_minutes().to_string());
                             *parsed_input = Some(new_tf);
                         }
                     }
@@ -585,7 +586,8 @@ impl Modifier {
                                 &raw_input_buf.to_display_string(),
                                 is_input_valid,
                                 Message::TimeframeInputChanged,
-                                timeframe_to_submit.map(|tf| Message::BasisSelected(Basis::Time(tf))),
+                                timeframe_to_submit
+                                    .map(|tf| Message::BasisSelected(Basis::Time(tf))),
                             );
 
                             basis_selection_column = basis_selection_column.push(custom_input);
@@ -830,10 +832,7 @@ fn supported_kline_timeframes(stream_pair: Option<&StreamPairKind>) -> Vec<Timef
         .collect()
 }
 
-fn supports_custom_kline_minutes(
-    kind: ModifierKind,
-    stream_pair: Option<&StreamPairKind>,
-) -> bool {
+fn supports_custom_kline_minutes(kind: ModifierKind, stream_pair: Option<&StreamPairKind>) -> bool {
     if !matches!(
         kind,
         ModifierKind::Candlestick(_) | ModifierKind::Footprint(_, _) | ModifierKind::Comparison(_)
@@ -882,7 +881,11 @@ impl From<&ModifierKind> for SelectedTab {
                     } else {
                         NumericInput::default()
                     },
-                    parsed_input: if tf.is_custom_minutes() { Some(*tf) } else { None },
+                    parsed_input: if tf.is_custom_minutes() {
+                        Some(*tf)
+                    } else {
+                        None
+                    },
                     is_input_valid: true,
                 },
                 Basis::Tick(tc) => SelectedTab::TickCount {

@@ -34,8 +34,9 @@ static TICK_DAY_CACHE: LazyLock<RwLock<QmtTickDayCache>> =
     LazyLock::new(|| RwLock::new(QmtTickDayCache::new(QMT_TICK_CACHE_MAX_DAYS_PER_SYMBOL)));
 static CURRENT_DAY_TICK_CACHE: LazyLock<RwLock<FxHashMap<Ticker, CurrentDayTickCacheEntry>>> =
     LazyLock::new(|| RwLock::new(FxHashMap::default()));
-static TICK_FETCH_FAILURE_CACHE: LazyLock<RwLock<FxHashMap<(Ticker, NaiveDate), TickFetchFailureEntry>>> =
-    LazyLock::new(|| RwLock::new(FxHashMap::default()));
+static TICK_FETCH_FAILURE_CACHE: LazyLock<
+    RwLock<FxHashMap<(Ticker, NaiveDate), TickFetchFailureEntry>>,
+> = LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
 fn qmt_bridge_base() -> String {
     env::var("QMT_BRIDGE_BASE").unwrap_or_else(|_| DEFAULT_QMT_BRIDGE_BASE.to_string())
@@ -183,6 +184,13 @@ struct SyntheticTradeState {
     previous_tick: Option<QmtTick>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntheticTradeSide {
+    Buy,
+    Sell,
+    Split,
+}
+
 #[derive(Debug, Default)]
 struct TradingDayCache {
     covered_ranges: Vec<(NaiveDate, NaiveDate)>,
@@ -221,13 +229,16 @@ impl QmtTickDayCache {
 }
 
 impl SyntheticTradeState {
-    fn update(&mut self, current_tick: QmtTick, ticker_info: TickerInfo) -> Option<Trade> {
-        let trade = self
+    fn update(&mut self, current_tick: QmtTick, ticker_info: TickerInfo) -> Vec<Trade> {
+        let trades = self
             .previous_tick
             .as_ref()
-            .and_then(|previous_tick| synthesize_trade(previous_tick, &current_tick, ticker_info));
+            .map(|previous_tick| {
+                synthesize_trades_for_tick_pair(previous_tick, &current_tick, ticker_info)
+            })
+            .unwrap_or_default();
         self.previous_tick = Some(current_tick);
-        trade
+        trades
     }
 }
 
@@ -418,7 +429,8 @@ fn current_day_history_ready(ticker: Ticker, day: NaiveDate) -> bool {
         return false;
     };
     prune_current_day_tick_cache(&mut cache);
-    cache.get(&ticker)
+    cache
+        .get(&ticker)
         .is_some_and(|entry| entry.day == day && entry.history_loaded)
 }
 
@@ -431,7 +443,11 @@ fn build_live_kline_from_ticks(
     let venue = ticker_info.exchange().venue();
     let bucket_start = qmt_bucket_start(venue, latest_tick.time, timeframe)?;
 
-    let last_seed_tick = ticks.iter().rev().find(|tick| tick.time < bucket_start).cloned();
+    let last_seed_tick = ticks
+        .iter()
+        .rev()
+        .find(|tick| tick.time < bucket_start)
+        .cloned();
     let mut bucket_ticks = ticks
         .iter()
         .filter(|tick| bucket_start <= tick.time && tick.time <= latest_tick.time)
@@ -442,7 +458,8 @@ fn build_live_kline_from_ticks(
         return None;
     }
 
-    let mut relevant_ticks = Vec::with_capacity(bucket_ticks.len() + usize::from(last_seed_tick.is_some()));
+    let mut relevant_ticks =
+        Vec::with_capacity(bucket_ticks.len() + usize::from(last_seed_tick.is_some()));
     if let Some(seed_tick) = last_seed_tick.clone() {
         relevant_ticks.push(seed_tick);
     }
@@ -463,7 +480,9 @@ fn build_live_kline_from_ticks(
         return Some(kline);
     }
 
-    let first_bucket_tick = relevant_ticks.iter().find(|tick| tick.time >= bucket_start)?;
+    let first_bucket_tick = relevant_ticks
+        .iter()
+        .find(|tick| tick.time >= bucket_start)?;
     let close = latest_tick.last_price.filter(|price| *price > 0.0)?;
     let open = if let Some(day) = china_trading_day(latest_tick.time) {
         let opening_session_start = qmt_session_bounds(venue, day)
@@ -490,7 +509,10 @@ fn build_live_kline_from_ticks(
 
     let mut high = close;
     let mut low = close;
-    for tick in relevant_ticks.iter().filter(|tick| tick.time >= bucket_start) {
+    for tick in relevant_ticks
+        .iter()
+        .filter(|tick| tick.time >= bucket_start)
+    {
         if let Some(last_price) = tick.last_price.filter(|price| *price > 0.0) {
             high = high.max(last_price);
             low = low.min(last_price);
@@ -585,7 +607,11 @@ fn china_offset() -> Option<FixedOffset> {
 }
 
 fn current_china_day() -> Option<NaiveDate> {
-    Some(chrono::Utc::now().with_timezone(&china_offset()?).date_naive())
+    Some(
+        chrono::Utc::now()
+            .with_timezone(&china_offset()?)
+            .date_naive(),
+    )
 }
 
 fn china_datetime(timestamp_ms: u64) -> Option<chrono::DateTime<FixedOffset>> {
@@ -687,7 +713,11 @@ pub fn supports_gapless_time_axis_timeframe(venue: Venue, timeframe: Timeframe) 
     uses_gapless_time_axis(venue) && qmt_timeframe_ms(timeframe).is_some()
 }
 
-fn qmt_bucket_starts_for_day(venue: Venue, day: NaiveDate, timeframe: Timeframe) -> Option<Vec<u64>> {
+fn qmt_bucket_starts_for_day(
+    venue: Venue,
+    day: NaiveDate,
+    timeframe: Timeframe,
+) -> Option<Vec<u64>> {
     if !is_qmt_trading_day(venue, day) {
         return None;
     }
@@ -788,8 +818,8 @@ pub fn time_axis_bucket_offset(
 
     let (anchor_day, anchor_bucket_index) = qmt_bucket_position(venue, anchor_ms, timeframe)?;
     let (target_day, target_bucket_index) = qmt_bucket_position(venue, target_ms, timeframe)?;
-    let buckets_per_day = i64::try_from(qmt_bucket_starts_for_day(venue, anchor_day, timeframe)?.len())
-        .ok()?;
+    let buckets_per_day =
+        i64::try_from(qmt_bucket_starts_for_day(venue, anchor_day, timeframe)?.len()).ok()?;
     if buckets_per_day <= 0 {
         return None;
     }
@@ -812,8 +842,8 @@ pub fn time_axis_bucket_at_offset(
     }
 
     let (anchor_day, anchor_bucket_index) = qmt_bucket_position(venue, anchor_ms, timeframe)?;
-    let buckets_per_day = i64::try_from(qmt_bucket_starts_for_day(venue, anchor_day, timeframe)?.len())
-        .ok()?;
+    let buckets_per_day =
+        i64::try_from(qmt_bucket_starts_for_day(venue, anchor_day, timeframe)?.len()).ok()?;
     if buckets_per_day <= 0 {
         return None;
     }
@@ -1076,11 +1106,11 @@ fn build_daily_seed_prices(ticks: &[QmtTick]) -> HashMap<NaiveDate, f32> {
 fn synthesize_trades_from_ticks(ticks: &[QmtTick], ticker_info: TickerInfo) -> Vec<Trade> {
     ticks
         .windows(2)
-        .filter_map(|pair| {
+        .flat_map(|pair| {
             let [previous_tick, current_tick] = pair else {
-                return None;
+                return Vec::new();
             };
-            synthesize_trade(previous_tick, current_tick, ticker_info)
+            synthesize_trades_for_tick_pair(previous_tick, current_tick, ticker_info)
         })
         .collect()
 }
@@ -1184,7 +1214,8 @@ fn aggregate_trades_to_klines(
         let Some(bar) = bars.get_mut(&bucket) else {
             continue;
         };
-        let day_changed = china_trading_day(previous_tick.time) != china_trading_day(current_tick.time);
+        let day_changed =
+            china_trading_day(previous_tick.time) != china_trading_day(current_tick.time);
 
         if let Some(current_high) = current_tick.high.filter(|price| *price > 0.0) {
             let high_increased = day_changed
@@ -1290,11 +1321,45 @@ fn aggregate_trades_to_klines(
     Ok(klines)
 }
 
-fn synthesize_trade(
+fn split_synthetic_qty(total_qty: Qty) -> (Qty, Qty) {
+    let sell_qty = Qty::from_units(total_qty.units.div_euclid(2));
+    let buy_qty = total_qty - sell_qty;
+    (buy_qty, sell_qty)
+}
+
+fn classify_synthetic_trade_side(
+    previous_tick: &QmtTick,
+    synthetic_price: f32,
+) -> Option<SyntheticTradeSide> {
+    let bid1 = previous_tick
+        .bid_price
+        .first()
+        .copied()
+        .filter(|price| *price > 0.0)?;
+    let ask1 = previous_tick
+        .ask_price
+        .first()
+        .copied()
+        .filter(|price| *price > 0.0)?;
+
+    if ask1 <= bid1 {
+        return Some(SyntheticTradeSide::Split);
+    }
+
+    if synthetic_price >= ask1 {
+        Some(SyntheticTradeSide::Buy)
+    } else if synthetic_price <= bid1 {
+        Some(SyntheticTradeSide::Sell)
+    } else {
+        Some(SyntheticTradeSide::Split)
+    }
+}
+
+fn synthesize_trades_for_tick_pair(
     previous_tick: &QmtTick,
     current_tick: &QmtTick,
     ticker_info: TickerInfo,
-) -> Option<Trade> {
+) -> Vec<Trade> {
     let day_changed = china_trading_day(previous_tick.time) != china_trading_day(current_tick.time);
 
     let volume_reset = matches!(
@@ -1312,7 +1377,7 @@ fn synthesize_trade(
     let counters_reset = volume_reset || amount_reset || txn_reset;
 
     if counters_reset && !day_changed {
-        return None;
+        return Vec::new();
     }
 
     let baseline_volume = if counters_reset && day_changed {
@@ -1324,85 +1389,71 @@ fn synthesize_trade(
         (Some(curr), Some(base)) if curr > base => Some((curr - base) as f32 * QMT_VOLUME_LOT_SIZE),
         (Some(curr), None) if curr > 0 => Some(curr as f32 * QMT_VOLUME_LOT_SIZE),
         _ => None,
-    }?;
+    };
+
+    let Some(qty_raw) = qty_raw else {
+        return Vec::new();
+    };
 
     if qty_raw <= 0.0 {
-        return None;
+        return Vec::new();
     }
 
-    let raw_price = current_tick.last_price?;
+    let Some(raw_price) = current_tick.last_price else {
+        return Vec::new();
+    };
 
     if raw_price <= 0.0 {
-        return None;
+        return Vec::new();
     }
 
-    let is_sell = infer_is_sell(previous_tick, current_tick, raw_price);
     let price = Price::from_f32(raw_price).round_to_min_tick(ticker_info.min_ticksize);
     let qty = Qty::from_f32(qty_raw).round_to_min_qty(ticker_info.min_qty);
 
     if qty.is_zero() {
-        return None;
+        return Vec::new();
     }
 
-    Some(Trade {
-        time: current_tick.time,
-        is_sell,
-        price,
-        qty,
-    })
-}
-
-fn infer_is_sell(previous_tick: &QmtTick, current_tick: &QmtTick, synthetic_price: f32) -> bool {
-    let bid1 = current_tick.bid_price.first().copied();
-    let ask1 = current_tick.ask_price.first().copied();
-
-    if let Some(ask) = ask1
-        && synthetic_price >= ask
-    {
-        return false;
-    }
-    if let Some(bid) = bid1
-        && synthetic_price <= bid
-    {
-        return true;
-    }
-
-    if let (Some(bid), Some(ask)) = (bid1, ask1) {
-        let mid = (bid + ask) / 2.0;
-        if synthetic_price > mid {
-            return false;
-        }
-        if synthetic_price < mid {
-            return true;
-        }
-    }
-
-    if let (Some(previous_last), Some(current_last)) =
-        (previous_tick.last_price, current_tick.last_price)
-    {
-        if current_last > previous_last {
-            return false;
-        }
-        if current_last < previous_last {
-            return true;
-        }
-    }
-
-    let bid_drop = match (previous_tick.bid_vol.first(), current_tick.bid_vol.first()) {
-        (Some(prev), Some(curr)) => prev - curr,
-        _ => 0.0,
-    };
-    let ask_drop = match (previous_tick.ask_vol.first(), current_tick.ask_vol.first()) {
-        (Some(prev), Some(curr)) => prev - curr,
-        _ => 0.0,
+    let Some(side) = classify_synthetic_trade_side(previous_tick, raw_price) else {
+        return Vec::new();
     };
 
-    if bid_drop > ask_drop {
-        true
-    } else if ask_drop > bid_drop {
-        false
-    } else {
-        false
+    match side {
+        SyntheticTradeSide::Buy => vec![Trade {
+            time: current_tick.time,
+            is_sell: false,
+            price,
+            qty,
+        }],
+        SyntheticTradeSide::Sell => vec![Trade {
+            time: current_tick.time,
+            is_sell: true,
+            price,
+            qty,
+        }],
+        SyntheticTradeSide::Split => {
+            let (buy_qty, sell_qty) = split_synthetic_qty(qty);
+            let mut trades = Vec::with_capacity(2);
+
+            if !buy_qty.is_zero() {
+                trades.push(Trade {
+                    time: current_tick.time,
+                    is_sell: false,
+                    price,
+                    qty: buy_qty,
+                });
+            }
+            if !sell_qty.is_zero() {
+                trades.push(Trade {
+                    time: current_tick.time,
+                    is_sell: true,
+                    price,
+                    qty: sell_qty,
+                });
+            }
+
+            trades
+        }
     }
 }
 
@@ -1412,7 +1463,12 @@ mod tests {
     use chrono::NaiveDate;
 
     fn sample_ticker_info() -> TickerInfo {
-        TickerInfo::new(Ticker::new("600309.SH", super::super::Exchange::SSH), 0.01, 1.0, None)
+        TickerInfo::new(
+            Ticker::new("600309.SH", super::super::Exchange::SSH),
+            0.01,
+            1.0,
+            None,
+        )
     }
 
     fn china_ms(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> u64 {
@@ -1455,6 +1511,8 @@ mod tests {
         previous.amount = Some(24_196_695.0);
         previous.volume = Some(2_958);
         previous.transaction_num = Some(258);
+        previous.bid_price = vec![82.06];
+        previous.ask_price = vec![82.08];
 
         let mut current = sample_tick(1_775_525_404_000);
         current.last_price = Some(82.08);
@@ -1462,12 +1520,15 @@ mod tests {
         current.volume = Some(3_175);
         current.transaction_num = Some(284);
 
-        let trade = synthesize_trade(&previous, &current, ticker_info)
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+        let trade = trades
+            .first()
             .expect("expected synthetic trade from volume delta");
 
         assert_eq!(trade.time, current.time);
         assert_eq!(f32::from(trade.qty), 21_700.0);
         assert_eq!(trade.price.to_f32(), 82.08);
+        assert!(!trade.is_sell);
     }
 
     #[test]
@@ -1477,13 +1538,74 @@ mod tests {
         previous.last_price = Some(82.00);
         previous.volume = Some(2_958);
         previous.transaction_num = Some(258);
+        previous.bid_price = vec![81.99];
+        previous.ask_price = vec![82.01];
 
         let mut current = sample_tick(1_775_525_404_000);
         current.last_price = None;
         current.volume = Some(3_175);
         current.transaction_num = Some(284);
 
-        assert!(synthesize_trade(&previous, &current, ticker_info).is_none());
+        assert!(synthesize_trades_for_tick_pair(&previous, &current, ticker_info).is_empty());
+    }
+
+    #[test]
+    fn synthesize_trade_uses_previous_bid_for_sell_classification() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.volume = Some(100);
+        previous.transaction_num = Some(10);
+        previous.bid_price = vec![82.00];
+        previous.ask_price = vec![82.02];
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = Some(82.00);
+        current.volume = Some(101);
+        current.transaction_num = Some(11);
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 1);
+        assert!(trades[0].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
+    }
+
+    #[test]
+    fn synthesize_trade_splits_inside_previous_spread_without_fallback() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.volume = Some(100);
+        previous.transaction_num = Some(10);
+        previous.bid_price = vec![82.00];
+        previous.ask_price = vec![82.02];
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = Some(82.01);
+        current.volume = Some(101);
+        current.transaction_num = Some(11);
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 2);
+        assert!(!trades[0].is_sell);
+        assert!(trades[1].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 50.0);
+        assert_eq!(f32::from(trades[1].qty), 50.0);
+    }
+
+    #[test]
+    fn synthesize_trade_requires_previous_top_of_book_without_fallback() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.volume = Some(100);
+        previous.transaction_num = Some(10);
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = Some(82.01);
+        current.volume = Some(101);
+        current.transaction_num = Some(11);
+
+        assert!(synthesize_trades_for_tick_pair(&previous, &current, ticker_info).is_empty());
     }
 
     #[test]
@@ -1517,9 +1639,15 @@ mod tests {
         tick2.high = Some(82.37);
         tick2.low = Some(81.80);
 
-        let bars =
-            aggregate_trades_to_klines(&trades, &[tick1, tick2], ticker_info, Timeframe::M5, start, end)
-                .expect("expected synthetic klines");
+        let bars = aggregate_trades_to_klines(
+            &trades,
+            &[tick1, tick2],
+            ticker_info,
+            Timeframe::M5,
+            start,
+            end,
+        )
+        .expect("expected synthetic klines");
 
         let first = bars.first().expect("expected one bar");
         assert_eq!(first.open.to_f32(), 82.00);
@@ -1561,9 +1689,15 @@ mod tests {
         tick2.high = Some(82.37);
         tick2.low = Some(81.80);
 
-        let bars =
-            aggregate_trades_to_klines(&trades, &[tick1, tick2], ticker_info, Timeframe::M5, start, end)
-                .expect("expected synthetic klines");
+        let bars = aggregate_trades_to_klines(
+            &trades,
+            &[tick1, tick2],
+            ticker_info,
+            Timeframe::M5,
+            start,
+            end,
+        )
+        .expect("expected synthetic klines");
 
         let first = bars.first().expect("expected one bar");
         assert!((first.open.to_f32() - 81.80).abs() < 0.001);
@@ -1624,7 +1758,10 @@ mod tests {
     #[test]
     fn qmt_bucket_start_does_not_map_lunch_grace_to_morning_bucket() {
         let lunch_tick = china_ms(2026, 4, 9, 11, 30, 2);
-        assert_eq!(qmt_bucket_start(Venue::SSH, lunch_tick, Timeframe::M30), None);
+        assert_eq!(
+            qmt_bucket_start(Venue::SSH, lunch_tick, Timeframe::M30),
+            None
+        );
     }
 
     #[test]
@@ -1770,6 +1907,8 @@ mod tests {
         seed_tick.last_price = Some(82.10);
         seed_tick.volume = Some(1_000);
         seed_tick.transaction_num = Some(10);
+        seed_tick.bid_price = vec![81.99];
+        seed_tick.ask_price = vec![82.00];
 
         let mut tick1 = sample_tick(bucket_start + 1_000);
         tick1.open = Some(82.00);
@@ -1778,6 +1917,8 @@ mod tests {
         tick1.low = Some(82.00);
         tick1.volume = Some(1_010);
         tick1.transaction_num = Some(11);
+        tick1.bid_price = vec![82.06];
+        tick1.ask_price = vec![82.08];
 
         let mut tick2 = sample_tick(bucket_start + 4_000);
         tick2.open = Some(82.00);
@@ -1814,6 +1955,8 @@ mod tests {
         tick1.last_price = Some(82.02);
         tick1.volume = Some(1_000);
         tick1.transaction_num = Some(10);
+        tick1.bid_price = vec![82.04];
+        tick1.ask_price = vec![82.06];
 
         let mut tick2 = sample_tick(second_bucket + 2_000);
         tick2.open = Some(82.05);
@@ -2052,14 +2195,13 @@ pub fn connect_trade_stream(
                                     let history_ready = day.is_some_and(|day| {
                                         current_day_history_ready(ticker_info.ticker, day)
                                     });
+                                    let trades = trade_state.update(tick, ticker_info);
 
-                                    if let Some(trade) = trade_state.update(tick, ticker_info)
-                                        && history_ready
-                                    {
+                                    if history_ready && !trades.is_empty() {
                                         trade_buffers
                                             .entry(ticker_info.ticker)
                                             .or_default()
-                                            .push(trade);
+                                            .extend(trades);
                                     }
 
                                     if last_flush.elapsed() >= super::TRADE_BUCKET_INTERVAL {
@@ -2358,9 +2500,11 @@ pub async fn fetch_klines(
     timeframe: Timeframe,
     range: Option<(u64, u64)>,
 ) -> Result<Vec<Kline>, AdapterError> {
-    Ok(fetch_tick_derived_history(ticker_info, timeframe, range, false)
-        .await?
-        .0)
+    Ok(
+        fetch_tick_derived_history(ticker_info, timeframe, range, false)
+            .await?
+            .0,
+    )
 }
 
 pub async fn fetch_klines_and_trades(
@@ -2400,7 +2544,10 @@ pub async fn historical_day_ranges(
     };
 
     let mut day_ranges = Vec::new();
-    for day in qmt_trading_days_between(venue, start_day, end_day).into_iter().rev() {
+    for day in qmt_trading_days_between(venue, start_day, end_day)
+        .into_iter()
+        .rev()
+    {
         let Some((day_start, day_end)) = qmt_tick_fetch_bounds(venue, day) else {
             continue;
         };
@@ -2549,7 +2696,10 @@ async fn fetch_ticks(
     Ok(ticks)
 }
 
-async fn fetch_tick_day(ticker_info: TickerInfo, day: NaiveDate) -> Result<Vec<QmtTick>, AdapterError> {
+async fn fetch_tick_day(
+    ticker_info: TickerInfo,
+    day: NaiveDate,
+) -> Result<Vec<QmtTick>, AdapterError> {
     if let Some(error) = recent_tick_fetch_failure(ticker_info.ticker, day) {
         return Err(AdapterError::InvalidRequest(format!(
             "QMT historical tick fetch cooling down for {} on {} after previous failure: {}",

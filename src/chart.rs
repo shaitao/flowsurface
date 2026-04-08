@@ -736,7 +736,8 @@ impl ViewState {
             Basis::Time(timeframe) => {
                 if self.uses_gapless_time_axis() {
                     let left_offset = (region.x / self.cell_width).floor() as i64 - 1;
-                    let right_offset = ((region.x + region.width) / self.cell_width).ceil() as i64 + 1;
+                    let right_offset =
+                        ((region.x + region.width) / self.cell_width).ceil() as i64 + 1;
 
                     let earliest = exchange::adapter::qmt::time_axis_bucket_at_offset(
                         self.ticker_info.exchange().venue(),

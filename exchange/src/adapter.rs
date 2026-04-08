@@ -728,10 +728,11 @@ pub async fn fetch_klines_and_trades(
 ) -> Result<(Vec<Kline>, Vec<Trade>), AdapterError> {
     match ticker_info.ticker.exchange.venue() {
         Venue::Binance => Err(AdapterError::InvalidRequest(
-            "Combined historical kline/trade fetch is only implemented for QMT venues"
-                .to_string(),
+            "Combined historical kline/trade fetch is only implemented for QMT venues".to_string(),
         )),
-        Venue::SSZ | Venue::SSH => qmt::fetch_klines_and_trades(ticker_info, timeframe, range).await,
+        Venue::SSZ | Venue::SSH => {
+            qmt::fetch_klines_and_trades(ticker_info, timeframe, range).await
+        }
     }
 }
 

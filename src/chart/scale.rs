@@ -574,7 +574,8 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                         let chart_x_max = region.x + region.width;
                         let mut last_x: Option<f32> = None;
                         let start_offset = (region.x / self.cell_width).floor() as i64 - 1;
-                        let end_offset = ((region.x + region.width) / self.cell_width).ceil() as i64 + 1;
+                        let end_offset =
+                            ((region.x + region.width) / self.cell_width).ceil() as i64 + 1;
 
                         for bucket_offset in start_offset..=end_offset {
                             let x_position = (bucket_offset as f32) * self.cell_width;
@@ -589,12 +590,14 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                                 continue;
                             }
 
-                            let Some(timestamp) = exchange::adapter::qmt::time_axis_bucket_at_offset(
-                                self.ticker_info.exchange().venue(),
-                                self.max,
-                                timeframe,
-                                bucket_offset,
-                            ) else {
+                            let Some(timestamp) =
+                                exchange::adapter::qmt::time_axis_bucket_at_offset(
+                                    self.ticker_info.exchange().venue(),
+                                    self.max,
+                                    timeframe,
+                                    bucket_offset,
+                                )
+                            else {
                                 continue;
                             };
 

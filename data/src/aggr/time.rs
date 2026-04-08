@@ -504,11 +504,8 @@ mod tests {
             },
         ];
 
-        let mut timeseries = TimeSeries::<KlineDataPoint>::new(
-            Timeframe::H1,
-            PriceStep::from_f32(0.01),
-            &klines,
-        );
+        let mut timeseries =
+            TimeSeries::<KlineDataPoint>::new(Timeframe::H1, PriceStep::from_f32(0.01), &klines);
 
         let trades = vec![
             Trade {
@@ -572,11 +569,8 @@ mod tests {
             },
         ];
 
-        let timeseries = TimeSeries::<KlineDataPoint>::new(
-            Timeframe::H1,
-            PriceStep::from_f32(0.01),
-            &klines,
-        );
+        let timeseries =
+            TimeSeries::<KlineDataPoint>::new(Timeframe::H1, PriceStep::from_f32(0.01), &klines);
 
         let trades = vec![Trade {
             time: bucket_0930 + 15 * 60_000,
