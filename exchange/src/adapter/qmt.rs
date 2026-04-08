@@ -42,7 +42,6 @@ static TICK_FETCH_FAILURE_CACHE: LazyLock<
     RwLock<FxHashMap<(Ticker, NaiveDate), TickFetchFailureEntry>>,
 > = LazyLock::new(|| RwLock::new(FxHashMap::default()));
 static INVALID_TOP_OF_BOOK_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
-static NO_CLEAR_SIDE_SIGNAL_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VOLUME_REGRESSION_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MISSING_LAST_PRICE_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ZERO_QTY_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1415,6 +1414,48 @@ fn split_synthetic_qty(total_qty: Qty) -> (Qty, Qty) {
     (buy_qty, sell_qty)
 }
 
+fn tick_rule_side(previous_tick: &QmtTick, current_tick: &QmtTick) -> SyntheticTradeSide {
+    match (
+        previous_tick.valid_last_price(),
+        current_tick.valid_last_price(),
+    ) {
+        (Some(prev), Some(curr)) if curr > prev => SyntheticTradeSide::Buy,
+        (Some(prev), Some(curr)) if curr < prev => SyntheticTradeSide::Sell,
+        _ => SyntheticTradeSide::Split,
+    }
+}
+
+fn classify_with_bba(
+    previous_tick: &QmtTick,
+    current_tick: &QmtTick,
+    bid1: f32,
+    ask1: f32,
+    synthetic_price: f32,
+    warning_enabled: bool,
+) -> SyntheticTradeSide {
+    if ask1 <= bid1 {
+        if warning_enabled {
+            log_qmt_synthetic_warning(
+                &INVALID_TOP_OF_BOOK_WARN_COUNT,
+                "invalid top of book ask1<=bid1",
+                || {
+                    format!(
+                        "bid1={bid1} ask1={ask1} previous_tick={previous_tick:?} current_tick={current_tick:?}"
+                    )
+                },
+            );
+        }
+        return SyntheticTradeSide::Split;
+    }
+    if synthetic_price >= ask1 {
+        return SyntheticTradeSide::Buy;
+    }
+    if synthetic_price <= bid1 {
+        return SyntheticTradeSide::Sell;
+    }
+    tick_rule_side(previous_tick, current_tick)
+}
+
 fn classify_synthetic_trade_side(
     previous_tick: &QmtTick,
     current_tick: &QmtTick,
@@ -1423,46 +1464,30 @@ fn classify_synthetic_trade_side(
     let warning_enabled = qmt_synthetic_warning_enabled(previous_tick, current_tick);
     let current_bid1 = current_tick.valid_bid1();
     let current_ask1 = current_tick.valid_ask1();
-    if current_bid1.is_none() || current_ask1.is_none() {
-        if current_tick.volume > 0 {
-            return SyntheticTradeSide::Split;
-        }
-    }
 
     if let (Some(bid1), Some(ask1)) = (current_bid1, current_ask1) {
-        if ask1 <= bid1 {
-            if warning_enabled {
-                log_qmt_synthetic_warning(
-                    &INVALID_TOP_OF_BOOK_WARN_COUNT,
-                    "invalid top of book ask1<=bid1",
-                    || {
-                        format!(
-                            "bid1={bid1} ask1={ask1} previous_tick={previous_tick:?} current_tick={current_tick:?}"
-                        )
-                    },
-                );
-            }
-            return SyntheticTradeSide::Split;
-        }
-        if synthetic_price >= ask1 {
-            return SyntheticTradeSide::Buy;
-        }
-        if synthetic_price <= bid1 {
-            return SyntheticTradeSide::Sell;
-        }
-        if bid1 < synthetic_price && synthetic_price < ask1 {
-            return SyntheticTradeSide::Split;
-        }
-    }
-
-    if warning_enabled {
-        log_qmt_synthetic_warning(
-            &NO_CLEAR_SIDE_SIGNAL_WARN_COUNT,
-            "had no clear side signal, splitting",
-            || format!("previous_tick={previous_tick:?} current_tick={current_tick:?}"),
+        return classify_with_bba(
+            previous_tick,
+            current_tick,
+            bid1,
+            ask1,
+            synthetic_price,
+            warning_enabled,
         );
     }
-    SyntheticTradeSide::Split
+
+    if let (Some(bid1), Some(ask1)) = (previous_tick.valid_bid1(), previous_tick.valid_ask1()) {
+        return classify_with_bba(
+            previous_tick,
+            current_tick,
+            bid1,
+            ask1,
+            synthetic_price,
+            warning_enabled,
+        );
+    }
+
+    tick_rule_side(previous_tick, current_tick)
 }
 
 fn synthetic_trade_qty_from_volume(previous_tick: &QmtTick, current_tick: &QmtTick) -> Option<f32> {
@@ -1670,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_trade_splits_inside_previous_spread_without_fallback() {
+    fn synthesize_trade_uses_tick_rule_inside_spread_uptick() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
         previous.volume = 100;
@@ -1683,15 +1708,13 @@ mod tests {
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
 
-        assert_eq!(trades.len(), 2);
+        assert_eq!(trades.len(), 1);
         assert!(!trades[0].is_sell);
-        assert!(trades[1].is_sell);
-        assert_eq!(f32::from(trades[0].qty), 50.0);
-        assert_eq!(f32::from(trades[1].qty), 50.0);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
     }
 
     #[test]
-    fn synthesize_trade_splits_without_current_top_of_book() {
+    fn synthesize_trade_falls_back_to_previous_bba_with_tick_rule() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
         previous.last_price = 82.00;
@@ -1705,11 +1728,9 @@ mod tests {
 
         let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
 
-        assert_eq!(trades.len(), 2);
+        assert_eq!(trades.len(), 1);
         assert!(!trades[0].is_sell);
-        assert!(trades[1].is_sell);
-        assert_eq!(f32::from(trades[0].qty), 50.0);
-        assert_eq!(f32::from(trades[1].qty), 50.0);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
     }
 
     #[test]
@@ -1733,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_trade_does_not_use_previous_l1_volume_drop_without_current_top_of_book() {
+    fn synthesize_trade_falls_back_to_previous_bba_unchanged_price_splits() {
         let ticker_info = sample_ticker_info();
         let mut previous = sample_tick(1_775_525_401_000);
         previous.last_price = 82.00;
@@ -1776,6 +1797,124 @@ mod tests {
         assert!(trades[1].is_sell);
         assert_eq!(f32::from(trades[0].qty), 50.0);
         assert_eq!(f32::from(trades[1].qty), 50.0);
+    }
+
+    #[test]
+    fn synthesize_trade_tick_rule_downtick_inside_spread_sells() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.last_price = 82.02;
+        previous.volume = 100;
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = 82.01;
+        current.volume = 101;
+        current.bid_price = vec![82.00];
+        current.ask_price = vec![82.02];
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 1);
+        assert!(trades[0].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
+    }
+
+    #[test]
+    fn synthesize_trade_tick_rule_unchanged_inside_spread_splits() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.last_price = 82.01;
+        previous.volume = 100;
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = 82.01;
+        current.volume = 101;
+        current.bid_price = vec![82.00];
+        current.ask_price = vec![82.02];
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 2);
+        assert!(!trades[0].is_sell);
+        assert!(trades[1].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 50.0);
+        assert_eq!(f32::from(trades[1].qty), 50.0);
+    }
+
+    #[test]
+    fn synthesize_trade_stale_bba_downtick_sells() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.last_price = 82.02;
+        previous.volume = 100;
+        previous.bid_price = vec![82.00];
+        previous.ask_price = vec![82.03];
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = 82.01;
+        current.volume = 101;
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 1);
+        assert!(trades[0].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
+    }
+
+    #[test]
+    fn synthesize_trade_stale_bba_at_ask_buys() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.last_price = 82.00;
+        previous.volume = 100;
+        previous.bid_price = vec![82.00];
+        previous.ask_price = vec![82.02];
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = 82.02;
+        current.volume = 101;
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 1);
+        assert!(!trades[0].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
+    }
+
+    #[test]
+    fn synthesize_trade_no_bba_uptick_buys() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.last_price = 82.00;
+        previous.volume = 100;
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = 82.01;
+        current.volume = 101;
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 1);
+        assert!(!trades[0].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
+    }
+
+    #[test]
+    fn synthesize_trade_no_bba_downtick_sells() {
+        let ticker_info = sample_ticker_info();
+        let mut previous = sample_tick(1_775_525_401_000);
+        previous.last_price = 82.02;
+        previous.volume = 100;
+
+        let mut current = sample_tick(1_775_525_404_000);
+        current.last_price = 82.01;
+        current.volume = 101;
+
+        let trades = synthesize_trades_for_tick_pair(&previous, &current, ticker_info);
+
+        assert_eq!(trades.len(), 1);
+        assert!(trades[0].is_sell);
+        assert_eq!(f32::from(trades[0].qty), 100.0);
     }
 
     #[test]
@@ -2089,9 +2228,9 @@ mod tests {
         first_trade_tick.last_price = 85.0;
         let opening_trades = trade_state.update(first_trade_tick, ticker_info);
 
-        assert_eq!(opening_trades.len(), 2);
-        assert_eq!(f32::from(opening_trades[0].qty), 224_700.0);
-        assert_eq!(f32::from(opening_trades[1].qty), 224_700.0);
+        assert_eq!(opening_trades.len(), 1);
+        assert!(!opening_trades[0].is_sell);
+        assert_eq!(f32::from(opening_trades[0].qty), 449_400.0);
 
         let zero_after_open = sample_tick(china_ms(2026, 4, 9, 9, 25, 4));
         assert!(trade_state.update(zero_after_open, ticker_info).is_empty());
