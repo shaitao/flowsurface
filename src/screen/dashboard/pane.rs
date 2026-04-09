@@ -14,7 +14,7 @@ use crate::{
         },
     },
     screen::dashboard::{
-        panel::{self, ladder::Ladder, timeandsales::TimeAndSales},
+        panel::{self, ladder::Ladder, order_entry::OrderEntry, timeandsales::TimeAndSales},
         tickers_table::TickersTable,
     },
     style::{self, Icon, icon_text},
@@ -47,6 +47,7 @@ pub enum Effect {
     RefreshStreams,
     ReloadHeatmapHistory,
     RequestFetch(Vec<FetchSpec>),
+    OrderEntry(panel::order_entry::Action),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
     SyncTickerSearch(String),
@@ -91,6 +92,7 @@ pub enum Event {
     ContentSelected(ContentKind),
     ChartInteraction(super::chart::Message),
     PanelInteraction(super::panel::Message),
+    OrderEntryInteraction(super::panel::order_entry::Message),
     ToggleIndicator(UiIndicator),
     DeleteNotification(usize),
     ReorderIndicator(column_drag::DragEvent),
@@ -299,6 +301,13 @@ impl State {
                         derived_plan.price_step,
                     )));
 
+                    let streams = vec![depth_stream(&derived_plan), trades_stream(&derived_plan)];
+
+                    (content, streams)
+                }
+                ContentKind::OrderEntry => {
+                    let content =
+                        Content::OrderEntry(Some(OrderEntry::new(derived_plan.ticker_info)));
                     let streams = vec![depth_stream(&derived_plan), trades_stream(&derived_plan)];
 
                     (content, streams)
@@ -812,6 +821,34 @@ impl State {
                     )
                 }
             }
+            Content::OrderEntry(panel) => {
+                if let Some(panel) = panel {
+                    let base = panel.view().map(move |message| {
+                        Message::PaneEvent(id, Event::OrderEntryInteraction(message))
+                    });
+
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        || column![].into(),
+                        None,
+                        tickers_table,
+                    )
+                } else {
+                    let base = uninitialized_base(ContentKind::OrderEntry);
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        || column![].into(),
+                        None,
+                        tickers_table,
+                    )
+                }
+            }
             Content::Heatmap {
                 chart, indicators, ..
             } => {
@@ -1105,6 +1142,13 @@ impl State {
                 Content::TimeAndSales(Some(p)) => super::panel::update(p, msg),
                 _ => {}
             },
+            Event::OrderEntryInteraction(msg) => {
+                if let Content::OrderEntry(Some(panel)) = &mut self.content
+                    && let Some(action) = panel.update(msg)
+                {
+                    return Some(Effect::OrderEntry(action));
+                }
+            }
             Event::ToggleIndicator(ind) => {
                 self.content.toggle_indicator(ind);
             }
@@ -1447,7 +1491,16 @@ impl State {
 
         let show_modal = |modal: Modal| Message::PaneEvent(pane, Event::ShowModal(modal));
 
-        if !treat_as_starter {
+        let supports_settings = matches!(
+            &self.content,
+            Content::Heatmap { .. }
+                | Content::Kline { .. }
+                | Content::TimeAndSales(_)
+                | Content::Ladder(_)
+                | Content::Comparison(_)
+        );
+
+        if !treat_as_starter && supports_settings {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Cog, 12),
                 show_modal(Modal::Settings),
@@ -1653,6 +1706,7 @@ impl State {
             Content::Ladder(panel) => panel
                 .as_mut()
                 .and_then(|p| p.invalidate(Some(now)).map(Action::Panel)),
+            Content::OrderEntry(_) => None,
             Content::Starter => None,
             Content::Comparison(chart) => chart
                 .as_mut()
@@ -1671,6 +1725,7 @@ impl State {
                 }
             }
             Content::Ladder(_) | Content::TimeAndSales(_) => Some(100),
+            Content::OrderEntry(_) => None,
             Content::Starter => None,
         }
     }
@@ -1749,6 +1804,7 @@ pub enum Content {
     },
     TimeAndSales(Option<TimeAndSales>),
     Ladder(Option<Ladder>),
+    OrderEntry(Option<OrderEntry>),
     Comparison(Option<ComparisonChart>),
 }
 
@@ -1948,6 +2004,7 @@ impl Content {
             ContentKind::ComparisonChart => Content::Comparison(None),
             ContentKind::TimeAndSales => Content::TimeAndSales(None),
             ContentKind::Ladder => Content::Ladder(None),
+            ContentKind::OrderEntry => Content::OrderEntry(None),
         }
     }
 
@@ -1957,6 +2014,7 @@ impl Content {
             Content::Kline { chart, .. } => Some(chart.as_ref()?.last_update()),
             Content::TimeAndSales(panel) => Some(panel.as_ref()?.last_update()),
             Content::Ladder(panel) => Some(panel.as_ref()?.last_update()),
+            Content::OrderEntry(panel) => Some(panel.as_ref()?.last_update()),
             Content::Comparison(chart) => Some(chart.as_ref()?.last_update()),
             Content::Starter => None,
         }
@@ -2015,6 +2073,7 @@ impl Content {
             Content::Kline { indicators, .. } => column_drag::reorder_vec(indicators, event),
             Content::TimeAndSales(_)
             | Content::Ladder(_)
+            | Content::OrderEntry(_)
             | Content::Starter
             | Content::Comparison(_) => {
                 panic!("indicator reorder on {} pane", self)
@@ -2052,6 +2111,7 @@ impl Content {
             }
             Content::TimeAndSales(_)
             | Content::Ladder(_)
+            | Content::OrderEntry(_)
             | Content::Starter
             | Content::Comparison(_) => None,
         }
@@ -2098,6 +2158,7 @@ impl Content {
             },
             Content::TimeAndSales(_) => ContentKind::TimeAndSales,
             Content::Ladder(_) => ContentKind::Ladder,
+            Content::OrderEntry(_) => ContentKind::OrderEntry,
             Content::Comparison(_) => ContentKind::ComparisonChart,
             Content::Starter => ContentKind::Starter,
         }
@@ -2109,6 +2170,7 @@ impl Content {
             Content::Kline { chart, .. } => chart.is_some(),
             Content::TimeAndSales(panel) => panel.is_some(),
             Content::Ladder(panel) => panel.is_some(),
+            Content::OrderEntry(panel) => panel.is_some(),
             Content::Comparison(chart) => chart.is_some(),
             Content::Starter => true,
         }
@@ -2130,6 +2192,7 @@ impl PartialEq for Content {
                 | (Content::Kline { .. }, Content::Kline { .. })
                 | (Content::TimeAndSales(_), Content::TimeAndSales(_))
                 | (Content::Ladder(_), Content::Ladder(_))
+                | (Content::OrderEntry(_), Content::OrderEntry(_))
         )
     }
 }

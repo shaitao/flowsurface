@@ -1,4 +1,5 @@
 pub mod ladder;
+pub mod order_entry;
 pub mod timeandsales;
 
 use iced::{

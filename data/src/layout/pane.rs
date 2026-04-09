@@ -75,6 +75,12 @@ pub enum Pane {
         #[serde(deserialize_with = "ok_or_default", default)]
         link_group: Option<LinkGroup>,
     },
+    OrderEntry {
+        stream_type: Vec<PersistStreamKind>,
+        settings: Settings,
+        #[serde(deserialize_with = "ok_or_default", default)]
+        link_group: Option<LinkGroup>,
+    },
 }
 
 impl Default for Pane {
@@ -191,10 +197,11 @@ pub enum ContentKind {
     ComparisonChart,
     TimeAndSales,
     Ladder,
+    OrderEntry,
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 7] = [
+    pub const ALL: [ContentKind; 8] = [
         ContentKind::Starter,
         ContentKind::HeatmapChart,
         ContentKind::FootprintChart,
@@ -202,6 +209,7 @@ impl ContentKind {
         ContentKind::ComparisonChart,
         ContentKind::TimeAndSales,
         ContentKind::Ladder,
+        ContentKind::OrderEntry,
     ];
 }
 
@@ -215,6 +223,7 @@ impl std::fmt::Display for ContentKind {
             ContentKind::ComparisonChart => "Comparison Chart",
             ContentKind::TimeAndSales => "Time&Sales",
             ContentKind::Ladder => "DOM/Ladder",
+            ContentKind::OrderEntry => "Order Entry",
         };
         write!(f, "{s}")
     }
@@ -279,7 +288,7 @@ impl PaneSetup {
                         Basis::default_kline_time(Some(base_ticker), Timeframe::M15)
                     }))
                 }
-                ContentKind::Starter | ContentKind::TimeAndSales => None,
+                ContentKind::Starter | ContentKind::TimeAndSales | ContentKind::OrderEntry => None,
             };
 
         let tick_multiplier = match content_kind {
@@ -309,6 +318,7 @@ impl PaneSetup {
             ContentKind::CandlestickChart
             | ContentKind::ComparisonChart
             | ContentKind::TimeAndSales
+            | ContentKind::OrderEntry
             | ContentKind::Starter => current_tick_multiplier,
         };
 

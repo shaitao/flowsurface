@@ -156,6 +156,11 @@ impl From<&pane::State> for data::Pane {
                 settings: pane.settings.clone(),
                 link_group: pane.link_group,
             },
+            pane::Content::OrderEntry(_) => data::Pane::OrderEntry {
+                stream_type: streams,
+                settings: pane.settings.clone(),
+                link_group: pane.link_group,
+            },
             pane::Content::Comparison(chart) => {
                 let settings = data::layout::pane::Settings {
                     visual_config: chart.as_ref().map(|c| {
@@ -269,6 +274,20 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
             link_group,
         } => {
             let content = pane::Content::Ladder(None);
+
+            Configuration::Pane(pane::State::from_config(
+                content,
+                stream_type,
+                settings,
+                link_group,
+            ))
+        }
+        data::Pane::OrderEntry {
+            stream_type,
+            settings,
+            link_group,
+        } => {
+            let content = pane::Content::OrderEntry(None);
 
             Configuration::Pane(pane::State::from_config(
                 content,

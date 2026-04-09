@@ -3,6 +3,7 @@ pub mod aggregation;
 pub mod connect;
 pub mod depth;
 mod limiter;
+pub mod order;
 pub mod proxy;
 mod serde_util;
 pub mod unit;

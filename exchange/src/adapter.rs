@@ -1,7 +1,12 @@
 use super::{Ticker, Timeframe};
 use crate::{
     Kline, OpenInterest, Price, PushFrequency, TickMultiplier, TickerInfo, TickerStats, Trade,
-    depth::Depth, unit::Qty,
+    depth::Depth,
+    order::{
+        OrderCancelRequest, OrderCancelResponse, OrderPanelSnapshot, OrderSubmitRequest,
+        OrderSubmitResponse,
+    },
+    unit::Qty,
 };
 
 use enum_map::{Enum, EnumMap};
@@ -773,5 +778,40 @@ pub async fn fetch_open_interest(
         _ => Err(AdapterError::InvalidRequest(format!(
             "Open interest data not available for {exchange}"
         ))),
+    }
+}
+
+pub async fn fetch_order_panel_snapshot(
+    ticker_info: TickerInfo,
+) -> Result<OrderPanelSnapshot, AdapterError> {
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "Order entry bridge APIs are only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::fetch_order_panel_snapshot(ticker_info).await,
+    }
+}
+
+pub async fn submit_order(
+    ticker_info: TickerInfo,
+    request: OrderSubmitRequest,
+) -> Result<OrderSubmitResponse, AdapterError> {
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "Order submission is only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::submit_order(ticker_info, request).await,
+    }
+}
+
+pub async fn cancel_order(
+    ticker_info: TickerInfo,
+    request: OrderCancelRequest,
+) -> Result<OrderCancelResponse, AdapterError> {
+    match ticker_info.ticker.exchange.venue() {
+        Venue::Binance => Err(AdapterError::InvalidRequest(
+            "Order cancel is only implemented for QMT venues".to_string(),
+        )),
+        Venue::SSZ | Venue::SSH => qmt::cancel_order(ticker_info, request).await,
     }
 }

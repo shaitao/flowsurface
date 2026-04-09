@@ -27,6 +27,7 @@ use exchange::{
     adapter::{StreamConfig, StreamKind, StreamTicksize, UniqueStreams},
     connect::{MAX_KLINE_STREAMS_PER_STREAM, MAX_TRADE_TICKERS_PER_STREAM},
     depth::Depth,
+    order::{OrderCancelResponse, OrderPanelSnapshot, OrderSubmitResponse},
 };
 
 use iced::{
@@ -56,6 +57,21 @@ pub enum Message {
         pane_id: uuid::Uuid,
         stream: StreamKind,
         data: FetchedData,
+    },
+    OrderEntrySnapshotLoaded {
+        pane_id: uuid::Uuid,
+        ticker_info: TickerInfo,
+        result: Result<OrderPanelSnapshot, String>,
+    },
+    OrderEntrySubmitFinished {
+        pane_id: uuid::Uuid,
+        ticker_info: TickerInfo,
+        result: Result<OrderSubmitResponse, String>,
+    },
+    OrderEntryCancelFinished {
+        pane_id: uuid::Uuid,
+        ticker_info: TickerInfo,
+        result: Result<OrderCancelResponse, String>,
     },
     ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
 }
@@ -153,6 +169,16 @@ impl Dashboard {
         streams: &[StreamKind],
         content_kind: ContentKind,
     ) -> Option<Task<Message>> {
+        if matches!(content_kind, ContentKind::OrderEntry)
+            && let pane::Content::OrderEntry(Some(panel)) = &mut state.content
+        {
+            panel.begin_snapshot_refresh();
+            return Some(Self::order_entry_snapshot_task(
+                pane_id,
+                panel.ticker_info(),
+            ));
+        }
+
         if matches!(content_kind, ContentKind::HeatmapChart)
             && let Some(stream) = Self::qmt_heatmap_history_stream(streams)
         {
@@ -207,6 +233,71 @@ impl Dashboard {
             .find(|(_, _, state)| state.unique_id() == pane_id)
             .map(|(_, _, state)| state)
             .is_some_and(|state| state.matches_stream(stream))
+    }
+
+    fn pane_still_matches_ticker(
+        &self,
+        main_window: window::Id,
+        pane_id: uuid::Uuid,
+        ticker_info: TickerInfo,
+    ) -> bool {
+        self.iter_all_panes(main_window)
+            .find(|(_, _, state)| state.unique_id() == pane_id)
+            .map(|(_, _, state)| state)
+            .is_some_and(|state| state.stream_pair() == Some(ticker_info))
+    }
+
+    fn order_entry_snapshot_task(pane_id: uuid::Uuid, ticker_info: TickerInfo) -> Task<Message> {
+        Task::perform(
+            async move {
+                exchange::adapter::fetch_order_panel_snapshot(ticker_info)
+                    .await
+                    .map_err(|error| error.ui_message())
+            },
+            move |result| Message::OrderEntrySnapshotLoaded {
+                pane_id,
+                ticker_info,
+                result,
+            },
+        )
+    }
+
+    fn order_entry_submit_task(
+        pane_id: uuid::Uuid,
+        ticker_info: TickerInfo,
+        request: exchange::order::OrderSubmitRequest,
+    ) -> Task<Message> {
+        Task::perform(
+            async move {
+                exchange::adapter::submit_order(ticker_info, request)
+                    .await
+                    .map_err(|error| error.ui_message())
+            },
+            move |result| Message::OrderEntrySubmitFinished {
+                pane_id,
+                ticker_info,
+                result,
+            },
+        )
+    }
+
+    fn order_entry_cancel_task(
+        pane_id: uuid::Uuid,
+        ticker_info: TickerInfo,
+        request: exchange::order::OrderCancelRequest,
+    ) -> Task<Message> {
+        Task::perform(
+            async move {
+                exchange::adapter::cancel_order(ticker_info, request)
+                    .await
+                    .map_err(|error| error.ui_message())
+            },
+            move |result| Message::OrderEntryCancelFinished {
+                pane_id,
+                ticker_info,
+                result,
+            },
+        )
     }
 
     fn qmt_heatmap_history_stream(streams: &[StreamKind]) -> Option<StreamKind> {
@@ -370,6 +461,83 @@ impl Dashboard {
                     );
                 }
             },
+            Message::OrderEntrySnapshotLoaded {
+                pane_id,
+                ticker_info,
+                result,
+            } => {
+                if !self.pane_still_matches_ticker(main_window.id, pane_id, ticker_info) {
+                    log::debug!(
+                        "Ignoring stale order entry snapshot for pane={} ticker={}",
+                        pane_id,
+                        ticker_info.ticker
+                    );
+                    return (Task::none(), None);
+                }
+
+                if let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id)
+                    && let pane::Content::OrderEntry(Some(panel)) = &mut state.content
+                {
+                    match result {
+                        Ok(snapshot) => panel.apply_snapshot(snapshot),
+                        Err(error) => panel.apply_request_error(error),
+                    }
+                }
+            }
+            Message::OrderEntrySubmitFinished {
+                pane_id,
+                ticker_info,
+                result,
+            } => {
+                if !self.pane_still_matches_ticker(main_window.id, pane_id, ticker_info) {
+                    log::debug!(
+                        "Ignoring stale order submit result for pane={} ticker={}",
+                        pane_id,
+                        ticker_info.ticker
+                    );
+                    return (Task::none(), None);
+                }
+
+                if let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id)
+                    && let pane::Content::OrderEntry(Some(panel)) = &mut state.content
+                {
+                    match result {
+                        Ok(response) => {
+                            panel.apply_submit_result(response);
+                            panel.begin_snapshot_refresh();
+                            return (Self::order_entry_snapshot_task(pane_id, ticker_info), None);
+                        }
+                        Err(error) => panel.apply_request_error(error),
+                    }
+                }
+            }
+            Message::OrderEntryCancelFinished {
+                pane_id,
+                ticker_info,
+                result,
+            } => {
+                if !self.pane_still_matches_ticker(main_window.id, pane_id, ticker_info) {
+                    log::debug!(
+                        "Ignoring stale order cancel result for pane={} ticker={}",
+                        pane_id,
+                        ticker_info.ticker
+                    );
+                    return (Task::none(), None);
+                }
+
+                if let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id)
+                    && let pane::Content::OrderEntry(Some(panel)) = &mut state.content
+                {
+                    match result {
+                        Ok(response) => {
+                            panel.apply_cancel_result(response);
+                            panel.begin_snapshot_refresh();
+                            return (Self::order_entry_snapshot_task(pane_id, ticker_info), None);
+                        }
+                        Err(error) => panel.apply_request_error(error),
+                    }
+                }
+            }
             Message::Pane(window, message) => match message {
                 pane::Message::PaneClicked(pane) => {
                     self.focus = Some((window, pane));
@@ -584,6 +752,25 @@ impl Dashboard {
                                 )
                                 .map(Message::from)
                                 .chain(self.refresh_streams(main_window.id))
+                            }
+                            pane::Effect::OrderEntry(action) => {
+                                let pane_id = state.unique_id();
+                                let ticker_info = match state.stream_pair() {
+                                    Some(ticker_info) => ticker_info,
+                                    None => return (Task::none(), None),
+                                };
+
+                                match action {
+                                    crate::screen::dashboard::panel::order_entry::Action::RefreshSnapshot => {
+                                        Self::order_entry_snapshot_task(pane_id, ticker_info)
+                                    }
+                                    crate::screen::dashboard::panel::order_entry::Action::Submit(request) => {
+                                        Self::order_entry_submit_task(pane_id, ticker_info, request)
+                                    }
+                                    crate::screen::dashboard::panel::order_entry::Action::Cancel(request) => {
+                                        Self::order_entry_cancel_task(pane_id, ticker_info, request)
+                                    }
+                                }
                             }
                             pane::Effect::SwitchTickersInGroup(ticker_info) => {
                                 self.switch_tickers_in_group(main_window.id, ticker_info)
@@ -1265,6 +1452,11 @@ impl Dashboard {
                                 panel.insert_depth(depth, depth_update_t);
                             }
                         }
+                        pane::Content::OrderEntry(panel) => {
+                            if let Some(panel) = panel {
+                                panel.insert_depth(depth);
+                            }
+                        }
                         _ => {
                             log::error!("No chart found for the stream: {stream:?}");
                         }
@@ -1311,6 +1503,11 @@ impl Dashboard {
                         pane::Content::Ladder(panel) => {
                             if let Some(p) = panel {
                                 p.insert_trades(buffer);
+                            }
+                        }
+                        pane::Content::OrderEntry(panel) => {
+                            if let Some(panel) = panel {
+                                panel.insert_trades(buffer);
                             }
                         }
                         _ => {
