@@ -5,7 +5,8 @@ use crate::{
 
 use data::chart::Basis;
 use exchange::{
-    StreamPairKind, TickMultiplier, Timeframe,
+    QMT_SYNTHETIC_BOOK_LEVELS_DEFAULT, QMT_SYNTHETIC_BOOK_LEVELS_MAX,
+    QMT_SYNTHETIC_BOOK_LEVELS_MIN, StreamPairKind, TickMultiplier, Timeframe,
     adapter::Exchange,
     unit::{MinTicksize, PriceStep},
 };
@@ -110,6 +111,15 @@ impl NumericInput {
             .and_then(|s| s.parse::<u16>().ok())
             .and_then(Timeframe::from_minutes)
     }
+
+    pub fn parse_u16(self) -> Option<u16> {
+        if self.len == 0 {
+            return None;
+        }
+        std::str::from_utf8(&self.buffer[..self.len as usize])
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+    }
 }
 
 impl Default for NumericInput {
@@ -124,6 +134,11 @@ pub enum ViewMode {
     TicksizeSelection {
         raw_input_buf: NumericInput,
         parsed_input: Option<TickMultiplier>,
+        is_input_valid: bool,
+    },
+    SyntheticBookLevelsSelection {
+        raw_input_buf: NumericInput,
+        parsed_input: Option<u16>,
         is_input_valid: bool,
     },
 }
@@ -145,6 +160,7 @@ pub enum SelectedTab {
 pub enum Action {
     BasisSelected(Basis),
     TicksizeSelected(TickMultiplier),
+    SyntheticBookLevelsSelected(u16),
     TabSelected(SelectedTab),
 }
 
@@ -154,6 +170,8 @@ pub enum Message {
     TabSelected(SelectedTab),
     TicksizeInputChanged(String),
     TicksizeSelected(TickMultiplier),
+    SyntheticBookLevelsInputChanged(String),
+    SyntheticBookLevelsSelected(u16),
     TickCountInputChanged(String),
     TimeframeInputChanged(String),
 }
@@ -210,6 +228,15 @@ impl Modifier {
         self.price_step = Some(price_step);
         self.min_ticksize = min_ticksize;
         self.exchange = exchange;
+        self
+    }
+
+    pub fn with_synthetic_book_levels_view(mut self, levels: u16) -> Self {
+        self.view_mode = ViewMode::SyntheticBookLevelsSelection {
+            raw_input_buf: NumericInput::from_str(&levels.to_string()),
+            parsed_input: Some(levels),
+            is_input_valid: true,
+        };
         self
     }
 
@@ -335,6 +362,43 @@ impl Modifier {
                                 *is_input_valid = false;
                             }
                         }
+                    }
+                }
+                None
+            }
+            Message::SyntheticBookLevelsSelected(levels) => {
+                if let ViewMode::SyntheticBookLevelsSelection {
+                    ref mut raw_input_buf,
+                    ref mut parsed_input,
+                    ref mut is_input_valid,
+                } = self.view_mode
+                {
+                    *raw_input_buf = NumericInput::from_str(&levels.to_string());
+                    *parsed_input = Some(levels);
+                    *is_input_valid = true;
+                }
+                Some(Action::SyntheticBookLevelsSelected(levels))
+            }
+            Message::SyntheticBookLevelsInputChanged(value_str) => {
+                if let ViewMode::SyntheticBookLevelsSelection {
+                    ref mut raw_input_buf,
+                    ref mut parsed_input,
+                    ref mut is_input_valid,
+                } = self.view_mode
+                {
+                    let numeric_value_str: String =
+                        value_str.chars().filter(char::is_ascii_digit).collect();
+
+                    *raw_input_buf = NumericInput::from_str(&numeric_value_str);
+                    *parsed_input = raw_input_buf.parse_u16();
+
+                    if raw_input_buf.is_empty() {
+                        *is_input_valid = true;
+                    } else {
+                        *is_input_valid = parsed_input.is_some_and(|levels| {
+                            (QMT_SYNTHETIC_BOOK_LEVELS_MIN..=QMT_SYNTHETIC_BOOK_LEVELS_MAX)
+                                .contains(&levels)
+                        });
                     }
                 }
                 None
@@ -735,6 +799,53 @@ impl Modifier {
                         .style(style::chart_modal)
                         .into()
                 }
+            }
+            ViewMode::SyntheticBookLevelsSelection {
+                raw_input_buf,
+                parsed_input,
+                is_input_valid,
+            } => {
+                let presets = [50_u16, 100, QMT_SYNTHETIC_BOOK_LEVELS_DEFAULT, 500, 1000];
+                let levels_grid = modifiers_grid(
+                    &presets,
+                    parsed_input,
+                    Message::SyntheticBookLevelsSelected,
+                    &create_button,
+                    3,
+                );
+                let levels_to_submit = parsed_input.filter(|levels| {
+                    (QMT_SYNTHETIC_BOOK_LEVELS_MIN..=QMT_SYNTHETIC_BOOK_LEVELS_MAX).contains(levels)
+                });
+
+                let levels_column = column![]
+                    .padding(4)
+                    .spacing(8)
+                    .align_x(Horizontal::Center)
+                    .push(text("Synthetic depth levels").size(13))
+                    .push(rule::horizontal(1).style(style::split_ruler))
+                    .push(numeric_input_box::<_, Message>(
+                        "Levels: ",
+                        &format!(
+                            "{}-{}",
+                            QMT_SYNTHETIC_BOOK_LEVELS_MIN, QMT_SYNTHETIC_BOOK_LEVELS_MAX
+                        ),
+                        &raw_input_buf.to_display_string(),
+                        is_input_valid,
+                        Message::SyntheticBookLevelsInputChanged,
+                        levels_to_submit.map(Message::SyntheticBookLevelsSelected),
+                    ))
+                    .push(levels_grid);
+
+                container(scrollable::Scrollable::with_direction(
+                    levels_column,
+                    scrollable::Direction::Vertical(
+                        scrollable::Scrollbar::new().width(4).scroller_width(4),
+                    ),
+                ))
+                .max_width(240)
+                .padding(16)
+                .style(style::chart_modal)
+                .into()
             }
         }
     }

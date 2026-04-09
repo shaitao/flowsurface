@@ -20,6 +20,10 @@ use unit::{ContractSize, MinQtySize, MinTicksize, Qty};
 use serde::{Deserialize, Serialize};
 use std::{fmt, hash::Hash};
 
+pub const QMT_SYNTHETIC_BOOK_LEVELS_DEFAULT: u16 = 30;
+pub const QMT_SYNTHETIC_BOOK_LEVELS_MIN: u16 = 1;
+pub const QMT_SYNTHETIC_BOOK_LEVELS_MAX: u16 = 5000;
+
 /// Desired frequency for orderbook depth updates.
 ///
 /// Maps user-selected update intervals to exchange-specific depth levels.

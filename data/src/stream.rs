@@ -23,6 +23,8 @@ pub struct PersistDepth {
     pub depth_aggr: exchange::adapter::StreamTicksize,
     #[serde(default = "default_push_freq")]
     pub push_freq: PushFrequency,
+    #[serde(default)]
+    pub synthetic_book_levels: Option<u16>,
 }
 
 impl From<StreamKind> for PersistStreamKind {
@@ -39,10 +41,12 @@ impl From<StreamKind> for PersistStreamKind {
                 ticker_info,
                 depth_aggr,
                 push_freq,
+                synthetic_book_levels,
             } => PersistStreamKind::Depth(PersistDepth {
                 ticker: ticker_info.ticker,
                 depth_aggr,
                 push_freq,
+                synthetic_book_levels,
             }),
             StreamKind::Trades { ticker_info } => PersistStreamKind::Trades {
                 ticker: ticker_info.ticker,
@@ -73,6 +77,7 @@ impl PersistStreamKind {
                         ticker_info: ti,
                         depth_aggr: d.depth_aggr,
                         push_freq: d.push_freq,
+                        synthetic_book_levels: d.synthetic_book_levels,
                     }]
                 })
                 .ok_or_else(|| format!("TickerInfo not found for {}", d.ticker)),
@@ -86,6 +91,7 @@ impl PersistStreamKind {
                             ticker_info: ti,
                             depth_aggr: d.depth_aggr,
                             push_freq: d.push_freq,
+                            synthetic_book_levels: d.synthetic_book_levels,
                         },
                         StreamKind::Trades { ticker_info: ti },
                     ]

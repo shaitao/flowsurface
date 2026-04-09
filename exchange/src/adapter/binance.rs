@@ -356,6 +356,7 @@ async fn try_resync(
 pub fn connect_depth_stream(
     ticker_info: TickerInfo,
     push_freq: PushFrequency,
+    _synthetic_book_levels: Option<u16>,
 ) -> impl Stream<Item = Event> {
     channel(100, move |mut output| async move {
         let mut state = State::Disconnected;
@@ -487,6 +488,7 @@ pub fn connect_depth_stream(
                                                             ticker_info,
                                                             depth_aggr: StreamTicksize::Client,
                                                             push_freq,
+                                                            synthetic_book_levels: None,
                                                         },
                                                         de_depth.time,
                                                         orderbook.depth.clone(),
@@ -545,6 +547,7 @@ pub fn connect_depth_stream(
                                                             ticker_info,
                                                             depth_aggr: StreamTicksize::Client,
                                                             push_freq,
+                                                            synthetic_book_levels: None,
                                                         },
                                                         de_depth.time,
                                                         orderbook.depth.clone(),

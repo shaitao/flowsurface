@@ -35,10 +35,15 @@ pub const MAX_KLINE_STREAMS_PER_STREAM: usize = 100;
 pub fn depth_stream(config: &StreamConfig<TickerInfo>) -> BoxStream<'static, Event> {
     let ticker = config.id;
     let push_freq = config.push_freq;
+    let synthetic_book_levels = config.synthetic_book_levels;
 
     match config.exchange.venue() {
-        Venue::Binance => adapter::binance::connect_depth_stream(ticker, push_freq).boxed(),
-        Venue::SSH | Venue::SSZ => adapter::qmt::connect_depth_stream(ticker, push_freq).boxed(),
+        Venue::Binance => {
+            adapter::binance::connect_depth_stream(ticker, push_freq, synthetic_book_levels).boxed()
+        }
+        Venue::SSH | Venue::SSZ => {
+            adapter::qmt::connect_depth_stream(ticker, push_freq, synthetic_book_levels).boxed()
+        }
     }
 }
 

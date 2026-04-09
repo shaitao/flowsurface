@@ -194,6 +194,11 @@ impl State {
                 ticker_info: derived_plan.ticker_info,
                 depth_aggr: derived_plan.depth_aggr,
                 push_freq: derived_plan.push_freq,
+                synthetic_book_levels: qmt_synthetic_book_levels(
+                    &self.settings,
+                    kind,
+                    derived_plan.ticker_info,
+                ),
             };
             let trades_stream = |derived_plan: &PaneSetup| StreamKind::Trades {
                 ticker_info: derived_plan.ticker_info,
@@ -790,6 +795,27 @@ impl State {
                         exchange,
                     );
 
+                    let modifiers = if let Some(levels) = stream_pair
+                        .and_then(|ticker_info| {
+                            qmt_synthetic_book_levels(
+                                &self.settings,
+                                ContentKind::Ladder,
+                                ticker_info,
+                            )
+                        })
+                        .map(|levels| {
+                            synthetic_book_levels_modifier(
+                                id,
+                                levels,
+                                modifier,
+                                ModifierKind::Orderbook(basis, tick_multiply),
+                            )
+                        }) {
+                        row![modifiers, levels].spacing(4).into()
+                    } else {
+                        modifiers
+                    };
+
                     top_left_buttons = top_left_buttons.push(modifiers);
 
                     let base = panel::view(panel, timezone).map(move |message| {
@@ -871,7 +897,7 @@ impl State {
                         .unwrap_or_else(|| tick_multiply.unscale_step(chart.tick_size()));
                     let min_ticksize = ticker_info.map(|ti| ti.min_ticksize);
 
-                    let modifiers = row![
+                    let mut modifiers = row![
                         basis_modifier(id, basis, modifier, kind),
                         ticksize_modifier(
                             id,
@@ -884,6 +910,17 @@ impl State {
                         ),
                     ]
                     .spacing(4);
+
+                    if let Some(levels) = ticker_info.and_then(|ticker_info| {
+                        qmt_synthetic_book_levels(
+                            &self.settings,
+                            ContentKind::HeatmapChart,
+                            ticker_info,
+                        )
+                    }) {
+                        modifiers = modifiers
+                            .push(synthetic_book_levels_modifier(id, levels, modifier, kind));
+                    }
 
                     top_left_buttons = top_left_buttons.push(modifiers);
 
@@ -1253,6 +1290,27 @@ impl State {
                                     effect = Some(Effect::RefreshStreams);
                                 }
                             }
+                            modal::stream::Action::SyntheticBookLevelsSelected(levels) => {
+                                self.settings.synthetic_book_levels = Some(levels);
+
+                                if let Some(mut it) = self.streams.ready_iter_mut() {
+                                    for stream in &mut it {
+                                        if let StreamKind::Depth {
+                                            synthetic_book_levels,
+                                            ..
+                                        } = stream
+                                        {
+                                            *synthetic_book_levels = Some(levels);
+                                        }
+                                    }
+                                }
+
+                                effect = Some(match self.content.kind() {
+                                    ContentKind::HeatmapChart => Effect::ReloadHeatmapHistory,
+                                    ContentKind::Ladder => Effect::RefreshStreams,
+                                    _ => Effect::RefreshStreams,
+                                });
+                            }
                             modal::stream::Action::BasisSelected(new_basis) => {
                                 modifier.update_kind_with_basis(new_basis);
                                 self.settings.selected_basis = Some(new_basis);
@@ -1317,6 +1375,7 @@ impl State {
                                                             ticker_info: base_ticker,
                                                             depth_aggr,
                                                             push_freq: exchange::PushFrequency::ServerDefault,
+                                                            synthetic_book_levels: None,
                                                         });
                                                         streams.push(StreamKind::Trades {
                                                             ticker_info: base_ticker,
@@ -1352,6 +1411,7 @@ impl State {
                                                             ticker_info: base_ticker,
                                                             depth_aggr,
                                                             push_freq: exchange::PushFrequency::ServerDefault,
+                                                            synthetic_book_levels: None,
                                                         },
                                                         StreamKind::Trades {
                                                             ticker_info: base_ticker,
@@ -2270,6 +2330,30 @@ fn ticksize_modifier<'a>(
         .into()
 }
 
+fn synthetic_book_levels_modifier<'a>(
+    id: pane_grid::Pane,
+    levels: u16,
+    modifier: Option<modal::stream::Modifier>,
+    kind: ModifierKind,
+) -> Element<'a, Message> {
+    let modifier_modal = Modal::StreamModifier(
+        modal::stream::Modifier::new(kind).with_synthetic_book_levels_view(levels),
+    );
+
+    let is_active = modifier.is_some_and(|m| {
+        matches!(
+            m.view_mode,
+            modal::stream::ViewMode::SyntheticBookLevelsSelection { .. }
+        )
+    });
+
+    button(text(format!("{levels}L")).align_y(Alignment::Center))
+        .style(move |theme, status| style::button::modifier(theme, status, !is_active))
+        .on_press(Message::PaneEvent(id, Event::ShowModal(modifier_modal)))
+        .height(widget::PANE_CONTROL_BTN_HEIGHT)
+        .into()
+}
+
 fn basis_modifier<'a>(
     id: pane_grid::Pane,
     selected_basis: Basis,
@@ -2288,6 +2372,36 @@ fn basis_modifier<'a>(
         .on_press(Message::PaneEvent(id, Event::ShowModal(modifier_modal)))
         .height(widget::PANE_CONTROL_BTN_HEIGHT)
         .into()
+}
+
+fn qmt_synthetic_book_levels(
+    settings: &Settings,
+    content_kind: ContentKind,
+    ticker_info: TickerInfo,
+) -> Option<u16> {
+    if !matches!(
+        content_kind,
+        ContentKind::HeatmapChart | ContentKind::Ladder
+    ) {
+        return None;
+    }
+
+    if !matches!(
+        ticker_info.exchange(),
+        exchange::adapter::Exchange::SSH | exchange::adapter::Exchange::SSZ
+    ) {
+        return None;
+    }
+
+    Some(
+        settings
+            .synthetic_book_levels
+            .unwrap_or(exchange::QMT_SYNTHETIC_BOOK_LEVELS_DEFAULT)
+            .clamp(
+                exchange::QMT_SYNTHETIC_BOOK_LEVELS_MIN,
+                exchange::QMT_SYNTHETIC_BOOK_LEVELS_MAX,
+            ),
+    )
 }
 
 fn by_basis_default<T>(

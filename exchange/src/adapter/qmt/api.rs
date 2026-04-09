@@ -228,6 +228,7 @@ pub async fn fetch_trades(
 
 pub async fn fetch_heatmap_history(
     ticker_info: TickerInfo,
+    synthetic_book_levels: Option<u16>,
 ) -> Result<(Vec<Trade>, Vec<(u64, crate::depth::Depth)>), AdapterError> {
     let Some(day) = current_china_day() else {
         return Ok((Vec::new(), Vec::new()));
@@ -249,7 +250,7 @@ pub async fn fetch_heatmap_history(
 
     let derive_started_at = Instant::now();
     let trades = synthesize_trades_from_ticks(&replay_ticks, ticker_info);
-    let depths = build_depth_history_from_ticks(&replay_ticks, ticker_info);
+    let depths = build_depth_history_from_ticks(&replay_ticks, ticker_info, synthetic_book_levels);
     let derive_elapsed = derive_started_at.elapsed();
 
     log::info!(
@@ -382,7 +383,7 @@ async fn fetch_current_day_ticks(
     };
     clear_tick_fetch_failure(ticker_info.ticker, day);
     Ok(merge_current_day_history_and_live(
-        ticker_info.ticker,
+        ticker_info,
         day,
         history_ticks,
     ))

@@ -3,7 +3,7 @@ use crate::{
     Volume,
     adapter::{AdapterError, Event, StreamKind, StreamTicksize, Venue, flush_trade_buffers},
     connect::{channel, connect_ws},
-    depth::{DeOrder, DepthPayload, DepthUpdate, LocalDepthCache},
+    depth::{DeOrder, Depth, DepthPayload, DepthUpdate, LocalDepthCache},
     order::{
         OrderCancelRequest, OrderCancelResponse, OrderPanelSnapshot, OrderSubmitRequest,
         OrderSubmitResponse,
@@ -251,6 +251,7 @@ struct CurrentDayTickCacheEntry {
     ticks: Vec<QmtTick>,
     history_loaded: bool,
     last_history_loaded_at: Option<Instant>,
+    history_depth_seed: Option<Depth>,
 }
 
 #[derive(Debug, Clone)]

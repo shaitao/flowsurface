@@ -41,6 +41,69 @@ fn sample_tick(time: u64) -> QmtTick {
     }
 }
 
+fn sample_depth_seed() -> Depth {
+    let bids = [
+        (99.96, 960.0),
+        (99.97, 970.0),
+        (99.98, 980.0),
+        (99.99, 990.0),
+        (100.00, 1000.0),
+    ]
+    .into_iter()
+    .map(|(price, qty)| (Price::from_f32(price), Qty::from_f32(qty)))
+    .collect();
+
+    let asks = [
+        (100.01, 1001.0),
+        (100.02, 1002.0),
+        (100.03, 1003.0),
+        (100.04, 1004.0),
+        (100.05, 1005.0),
+    ]
+    .into_iter()
+    .map(|(price, qty)| (Price::from_f32(price), Qty::from_f32(qty)))
+    .collect();
+
+    Depth { bids, asks }
+}
+
+fn sample_live_depth_payload(time: u64) -> DepthPayload {
+    DepthPayload {
+        last_update_id: time,
+        time,
+        bids: vec![
+            DeOrder {
+                price: 100.00,
+                qty: 2_000.0,
+            },
+            DeOrder {
+                price: 99.99,
+                qty: 1_999.0,
+            },
+        ],
+        asks: vec![
+            DeOrder {
+                price: 100.01,
+                qty: 2_001.0,
+            },
+            DeOrder {
+                price: 100.02,
+                qty: 2_002.0,
+            },
+        ],
+    }
+}
+
+fn sample_book_tick(time: u64, bid_levels: &[(f32, f32)], ask_levels: &[(f32, f32)]) -> QmtTick {
+    let mut tick = sample_tick(time);
+    tick.volume = 100;
+    tick.bid_price = bid_levels.iter().map(|(price, _)| *price).collect();
+    tick.bid_vol = bid_levels.iter().map(|(_, qty)| *qty).collect();
+    tick.ask_price = ask_levels.iter().map(|(price, _)| *price).collect();
+    tick.ask_vol = ask_levels.iter().map(|(_, qty)| *qty).collect();
+    tick
+}
+
 #[test]
 fn synthesize_trade_uses_last_price_with_volume_qty() {
     let ticker_info = sample_ticker_info();
@@ -678,6 +741,7 @@ fn synthetic_trade_state_uses_zero_volume_opening_baseline() {
 
 #[test]
 fn current_day_history_ready_only_after_merge() {
+    let ticker_info = sample_ticker_info();
     let ticker = Ticker::new("600309.SH", super::super::Exchange::SSH);
     let day = current_china_day().expect("current china day");
     let timestamp = china_offset()
@@ -697,12 +761,13 @@ fn current_day_history_ready_only_after_merge() {
     cache_live_tick(ticker, &live_tick);
     assert!(!current_day_history_ready(ticker, day));
 
-    let _ = merge_current_day_history_and_live(ticker, day, vec![live_tick]);
+    let _ = merge_current_day_history_and_live(ticker_info, day, vec![live_tick]);
     assert!(current_day_history_ready(ticker, day));
 }
 
 #[test]
 fn current_day_history_snapshot_is_fresh_right_after_merge() {
+    let ticker_info = sample_ticker_info();
     let ticker = Ticker::new("600309.SH", super::super::Exchange::SSH);
     let day = current_china_day().expect("current china day");
     let timestamp = china_offset()
@@ -720,7 +785,7 @@ fn current_day_history_snapshot_is_fresh_right_after_merge() {
     tick.volume = 100;
     tick.last_price = 82.01;
 
-    let merged = merge_current_day_history_and_live(ticker, day, vec![tick.clone()]);
+    let merged = merge_current_day_history_and_live(ticker_info, day, vec![tick.clone()]);
     let fresh = current_day_history_snapshot_if_fresh(ticker, day, Duration::from_secs(1))
         .expect("fresh current-day history snapshot");
 
@@ -731,6 +796,7 @@ fn current_day_history_snapshot_is_fresh_right_after_merge() {
 
 #[test]
 fn current_day_history_snapshot_expires_after_ttl() {
+    let ticker_info = sample_ticker_info();
     let ticker = Ticker::new("600309.SH", super::super::Exchange::SSH);
     let day = current_china_day().expect("current china day");
     let timestamp = china_offset()
@@ -747,7 +813,7 @@ fn current_day_history_snapshot_expires_after_ttl() {
     let mut tick = sample_tick(timestamp);
     tick.volume = 100;
     tick.last_price = 82.01;
-    let _ = merge_current_day_history_and_live(ticker, day, vec![tick]);
+    let _ = merge_current_day_history_and_live(ticker_info, day, vec![tick]);
 
     if let Ok(mut cache) = CURRENT_DAY_TICK_CACHE.write()
         && let Some(entry) = cache.get_mut(&ticker)
@@ -756,6 +822,166 @@ fn current_day_history_snapshot_expires_after_ttl() {
     }
 
     assert!(current_day_history_snapshot_if_fresh(ticker, day, Duration::from_secs(1)).is_none());
+}
+
+#[test]
+fn current_day_history_merge_stores_depth_seed_from_pure_history() {
+    let ticker_info = sample_ticker_info();
+    let ticker = ticker_info.ticker;
+    let day = current_china_day().expect("current china day");
+    let ts = china_ms(day.year(), day.month(), day.day(), 10, 0, 0);
+
+    if let Ok(mut cache) = CURRENT_DAY_TICK_CACHE.write() {
+        cache.clear();
+    }
+
+    let mut history_tick = sample_tick(ts);
+    history_tick.volume = 100;
+    history_tick.bid_price = vec![100.00, 99.99, 99.98, 99.97, 99.96];
+    history_tick.ask_price = vec![100.01, 100.02, 100.03, 100.04, 100.05];
+    history_tick.bid_vol = vec![1000.0, 990.0, 980.0, 970.0, 960.0];
+    history_tick.ask_vol = vec![1001.0, 1002.0, 1003.0, 1004.0, 1005.0];
+
+    let _ = merge_current_day_history_and_live(ticker_info, day, vec![history_tick]);
+    let depth_seed = current_day_history_depth_seed(ticker, day).expect("depth seed");
+
+    assert_eq!(depth_seed.bids.len(), 5);
+    assert_eq!(depth_seed.asks.len(), 5);
+    let (best_bid, best_bid_qty) = depth_seed.bids.last_key_value().expect("best bid");
+    let (worst_ask, worst_ask_qty) = depth_seed.asks.last_key_value().expect("worst ask");
+    assert!((best_bid.to_f32() - 100.00).abs() < 0.001);
+    assert_eq!(*best_bid_qty, Qty::from_f32(1000.0));
+    assert!((worst_ask.to_f32() - 100.05).abs() < 0.001);
+    assert_eq!(*worst_ask_qty, Qty::from_f32(1005.0));
+}
+
+#[test]
+fn synthesize_qmt_depth_payload_preserves_deeper_history_levels() {
+    let payload = super::streams::synthesize_qmt_depth_payload(
+        sample_live_depth_payload(1_000),
+        &sample_depth_seed(),
+        300,
+    );
+
+    assert_eq!(payload.bids.len(), 5);
+    assert_eq!(payload.asks.len(), 5);
+    assert_eq!(payload.bids[0].price, 100.00);
+    assert_eq!(payload.bids[0].qty, 2_000.0);
+    assert_eq!(payload.bids[1].price, 99.99);
+    assert_eq!(payload.bids[1].qty, 1_999.0);
+    assert!((payload.bids[2].price - 99.98).abs() < 0.001);
+    assert!((payload.asks[0].price - 100.01).abs() < 0.001);
+    assert_eq!(payload.asks[0].qty, 2_001.0);
+    assert!((payload.asks[1].price - 100.02).abs() < 0.001);
+    assert_eq!(payload.asks[1].qty, 2_002.0);
+    assert!((payload.asks[2].price - 100.03).abs() < 0.001);
+}
+
+#[test]
+fn synthesize_qmt_depth_payload_caps_sides_to_300_levels() {
+    let deep_bids = (0..360)
+        .map(|offset| {
+            let price = 100.00 - (offset as f32 * 0.01);
+            (
+                Price::from_f32(price),
+                Qty::from_f32(1_000.0 - offset as f32),
+            )
+        })
+        .collect();
+    let deep_asks = (0..360)
+        .map(|offset| {
+            let price = 100.01 + (offset as f32 * 0.01);
+            (
+                Price::from_f32(price),
+                Qty::from_f32(1_000.0 - offset as f32),
+            )
+        })
+        .collect();
+    let baseline = Depth {
+        bids: deep_bids,
+        asks: deep_asks,
+    };
+
+    let payload = super::streams::synthesize_qmt_depth_payload(
+        sample_live_depth_payload(1_000),
+        &baseline,
+        300,
+    );
+
+    assert_eq!(payload.bids.len(), 300);
+    assert_eq!(payload.asks.len(), 300);
+}
+
+#[test]
+fn synthesize_qmt_depth_payload_respects_custom_level_limit() {
+    let baseline = Depth {
+        bids: (0..20)
+            .map(|offset| {
+                (
+                    Price::from_f32(100.0 - (offset as f32 * 0.01)),
+                    Qty::from_f32(1_000.0 - offset as f32),
+                )
+            })
+            .collect(),
+        asks: (0..20)
+            .map(|offset| {
+                (
+                    Price::from_f32(100.01 + (offset as f32 * 0.01)),
+                    Qty::from_f32(1_000.0 - offset as f32),
+                )
+            })
+            .collect(),
+    };
+
+    let payload = super::streams::synthesize_qmt_depth_payload(
+        sample_live_depth_payload(1_000),
+        &baseline,
+        7,
+    );
+
+    assert_eq!(payload.bids.len(), 7);
+    assert_eq!(payload.asks.len(), 7);
+}
+
+#[test]
+fn build_depth_history_from_ticks_preserves_deeper_history_levels() {
+    let ticker_info = sample_ticker_info();
+    let ticks = vec![
+        sample_book_tick(
+            1_000,
+            &[(100.00, 1000.0), (99.99, 999.0), (99.98, 998.0)],
+            &[(100.01, 1001.0), (100.02, 1002.0), (100.03, 1003.0)],
+        ),
+        sample_book_tick(
+            4_000,
+            &[(100.00, 2000.0), (99.99, 1999.0)],
+            &[(100.01, 2001.0), (100.02, 2002.0)],
+        ),
+    ];
+
+    let depths = build_depth_history_from_ticks(&ticks, ticker_info, Some(300));
+    let latest = depths.last().expect("latest depth snapshot").1.clone();
+    let bid_levels = latest
+        .bids
+        .iter()
+        .map(|(price, qty)| (price.to_f32(), qty.to_f32_lossy()))
+        .collect::<Vec<_>>();
+    let ask_levels = latest
+        .asks
+        .iter()
+        .map(|(price, qty)| (price.to_f32(), qty.to_f32_lossy()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(latest.bids.len(), 3);
+    assert_eq!(latest.asks.len(), 3);
+    assert!((bid_levels[2].0 - 100.00).abs() < 0.001);
+    assert!((bid_levels[2].1 - 2000.0).abs() < 0.001);
+    assert!((bid_levels[0].0 - 99.98).abs() < 0.001);
+    assert!((bid_levels[0].1 - 998.0).abs() < 0.001);
+    assert!((ask_levels[0].0 - 100.01).abs() < 0.001);
+    assert!((ask_levels[0].1 - 2001.0).abs() < 0.001);
+    assert!((ask_levels[2].0 - 100.03).abs() < 0.001);
+    assert!((ask_levels[2].1 - 1003.0).abs() < 0.001);
 }
 
 #[test]

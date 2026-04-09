@@ -1,6 +1,18 @@
 use super::*;
 use futures::SinkExt;
+use std::sync::Arc;
 use tokio::sync::broadcast;
+
+fn qmt_synthetic_book_level_limit(requested: Option<u16>) -> usize {
+    usize::from(
+        requested
+            .unwrap_or(crate::QMT_SYNTHETIC_BOOK_LEVELS_DEFAULT)
+            .clamp(
+                crate::QMT_SYNTHETIC_BOOK_LEVELS_MIN,
+                crate::QMT_SYNTHETIC_BOOK_LEVELS_MAX,
+            ),
+    )
+}
 
 fn tick_to_depth_payload(tick: &QmtTick) -> DepthPayload {
     let bids = tick
@@ -29,17 +41,149 @@ fn tick_to_depth_payload(tick: &QmtTick) -> DepthPayload {
     }
 }
 
+fn limit_depth_levels(depth: &Depth, limit: usize) -> Depth {
+    let bids = depth
+        .bids
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|(price, qty)| (*price, *qty))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect();
+
+    let asks = depth
+        .asks
+        .iter()
+        .take(limit)
+        .map(|(price, qty)| (*price, *qty))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect();
+
+    Depth { bids, asks }
+}
+
+pub(super) fn synthesize_qmt_depth_payload(
+    mut live_payload: DepthPayload,
+    baseline: &Depth,
+    level_limit: usize,
+) -> DepthPayload {
+    if live_payload.bids.is_empty() {
+        live_payload.bids = baseline
+            .bids
+            .iter()
+            .rev()
+            .take(level_limit)
+            .map(|(price, qty)| DeOrder {
+                price: price.to_f32(),
+                qty: qty.to_f32_lossy(),
+            })
+            .collect();
+    } else {
+        let deepest_live_bid = live_payload
+            .bids
+            .iter()
+            .map(|order| order.price)
+            .min_by(|left, right| left.total_cmp(right))
+            .expect("live bid payload should contain a deepest price");
+
+        let remaining = level_limit.saturating_sub(live_payload.bids.len());
+        live_payload.bids.extend(
+            baseline
+                .bids
+                .iter()
+                .rev()
+                .filter(|(price, _)| price.to_f32() < deepest_live_bid)
+                .take(remaining)
+                .map(|(price, qty)| DeOrder {
+                    price: price.to_f32(),
+                    qty: qty.to_f32_lossy(),
+                }),
+        );
+    }
+
+    if live_payload.asks.is_empty() {
+        live_payload.asks = baseline
+            .asks
+            .iter()
+            .take(level_limit)
+            .map(|(price, qty)| DeOrder {
+                price: price.to_f32(),
+                qty: qty.to_f32_lossy(),
+            })
+            .collect();
+    } else {
+        let deepest_live_ask = live_payload
+            .asks
+            .iter()
+            .map(|order| order.price)
+            .max_by(|left, right| left.total_cmp(right))
+            .expect("live ask payload should contain a deepest price");
+
+        let remaining = level_limit.saturating_sub(live_payload.asks.len());
+        live_payload.asks.extend(
+            baseline
+                .asks
+                .iter()
+                .filter(|(price, _)| price.to_f32() > deepest_live_ask)
+                .take(remaining)
+                .map(|(price, qty)| DeOrder {
+                    price: price.to_f32(),
+                    qty: qty.to_f32_lossy(),
+                }),
+        );
+    }
+
+    if let Some(best_ask) = live_payload.asks.first().map(|order| order.price) {
+        live_payload.bids.retain(|order| order.price < best_ask);
+    }
+    if let Some(best_bid) = live_payload.bids.first().map(|order| order.price) {
+        live_payload.asks.retain(|order| order.price > best_bid);
+    }
+
+    live_payload.bids.truncate(level_limit);
+    live_payload.asks.truncate(level_limit);
+    live_payload
+}
+
+fn seed_depth_cache_from_history(
+    depth_cache: &mut LocalDepthCache,
+    ticker_info: TickerInfo,
+    tick_time: u64,
+    level_limit: usize,
+) -> bool {
+    let Some(day) = china_trading_day(tick_time) else {
+        return false;
+    };
+    let Some(seed_depth) = current_day_history_depth_seed(ticker_info.ticker, day) else {
+        return false;
+    };
+
+    depth_cache.depth = Arc::new(limit_depth_levels(&seed_depth, level_limit));
+    depth_cache.last_update_id = tick_time;
+    depth_cache.time = tick_time;
+    true
+}
+
 pub(super) fn build_depth_history_from_ticks(
     ticks: &[QmtTick],
     ticker_info: TickerInfo,
+    synthetic_book_levels: Option<u16>,
 ) -> Vec<(u64, crate::depth::Depth)> {
+    let level_limit = qmt_synthetic_book_level_limit(synthetic_book_levels);
     let mut depth_cache = LocalDepthCache::default();
     let mut snapshots = Vec::new();
 
     for tick in ticks {
-        let payload = tick_to_depth_payload(tick);
+        let mut payload = tick_to_depth_payload(tick);
         if payload.bids.is_empty() && payload.asks.is_empty() {
             continue;
+        }
+
+        if !depth_cache.depth.bids.is_empty() || !depth_cache.depth.asks.is_empty() {
+            payload =
+                synthesize_qmt_depth_payload(payload, depth_cache.depth.as_ref(), level_limit);
         }
 
         depth_cache.update(DepthUpdate::Snapshot(payload), ticker_info.min_ticksize);
@@ -79,29 +223,55 @@ async fn recv_shared_tick_event(
 pub fn connect_depth_stream(
     ticker_info: TickerInfo,
     push_freq: PushFrequency,
+    synthetic_book_levels: Option<u16>,
 ) -> impl Stream<Item = Event> {
     channel(100, move |mut output| async move {
         let exchange = ticker_info.exchange();
+        let level_limit = qmt_synthetic_book_level_limit(synthetic_book_levels);
         let stream_kind = StreamKind::Depth {
             ticker_info,
             depth_aggr: StreamTicksize::Client,
             push_freq,
+            synthetic_book_levels,
         };
         let mut depth_cache = LocalDepthCache::default();
+        let mut history_seeded = false;
         let mut receiver = subscribe_shared_tick_stream(ticker_info).await;
 
         while let Some(event) = recv_shared_tick_event(&mut receiver, ticker_info).await {
             match event {
                 SharedTickStreamEvent::Connected => {
+                    depth_cache = LocalDepthCache::default();
+                    history_seeded = false;
                     let _ = output.send(Event::Connected(exchange)).await;
                 }
                 SharedTickStreamEvent::Disconnected(reason) => {
                     let _ = output.send(Event::Disconnected(exchange, reason)).await;
                 }
                 SharedTickStreamEvent::Tick(tick) => {
-                    let payload = tick_to_depth_payload(&tick);
+                    if !history_seeded {
+                        history_seeded = seed_depth_cache_from_history(
+                            &mut depth_cache,
+                            ticker_info,
+                            tick.time,
+                            level_limit,
+                        );
+                    }
+
+                    let mut payload = tick_to_depth_payload(&tick);
                     if payload.bids.is_empty() && payload.asks.is_empty() {
                         continue;
+                    }
+
+                    if history_seeded
+                        && (!depth_cache.depth.bids.is_empty()
+                            || !depth_cache.depth.asks.is_empty())
+                    {
+                        payload = synthesize_qmt_depth_payload(
+                            payload,
+                            depth_cache.depth.as_ref(),
+                            level_limit,
+                        );
                     }
                     depth_cache.update(DepthUpdate::Snapshot(payload), ticker_info.min_ticksize);
                     let _ = output

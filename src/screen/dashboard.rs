@@ -1649,7 +1649,7 @@ impl Dashboard {
                     let depth_subs = specs
                         .depth
                         .iter()
-                        .map(|(ticker, aggr, push_freq)| {
+                        .map(|(ticker, aggr, push_freq, synthetic_book_levels)| {
                             let tick_mltp = match aggr {
                                 StreamTicksize::Client => None,
                                 StreamTicksize::ServerSide(tick_mltp) => Some(*tick_mltp),
@@ -1660,6 +1660,7 @@ impl Dashboard {
                                 ticker.exchange(),
                                 tick_mltp,
                                 *push_freq,
+                                *synthetic_book_levels,
                             );
 
                             Subscription::run_with(config, exchange::connect::depth_stream)
@@ -1681,6 +1682,7 @@ impl Dashboard {
                                 exchange,
                                 None,
                                 PushFrequency::ServerDefault,
+                                None,
                             );
 
                             Subscription::run_with(config, exchange::connect::trade_stream)
@@ -1702,6 +1704,7 @@ impl Dashboard {
                                 exchange,
                                 None,
                                 PushFrequency::ServerDefault,
+                                None,
                             );
 
                             Subscription::run_with(config, exchange::connect::kline_stream)

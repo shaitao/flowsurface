@@ -598,34 +598,62 @@ pub fn heatmap_history_fetch_task(
     });
 
     let fetch_task = match stream {
-        StreamKind::Depth { ticker_info, .. } | StreamKind::Trades { ticker_info } => {
-            Task::perform(
-                iced::futures::TryFutureExt::map_err(
-                    adapter::fetch_heatmap_history(ticker_info),
-                    |err| {
-                        log::error!("Heatmap history fetch failed: {err}");
-                        err.ui_message()
-                    },
-                ),
-                move |result| match result {
-                    Ok((trades, depths)) => {
-                        let data = FetchedData::HeatmapHistory { trades, depths };
-                        FetchUpdate::Data {
-                            layout_id,
-                            pane_id,
-                            data,
-                            stream,
-                        }
-                    }
-                    Err(err) => FetchUpdate::Error {
-                        pane_id,
-                        req_id: None,
-                        stream: Some(stream),
-                        error: err,
-                    },
+        StreamKind::Depth {
+            ticker_info,
+            synthetic_book_levels,
+            ..
+        } => Task::perform(
+            iced::futures::TryFutureExt::map_err(
+                adapter::fetch_heatmap_history(ticker_info, synthetic_book_levels),
+                |err| {
+                    log::error!("Heatmap history fetch failed: {err}");
+                    err.ui_message()
                 },
-            )
-        }
+            ),
+            move |result| match result {
+                Ok((trades, depths)) => {
+                    let data = FetchedData::HeatmapHistory { trades, depths };
+                    FetchUpdate::Data {
+                        layout_id,
+                        pane_id,
+                        data,
+                        stream,
+                    }
+                }
+                Err(err) => FetchUpdate::Error {
+                    pane_id,
+                    req_id: None,
+                    stream: Some(stream),
+                    error: err,
+                },
+            },
+        ),
+        StreamKind::Trades { ticker_info } => Task::perform(
+            iced::futures::TryFutureExt::map_err(
+                adapter::fetch_heatmap_history(ticker_info, None),
+                |err| {
+                    log::error!("Heatmap history fetch failed: {err}");
+                    err.ui_message()
+                },
+            ),
+            move |result| match result {
+                Ok((trades, depths)) => {
+                    let data = FetchedData::HeatmapHistory { trades, depths };
+                    FetchUpdate::Data {
+                        layout_id,
+                        pane_id,
+                        data,
+                        stream,
+                    }
+                }
+                Err(err) => FetchUpdate::Error {
+                    pane_id,
+                    req_id: None,
+                    stream: Some(stream),
+                    error: err,
+                },
+            },
+        ),
         _ => Task::none(),
     };
 

@@ -93,6 +93,7 @@ impl Default for Pane {
 #[serde(default)]
 pub struct Settings {
     pub tick_multiply: Option<exchange::TickMultiplier>,
+    pub synthetic_book_levels: Option<u16>,
     pub visual_config: Option<VisualConfig>,
     pub selected_basis: Option<Basis>,
 }

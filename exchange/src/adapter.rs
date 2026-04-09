@@ -293,6 +293,8 @@ pub enum StreamKind {
         #[serde(default = "default_depth_aggr")]
         depth_aggr: StreamTicksize,
         push_freq: PushFrequency,
+        #[serde(default)]
+        synthetic_book_levels: Option<u16>,
     },
     Trades {
         ticker_info: TickerInfo,
@@ -308,13 +310,21 @@ impl StreamKind {
         }
     }
 
-    pub fn as_depth_stream(&self) -> Option<(TickerInfo, StreamTicksize, PushFrequency)> {
+    pub fn as_depth_stream(
+        &self,
+    ) -> Option<(TickerInfo, StreamTicksize, PushFrequency, Option<u16>)> {
         match self {
             StreamKind::Depth {
                 ticker_info,
                 depth_aggr,
                 push_freq,
-            } => Some((*ticker_info, *depth_aggr, *push_freq)),
+                synthetic_book_levels,
+            } => Some((
+                *ticker_info,
+                *depth_aggr,
+                *push_freq,
+                *synthetic_book_levels,
+            )),
             _ => None,
         }
     }
@@ -409,7 +419,7 @@ impl UniqueStreams {
     pub fn depth_streams(
         &self,
         exchange_filter: Option<Exchange>,
-    ) -> Vec<(TickerInfo, StreamTicksize, PushFrequency)> {
+    ) -> Vec<(TickerInfo, StreamTicksize, PushFrequency, Option<u16>)> {
         self.streams(exchange_filter, |_, stream| stream.as_depth_stream())
     }
 
@@ -445,7 +455,7 @@ fn default_depth_aggr() -> StreamTicksize {
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamSpecs {
-    pub depth: Vec<(TickerInfo, StreamTicksize, PushFrequency)>,
+    pub depth: Vec<(TickerInfo, StreamTicksize, PushFrequency, Option<u16>)>,
     pub trade: Vec<TickerInfo>,
     pub kline: Vec<(TickerInfo, Timeframe)>,
 }
@@ -648,6 +658,7 @@ pub struct StreamConfig<I> {
     pub exchange: Exchange,
     pub tick_mltp: Option<TickMultiplier>,
     pub push_freq: PushFrequency,
+    pub synthetic_book_levels: Option<u16>,
 }
 
 impl<I> StreamConfig<I> {
@@ -656,12 +667,14 @@ impl<I> StreamConfig<I> {
         exchange: Exchange,
         tick_mltp: Option<TickMultiplier>,
         push_freq: PushFrequency,
+        synthetic_book_levels: Option<u16>,
     ) -> Self {
         Self {
             id,
             exchange,
             tick_mltp,
             push_freq,
+            synthetic_book_levels,
         }
     }
 }
@@ -755,12 +768,15 @@ pub async fn fetch_trades(
 
 pub async fn fetch_heatmap_history(
     ticker_info: TickerInfo,
+    synthetic_book_levels: Option<u16>,
 ) -> Result<(Vec<Trade>, Vec<(u64, Depth)>), AdapterError> {
     match ticker_info.ticker.exchange.venue() {
         Venue::Binance => Err(AdapterError::InvalidRequest(
             "Heatmap history replay is only implemented for QMT venues".to_string(),
         )),
-        Venue::SSZ | Venue::SSH => qmt::fetch_heatmap_history(ticker_info).await,
+        Venue::SSZ | Venue::SSH => {
+            qmt::fetch_heatmap_history(ticker_info, synthetic_book_levels).await
+        }
     }
 }
 

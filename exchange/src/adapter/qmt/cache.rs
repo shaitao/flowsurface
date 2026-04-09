@@ -259,6 +259,7 @@ pub(super) fn cache_live_tick(ticker: Ticker, tick: &QmtTick) {
             ticks: Vec::new(),
             history_loaded: false,
             last_history_loaded_at: None,
+            history_depth_seed: None,
         });
 
     if entry.day != day {
@@ -267,17 +268,35 @@ pub(super) fn cache_live_tick(ticker: Ticker, tick: &QmtTick) {
             ticks: Vec::new(),
             history_loaded: false,
             last_history_loaded_at: None,
+            history_depth_seed: None,
         };
     }
 
     entry.ticks = merge_ticks(&entry.ticks, std::iter::once(tick.clone()));
 }
 
+fn build_history_depth_seed_from_ticks(
+    ticker_info: TickerInfo,
+    ticks: &[QmtTick],
+) -> Option<Depth> {
+    build_depth_history_from_ticks(
+        ticks,
+        ticker_info,
+        Some(crate::QMT_SYNTHETIC_BOOK_LEVELS_MAX),
+    )
+    .into_iter()
+    .last()
+    .map(|(_, depth)| depth)
+}
+
 pub(super) fn merge_current_day_history_and_live(
-    ticker: Ticker,
+    ticker_info: TickerInfo,
     day: NaiveDate,
     history_ticks: Vec<QmtTick>,
 ) -> Vec<QmtTick> {
+    let ticker = ticker_info.ticker;
+    let history_depth_seed = build_history_depth_seed_from_ticks(ticker_info, &history_ticks);
+
     let Ok(mut cache) = CURRENT_DAY_TICK_CACHE.write() else {
         return history_ticks;
     };
@@ -290,6 +309,7 @@ pub(super) fn merge_current_day_history_and_live(
             ticks: Vec::new(),
             history_loaded: false,
             last_history_loaded_at: None,
+            history_depth_seed: None,
         });
 
     if entry.day != day {
@@ -298,12 +318,14 @@ pub(super) fn merge_current_day_history_and_live(
             ticks: Vec::new(),
             history_loaded: false,
             last_history_loaded_at: None,
+            history_depth_seed: None,
         };
     }
 
     entry.ticks = merge_ticks(&history_ticks, entry.ticks.clone());
     entry.history_loaded = true;
     entry.last_history_loaded_at = Some(Instant::now());
+    entry.history_depth_seed = history_depth_seed;
     entry.ticks.clone()
 }
 
@@ -350,6 +372,19 @@ pub(super) fn current_day_history_ready(ticker: Ticker, day: NaiveDate) -> bool 
     cache
         .get(&ticker)
         .is_some_and(|entry| entry.day == day && entry.history_loaded)
+}
+
+pub(super) fn current_day_history_depth_seed(ticker: Ticker, day: NaiveDate) -> Option<Depth> {
+    let Ok(mut cache) = CURRENT_DAY_TICK_CACHE.write() else {
+        return None;
+    };
+    prune_current_day_tick_cache(&mut cache);
+    let entry = cache.get(&ticker)?;
+    if entry.day != day || !entry.history_loaded {
+        return None;
+    }
+
+    entry.history_depth_seed.clone()
 }
 
 pub(super) async fn acquire_current_day_fetch_lock(
