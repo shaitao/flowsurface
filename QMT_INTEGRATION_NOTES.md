@@ -1001,7 +1001,7 @@ QMT heatmap is conceptually the same kind of view:
 
 - live depth accumulation
 - live trade accumulation
-- current meaningful basis is `3s`
+- current meaningful bases are `3s / 4s / 6s`
 - current-day replay comes from tick-derived snapshots, not native depth history
 
 The trap is that QMT also has a session-aware gapless time-axis helper for trading-day charts.
@@ -1009,17 +1009,17 @@ The trap is that QMT also has a session-aware gapless time-axis helper for tradi
 Important detail:
 
 - the generic QMT gapless helpers depend on timeframe support from `qmt_timeframe_ms(...)`
-- synthetic kline helpers should still reject millisecond heatmap bases such as `MS3000`
+- synthetic kline helpers should still reject millisecond heatmap bases such as `MS3000 / MS4000 / MS6000`
 
 Failure mode when this is wired incorrectly:
 
-- enabling `MS3000` in the wrong helper path can accidentally widen kline/session code that was never meant for heatmap
+- enabling heatmap-only millisecond bases in the wrong helper path can accidentally widen kline/session code that was never meant for heatmap
 - faking midday buckets would hide the lunch break by inventing data instead of only compressing coordinates
 
 Current rule:
 
 - keep `qmt_timeframe_ms(...)` unchanged for synthetic-kline logic
-- add a dedicated heatmap-axis `3s` bucket mapper only for `time_axis_bucket_offset(...) / time_axis_bucket_at_offset(...)`
+- add a dedicated heatmap-axis mapper only for `time_axis_bucket_offset(...) / time_axis_bucket_at_offset(...)`
 - compress the lunch gap on the X axis only
 - never fabricate midday depth or trade data just to make the chart look continuous
 
@@ -1070,6 +1070,40 @@ Current rule:
 
 - basis / tick-size changes must trigger a fresh current-day heatmap history sync
 - `pause_buffer` must also be cleared during those resets so old depth does not leak into the new configuration
+
+### 4f. QMT heatmap history must drop off-session tail ticks
+
+Another QMT-specific trap is that raw `/api/v1/ticks` history can contain dirty tail ticks outside the real session.
+
+Failure mode:
+
+- some symbols return extra ticks after the close, for example around `15:05` or `15:30`
+- those rows may still carry `volume` and top-of-book arrays
+- the usual `volume > 0 && has_top_of_book` replay filter therefore lets them through
+- heatmap `latest_x` gets pushed into off-session time that the QMT gapless axis does not represent
+- the heatmap list tooltip can still query data, but the main chart and time axis look broken or missing
+
+Current rule:
+
+- QMT heatmap history replay must only keep ticks that map onto the QMT heatmap session axis
+- filter replay ticks by session membership in addition to `volume > 0` and top-of-book checks
+- treat ticks such as `15:05` / `15:30` tails as dirty bridge data, not valid replay input
+
+### 4g. Heatmap history replay should behave like zero-delay WS playback
+
+Batch-applying all historical trades first and all historical depth later is not equivalent to the live path.
+
+Failure mode:
+
+- history data reaches the chart, but is replayed through a shortcut path that does not match live update ordering
+- anchors such as `latest_x`, `base_price_y`, and `last_price` can end up different from the state produced by real WS updates
+- the pane looks inconsistent until later live ticks move the chart again
+
+Current rule:
+
+- merge historical trades and depth snapshots by timestamp
+- replay them through the same insert/update path used by live WS events
+- history backfill should act like zero-delay WS playback, not a separate chart mutation shortcut
 
 ### 5. Footprint history should not be blocked by a separate trade-fetch path
 

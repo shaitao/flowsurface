@@ -449,15 +449,10 @@ impl HeatmapChart {
             .chain(depths.iter().map(|(time, _)| *time))
             .max();
 
-        for trade in trades {
-            self.insert_trade_at_time(trade, trade.time);
-        }
-
-        for (time, depth) in depths {
-            self.process_depth_at(self.round_to_basis_time(*time), depth);
-        }
-
         self.history_sync_pending = false;
+        self.replay_cutoff_time = None;
+        self.replay_history_updates_as_live(trades, depths);
+
         self.replay_cutoff_time = history_cutoff;
         self.flush_pending_history_updates();
         self.cleanup_old_data();
@@ -489,6 +484,34 @@ impl HeatmapChart {
     fn should_skip_live_depth(&self, update_t: u64) -> bool {
         self.replay_cutoff_time
             .is_some_and(|cutoff| update_t <= cutoff)
+    }
+
+    fn replay_history_updates_as_live(&mut self, trades: &[Trade], depths: &[(u64, Depth)]) {
+        let mut trade_index = 0usize;
+        let mut depth_index = 0usize;
+
+        while trade_index < trades.len() || depth_index < depths.len() {
+            match (trades.get(trade_index), depths.get(depth_index)) {
+                (Some(trade), Some((depth_time, depth))) => {
+                    if *depth_time <= trade.time {
+                        self.insert_depth(depth, *depth_time);
+                        depth_index += 1;
+                    } else {
+                        self.insert_trades(std::slice::from_ref(trade), trade.time);
+                        trade_index += 1;
+                    }
+                }
+                (Some(trade), None) => {
+                    self.insert_trades(std::slice::from_ref(trade), trade.time);
+                    trade_index += 1;
+                }
+                (None, Some((depth_time, depth))) => {
+                    self.insert_depth(depth, *depth_time);
+                    depth_index += 1;
+                }
+                (None, None) => break,
+            }
+        }
     }
 
     fn insert_live_trades_after_replay(&mut self, buffer: &[Trade], update_t: u64) {
@@ -1241,5 +1264,29 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn history_replay_applies_updates_in_timestamp_order() {
+        let mut chart = sample_chart();
+
+        chart.apply_history_replay(
+            &[Trade {
+                time: 6_000,
+                is_sell: false,
+                price: Price::from_f32(82.0),
+                qty: Qty::from_f32(100.0),
+            }],
+            &[(3_000, sample_depth(10.0, 500.0))],
+        );
+
+        assert_eq!(chart.chart.latest_x, 6_000);
+        assert_eq!(chart.chart.base_price_y, Price::from_f32(82.0));
+        match chart.chart.last_price {
+            Some(PriceInfoLabel::Neutral(price)) => {
+                assert_eq!(price, Price::from_f32(82.0));
+            }
+            _ => panic!("expected neutral last price label"),
+        }
     }
 }

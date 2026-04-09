@@ -483,10 +483,18 @@ fn qmt_timeframe_ms_supports_custom_minutes() {
 }
 
 #[test]
-fn supports_gapless_time_axis_timeframe_includes_heatmap_ms3000() {
+fn supports_gapless_time_axis_timeframe_includes_heatmap_ms_bases() {
     assert!(supports_gapless_time_axis_timeframe(
         Venue::SSH,
         Timeframe::MS3000
+    ));
+    assert!(supports_gapless_time_axis_timeframe(
+        Venue::SSH,
+        Timeframe::MS4000
+    ));
+    assert!(supports_gapless_time_axis_timeframe(
+        Venue::SSH,
+        Timeframe::MS6000
     ));
     assert!(supports_gapless_time_axis_timeframe(
         Venue::SSH,
@@ -515,6 +523,68 @@ fn qmt_heatmap_gapless_axis_skips_lunch_gap() {
         time_axis_bucket_at_offset(Venue::SSH, after_lunch, Timeframe::MS3000, -1),
         Some(before_lunch)
     );
+}
+
+#[test]
+fn qmt_heatmap_gapless_axis_skips_lunch_gap_for_ms4000_and_ms6000() {
+    let before_lunch_4s = china_ms(2026, 4, 9, 11, 29, 56);
+    let after_lunch_4s = china_ms(2026, 4, 9, 13, 0, 0);
+    assert_eq!(
+        time_axis_bucket_offset(
+            Venue::SSH,
+            before_lunch_4s,
+            after_lunch_4s,
+            Timeframe::MS4000
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        time_axis_bucket_at_offset(Venue::SSH, before_lunch_4s, Timeframe::MS4000, 1),
+        Some(after_lunch_4s)
+    );
+
+    let before_lunch_6s = china_ms(2026, 4, 9, 11, 29, 54);
+    let after_lunch_6s = china_ms(2026, 4, 9, 13, 0, 0);
+    assert_eq!(
+        time_axis_bucket_offset(
+            Venue::SSH,
+            before_lunch_6s,
+            after_lunch_6s,
+            Timeframe::MS6000
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        time_axis_bucket_at_offset(Venue::SSH, before_lunch_6s, Timeframe::MS6000, 1),
+        Some(after_lunch_6s)
+    );
+}
+
+#[test]
+fn qmt_heatmap_tick_in_session_rejects_off_session_tail_ticks() {
+    let venue = Venue::SSH;
+
+    assert!(qmt_heatmap_tick_in_session(
+        venue,
+        china_ms(2026, 4, 9, 9, 30, 0)
+    ));
+    assert!(qmt_heatmap_tick_in_session(
+        venue,
+        china_ms(2026, 4, 9, 15, 0, 4)
+    ));
+
+    assert!(!qmt_heatmap_tick_in_session(
+        venue,
+        china_ms(2026, 4, 9, 9, 25, 2)
+    ));
+    assert!(!qmt_heatmap_tick_in_session(
+        venue,
+        china_ms(2026, 4, 9, 15, 5, 0)
+    ));
+    assert!(!qmt_heatmap_tick_in_session(
+        venue,
+        china_ms(2026, 4, 9, 15, 30, 9)
+    ));
 }
 
 #[test]

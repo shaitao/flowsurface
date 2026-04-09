@@ -595,8 +595,21 @@ impl Exchange {
 
     pub fn supports_heatmap_timeframe(&self, tf: Timeframe) -> bool {
         match self.venue() {
-            Venue::Binance => Timeframe::HEATMAP.contains(&tf),
-            Venue::SSZ | Venue::SSH => matches!(tf, Timeframe::MS3000),
+            Venue::Binance => matches!(
+                tf,
+                Timeframe::MS100
+                    | Timeframe::MS200
+                    | Timeframe::MS300
+                    | Timeframe::MS500
+                    | Timeframe::MS1000
+                    | Timeframe::MS3000
+            ),
+            Venue::SSZ | Venue::SSH => {
+                matches!(
+                    tf,
+                    Timeframe::MS3000 | Timeframe::MS4000 | Timeframe::MS6000
+                )
+            }
         }
     }
 

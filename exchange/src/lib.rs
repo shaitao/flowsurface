@@ -54,6 +54,8 @@ impl std::fmt::Display for Timeframe {
             Timeframe::MS500 => write!(f, "500ms"),
             Timeframe::MS1000 => write!(f, "1s"),
             Timeframe::MS3000 => write!(f, "3s"),
+            Timeframe::MS4000 => write!(f, "4s"),
+            Timeframe::MS6000 => write!(f, "6s"),
             Timeframe::M1 => write!(f, "1m"),
             Timeframe::M3 => write!(f, "3m"),
             Timeframe::M5 => write!(f, "5m"),
@@ -77,6 +79,8 @@ pub enum Timeframe {
     MS500,
     MS1000,
     MS3000,
+    MS4000,
+    MS6000,
     M1,
     M3,
     M5,
@@ -104,13 +108,15 @@ impl Timeframe {
         Timeframe::D1,
     ];
 
-    pub const HEATMAP: [Timeframe; 6] = [
+    pub const HEATMAP: [Timeframe; 8] = [
         Timeframe::MS100,
         Timeframe::MS200,
         Timeframe::MS300,
         Timeframe::MS500,
         Timeframe::MS1000,
         Timeframe::MS3000,
+        Timeframe::MS4000,
+        Timeframe::MS6000,
     ];
 
     pub const CUSTOM_MINUTES_MIN: u16 = 1;
@@ -144,6 +150,8 @@ impl Timeframe {
             Timeframe::MS500 => 500,
             Timeframe::MS1000 => 1_000,
             Timeframe::MS3000 => 3_000,
+            Timeframe::MS4000 => 4_000,
+            Timeframe::MS6000 => 6_000,
             _ => {
                 let minutes = self.to_minutes();
                 u64::from(minutes) * 60_000

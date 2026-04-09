@@ -28,14 +28,18 @@ pub(super) fn qmt_timeframe_ms(timeframe: Timeframe) -> Option<u64> {
         | Timeframe::MS300
         | Timeframe::MS500
         | Timeframe::MS1000
-        | Timeframe::MS3000 => None,
+        | Timeframe::MS3000
+        | Timeframe::MS4000
+        | Timeframe::MS6000 => None,
         _ => Some(timeframe.to_milliseconds()),
     }
 }
 
 fn qmt_gapless_axis_timeframe_ms(timeframe: Timeframe) -> Option<u64> {
     match timeframe {
-        Timeframe::MS3000 => Some(timeframe.to_milliseconds()),
+        Timeframe::MS3000 | Timeframe::MS4000 | Timeframe::MS6000 => {
+            Some(timeframe.to_milliseconds())
+        }
         _ => qmt_timeframe_ms(timeframe),
     }
 }
@@ -124,6 +128,10 @@ pub fn uses_gapless_time_axis(venue: Venue) -> bool {
 
 pub fn supports_gapless_time_axis_timeframe(venue: Venue, timeframe: Timeframe) -> bool {
     uses_gapless_time_axis(venue) && qmt_gapless_axis_timeframe_ms(timeframe).is_some()
+}
+
+pub(super) fn qmt_heatmap_tick_in_session(venue: Venue, timestamp_ms: u64) -> bool {
+    qmt_gapless_axis_bucket_start(venue, timestamp_ms, Timeframe::MS3000).is_some()
 }
 
 fn qmt_gapless_axis_bucket_start(

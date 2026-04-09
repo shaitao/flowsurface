@@ -242,10 +242,15 @@ pub async fn fetch_heatmap_history(
     let ticks = fetch_ticks(ticker_info, range).await?;
     let fetch_elapsed = fetch_started_at.elapsed();
     let total_ticks = ticks.len();
+    let venue = ticker_info.exchange().venue();
 
     let replay_ticks = ticks
         .into_iter()
-        .filter(|tick| qmt_tick_has_traded_volume(tick) && qmt_tick_has_top_of_book(tick))
+        .filter(|tick| {
+            qmt_tick_has_traded_volume(tick)
+                && qmt_tick_has_top_of_book(tick)
+                && qmt_heatmap_tick_in_session(venue, tick.time)
+        })
         .collect::<Vec<_>>();
 
     let derive_started_at = Instant::now();
