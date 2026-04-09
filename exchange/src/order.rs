@@ -62,11 +62,22 @@ pub struct WorkingOrder {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OrderBookLevel {
+    pub price: f32,
+    pub quantity: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OrderPanelSnapshot {
     pub symbol: String,
     pub best_bid: Option<f32>,
     pub best_ask: Option<f32>,
     pub last_price: Option<f32>,
+    #[serde(default)]
+    pub bids: Vec<OrderBookLevel>,
+    #[serde(default)]
+    pub asks: Vec<OrderBookLevel>,
     pub available_cash: Option<f32>,
     pub position_qty: Option<f32>,
     pub available_qty: Option<f32>,
