@@ -31,20 +31,7 @@ async fn fetch_trading_days(
             ("end", end_ms.to_string()),
         ],
     )?;
-
-    let response = reqwest::get(&url).await.map_err(AdapterError::from)?;
-    let status = response.status();
-    let text = response.text().await.map_err(AdapterError::from)?;
-
-    if !status.is_success() {
-        return Err(AdapterError::http_status_failed(
-            status,
-            format!("GET {url} failed: {text}"),
-        ));
-    }
-
-    let parsed: BridgeItemsResponse<String> =
-        serde_json::from_str(&text).map_err(|e| AdapterError::ParseError(e.to_string()))?;
+    let parsed: BridgeItemsResponse<String> = qmt_get_bridge(&url).await?;
 
     parsed
         .items

@@ -72,10 +72,9 @@ async fn run_shared_tick_stream(
                             }
                         }
                         Ok(Ok(message)) => match message.opcode {
-                            OpCode::Text => {
-                                match serde_json::from_slice::<BridgeWsMessage>(
-                                    &message.payload[..],
-                                ) {
+                            OpCode::Text | OpCode::Binary => {
+                                match decode_bridge_ws_message(message.opcode, &message.payload[..])
+                                {
                                     Ok(BridgeWsMessage::Tick(tick)) => {
                                         cache_live_tick(ticker, &tick);
                                         let _ = sender.send(SharedTickStreamEvent::Tick(tick));
@@ -151,4 +150,22 @@ async fn maybe_stop_shared_tick_stream(
 
     streams.remove(&ticker);
     true
+}
+
+fn decode_bridge_ws_message(
+    opcode: OpCode,
+    payload: &[u8],
+) -> Result<BridgeWsMessage, AdapterError> {
+    match opcode {
+        OpCode::Text => {
+            serde_json::from_slice(payload).map_err(|e| AdapterError::ParseError(e.to_string()))
+        }
+        OpCode::Binary => {
+            let decompressed = qmt_decompress_zstd(payload)?;
+            qmt_decode_msgpack(&decompressed)
+        }
+        _ => Err(AdapterError::ParseError(format!(
+            "unsupported websocket opcode: {opcode:?}"
+        ))),
+    }
 }

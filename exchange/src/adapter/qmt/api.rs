@@ -26,19 +26,7 @@ pub async fn search_ticker_metadata(
             ("limit", limit.max(1).to_string()),
         ],
     )?;
-    let response = reqwest::get(&url).await.map_err(AdapterError::from)?;
-    let status = response.status();
-    let text = response.text().await.map_err(AdapterError::from)?;
-
-    if !status.is_success() {
-        return Err(AdapterError::http_status_failed(
-            status,
-            format!("GET {url} failed: {text}"),
-        ));
-    }
-
-    let parsed: BridgeItemsResponse<BridgeSearchItem> =
-        serde_json::from_str(&text).map_err(|e| AdapterError::ParseError(e.to_string()))?;
+    let parsed: BridgeItemsResponse<BridgeSearchItem> = qmt_get_bridge(&url).await?;
     let mut map = HashMap::new();
     for item in parsed.items {
         let Some(exchange) = qmt_exchange_from_symbol(&item.symbol) else {
@@ -474,23 +462,37 @@ async fn fetch_tick_chunk(
     )?;
 
     let request_started_at = Instant::now();
-    let response = reqwest::get(&url).await.map_err(AdapterError::from)?;
+    let response = qmt_bridge_http_client()
+        .get(&url)
+        .header(reqwest::header::ACCEPT, QMT_BRIDGE_MSGPACK_CONTENT_TYPE)
+        .send()
+        .await
+        .map_err(AdapterError::from)?;
     let request_elapsed = request_started_at.elapsed();
     let status = response.status();
+    let is_msgpack = qmt_response_is_msgpack(&response);
     let body_started_at = Instant::now();
-    let text = response.text().await.map_err(AdapterError::from)?;
+    let bytes = response.bytes().await.map_err(AdapterError::from)?;
     let body_elapsed = body_started_at.elapsed();
 
     if !status.is_success() {
         return Err(AdapterError::http_status_failed(
             status,
-            format!("GET {url} failed: {text}"),
+            format!(
+                "GET {url} failed: {}",
+                qmt_response_body_to_error_detail(&bytes, is_msgpack)
+            ),
         ));
     }
 
+    if !is_msgpack {
+        return Err(AdapterError::ParseError(format!(
+            "QMT bridge returned unexpected content type for GET {url}"
+        )));
+    }
+
     let parse_started_at = Instant::now();
-    let parsed: BridgeItemsResponse<QmtTick> =
-        serde_json::from_str(&text).map_err(|e| AdapterError::ParseError(e.to_string()))?;
+    let parsed: BridgeItemsResponse<QmtTick> = qmt_decode_msgpack(&bytes)?;
     let parse_elapsed = parse_started_at.elapsed();
     let sanitized = sanitize_qmt_ticks(parsed.items);
     log::info!(
@@ -515,19 +517,7 @@ pub async fn fetch_order_panel_snapshot(
         "/api/v1/order/panel",
         &[("symbol", ticker_info.ticker.to_string())],
     )?;
-
-    let response = reqwest::get(&url).await.map_err(AdapterError::from)?;
-    let status = response.status();
-    let text = response.text().await.map_err(AdapterError::from)?;
-
-    if !status.is_success() {
-        return Err(AdapterError::http_status_failed(
-            status,
-            format!("GET {url} failed: {text}"),
-        ));
-    }
-
-    serde_json::from_str(&text).map_err(|e| AdapterError::ParseError(e.to_string()))
+    qmt_get_bridge(&url).await
 }
 
 pub async fn submit_order(
@@ -543,24 +533,7 @@ pub async fn submit_order(
         price: request.price,
         quantity: request.quantity,
     };
-
-    let response = reqwest::Client::new()
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(AdapterError::from)?;
-    let status = response.status();
-    let text = response.text().await.map_err(AdapterError::from)?;
-
-    if !status.is_success() {
-        return Err(AdapterError::http_status_failed(
-            status,
-            format!("POST {url} failed: {text}"),
-        ));
-    }
-
-    serde_json::from_str(&text).map_err(|e| AdapterError::ParseError(e.to_string()))
+    qmt_post_bridge(&url, &body).await
 }
 
 pub async fn cancel_order(
@@ -573,24 +546,7 @@ pub async fn cancel_order(
         symbol: &symbol,
         order_id: &request.order_id,
     };
-
-    let response = reqwest::Client::new()
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(AdapterError::from)?;
-    let status = response.status();
-    let text = response.text().await.map_err(AdapterError::from)?;
-
-    if !status.is_success() {
-        return Err(AdapterError::http_status_failed(
-            status,
-            format!("POST {url} failed: {text}"),
-        ));
-    }
-
-    serde_json::from_str(&text).map_err(|e| AdapterError::ParseError(e.to_string()))
+    qmt_post_bridge(&url, &body).await
 }
 
 pub async fn fetch_historical_oi(

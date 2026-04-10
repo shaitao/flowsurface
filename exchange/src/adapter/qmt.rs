@@ -15,11 +15,13 @@ use chrono::{Datelike, Days, FixedOffset, NaiveDate, TimeZone};
 use fastwebsockets::OpCode;
 use futures::Stream;
 use indexmap::IndexMap;
+use reqwest::header::{ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{HashMap, HashSet},
     env,
+    io::Cursor,
     sync::{
         LazyLock, RwLock,
         atomic::{AtomicUsize, Ordering},
@@ -54,6 +56,9 @@ pub use time::{
 };
 
 const DEFAULT_QMT_BRIDGE_BASE: &str = "http://127.0.0.1:8765";
+const QMT_BRIDGE_MSGPACK_CONTENT_TYPE: &str = "application/msgpack";
+const QMT_BRIDGE_ZSTD_CONTENT_ENCODING: &str = "zstd";
+const QMT_BRIDGE_ZSTD_LEVEL: i32 = 3;
 const DEFAULT_QMT_INITIAL_KLINE_BARS: u64 = 450;
 const QMT_VOLUME_LOT_SIZE: f32 = 100.0;
 const QMT_KLINE_SEED_CALENDAR_LOOKBACK_MS: u64 = 14 * 86_400_000;
@@ -75,9 +80,14 @@ static INVALID_TOP_OF_BOOK_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VOLUME_REGRESSION_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MISSING_LAST_PRICE_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ZERO_QTY_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
+static QMT_BRIDGE_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 fn qmt_bridge_base() -> String {
     env::var("QMT_BRIDGE_BASE").unwrap_or_else(|_| DEFAULT_QMT_BRIDGE_BASE.to_string())
+}
+
+fn qmt_bridge_http_client() -> &'static reqwest::Client {
+    &QMT_BRIDGE_HTTP_CLIENT
 }
 
 fn qmt_bridge_url(
@@ -130,6 +140,114 @@ fn qmt_bridge_ws_url(
     query_pairs: &[(&str, String)],
 ) -> Result<(String, String), AdapterError> {
     qmt_bridge_url(path, query_pairs, true)
+}
+
+fn qmt_encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>, AdapterError> {
+    rmp_serde::to_vec_named(value).map_err(|e| AdapterError::ParseError(e.to_string()))
+}
+
+fn qmt_decode_msgpack<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, AdapterError> {
+    rmp_serde::from_slice(bytes).map_err(|e| AdapterError::ParseError(e.to_string()))
+}
+
+fn qmt_compress_zstd(bytes: &[u8]) -> Result<Vec<u8>, AdapterError> {
+    zstd::stream::encode_all(Cursor::new(bytes), QMT_BRIDGE_ZSTD_LEVEL)
+        .map_err(|e| AdapterError::ParseError(e.to_string()))
+}
+
+fn qmt_decompress_zstd(bytes: &[u8]) -> Result<Vec<u8>, AdapterError> {
+    zstd::stream::decode_all(Cursor::new(bytes))
+        .map_err(|e| AdapterError::ParseError(e.to_string()))
+}
+
+fn qmt_response_is_msgpack(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.contains(QMT_BRIDGE_MSGPACK_CONTENT_TYPE))
+        .unwrap_or(false)
+}
+
+fn qmt_response_body_to_error_detail(bytes: &[u8], is_msgpack: bool) -> String {
+    if is_msgpack {
+        if let Ok(value) = qmt_decode_msgpack::<serde_json::Value>(bytes) {
+            return serde_json::to_string(&value)
+                .unwrap_or_else(|_| format!("msgpack error body ({} bytes)", bytes.len()));
+        }
+        return format!("invalid msgpack error body ({} bytes)", bytes.len());
+    }
+
+    String::from_utf8(bytes.to_vec())
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+}
+
+async fn qmt_get_bridge<T: DeserializeOwned>(url: &str) -> Result<T, AdapterError> {
+    let response = qmt_bridge_http_client()
+        .get(url)
+        .header(ACCEPT, QMT_BRIDGE_MSGPACK_CONTENT_TYPE)
+        .send()
+        .await
+        .map_err(AdapterError::from)?;
+    let status = response.status();
+    let is_msgpack = qmt_response_is_msgpack(&response);
+    let bytes = response.bytes().await.map_err(AdapterError::from)?;
+
+    if !status.is_success() {
+        return Err(AdapterError::http_status_failed(
+            status,
+            format!(
+                "GET {url} failed: {}",
+                qmt_response_body_to_error_detail(&bytes, is_msgpack)
+            ),
+        ));
+    }
+
+    if !is_msgpack {
+        return Err(AdapterError::ParseError(format!(
+            "QMT bridge returned unexpected content type for GET {url}"
+        )));
+    }
+
+    qmt_decode_msgpack(&bytes)
+}
+
+async fn qmt_post_bridge<Req: Serialize, Resp: DeserializeOwned>(
+    url: &str,
+    body: &Req,
+) -> Result<Resp, AdapterError> {
+    let packed = qmt_encode_msgpack(body)?;
+    let compressed = qmt_compress_zstd(&packed)?;
+    let response = qmt_bridge_http_client()
+        .post(url)
+        .header(ACCEPT, QMT_BRIDGE_MSGPACK_CONTENT_TYPE)
+        .header(CONTENT_TYPE, QMT_BRIDGE_MSGPACK_CONTENT_TYPE)
+        .header(CONTENT_ENCODING, QMT_BRIDGE_ZSTD_CONTENT_ENCODING)
+        .body(compressed)
+        .send()
+        .await
+        .map_err(AdapterError::from)?;
+    let status = response.status();
+    let is_msgpack = qmt_response_is_msgpack(&response);
+    let bytes = response.bytes().await.map_err(AdapterError::from)?;
+
+    if !status.is_success() {
+        return Err(AdapterError::http_status_failed(
+            status,
+            format!(
+                "POST {url} failed: {}",
+                qmt_response_body_to_error_detail(&bytes, is_msgpack)
+            ),
+        ));
+    }
+
+    if !is_msgpack {
+        return Err(AdapterError::ParseError(format!(
+            "QMT bridge returned unexpected content type for POST {url}"
+        )));
+    }
+
+    qmt_decode_msgpack(&bytes)
 }
 
 #[derive(Debug, Clone, Deserialize)]
