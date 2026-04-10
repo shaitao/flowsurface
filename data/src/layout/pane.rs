@@ -96,6 +96,14 @@ pub struct Settings {
     pub synthetic_book_levels: Option<u16>,
     pub visual_config: Option<VisualConfig>,
     pub selected_basis: Option<Basis>,
+    #[serde(deserialize_with = "ok_or_default", default)]
+    pub horizontal_rays: Vec<HorizontalRay>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HorizontalRay {
+    pub start_time: u64,
+    pub price: exchange::unit::Price,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]

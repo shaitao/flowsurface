@@ -75,6 +75,14 @@ pub fn venue_icon(venue: exchange::adapter::Venue) -> Icon {
     }
 }
 
+pub fn horizontal_ray_width(_theme: &Theme) -> f32 {
+    2.0
+}
+
+pub fn horizontal_ray_handle_radius(_theme: &Theme) -> f32 {
+    4.5
+}
+
 #[cfg(target_os = "macos")]
 pub fn title_text(theme: &Theme) -> iced::widget::text::Style {
     let palette = theme.extended_palette();

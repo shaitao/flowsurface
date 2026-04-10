@@ -1,5 +1,5 @@
 use crate::{
-    chart::{self, comparison::ComparisonChart, heatmap::HeatmapChart, kline::KlineChart},
+    chart::{self, Chart, comparison::ComparisonChart, heatmap::HeatmapChart, kline::KlineChart},
     connector::{
         ResolvedStream,
         fetcher::{FetchSpec, InfoKind},
@@ -47,6 +47,7 @@ pub enum Effect {
     RefreshStreams,
     ReloadHeatmapHistory,
     RequestFetch(Vec<FetchSpec>),
+    SharedHorizontalLevel(chart::HorizontalLevelEvent),
     OrderEntry(panel::order_entry::Action),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
@@ -93,6 +94,7 @@ pub enum Event {
     ChartInteraction(super::chart::Message),
     PanelInteraction(super::panel::Message),
     OrderEntryInteraction(super::panel::order_entry::Message),
+    ToggleHorizontalLevelMode,
     ToggleIndicator(UiIndicator),
     DeleteNotification(usize),
     ReorderIndicator(column_drag::DragEvent),
@@ -108,6 +110,8 @@ pub struct State {
     id: uuid::Uuid,
     pub modal: Option<Modal>,
     pub content: Content,
+    shared_horizontal_levels: Vec<chart::HorizontalLevel>,
+    horizontal_level_mode: bool,
     pub settings: Settings,
     pub notifications: Vec<Toast>,
     pub streams: ResolvedStream,
@@ -126,9 +130,16 @@ impl State {
         settings: Settings,
         link_group: Option<LinkGroup>,
     ) -> Self {
+        let shared_horizontal_levels = settings
+            .horizontal_rays
+            .iter()
+            .map(|ray| chart::HorizontalLevel::new(ray.start_time, ray.price))
+            .collect();
+
         Self {
             content,
             settings,
+            shared_horizontal_levels,
             streams: ResolvedStream::waiting(streams),
             link_group,
             ..Default::default()
@@ -159,6 +170,27 @@ impl State {
             1 => Some(StreamPairKind::SingleSource(unique[0])),
             _ => Some(StreamPairKind::MultiSource(unique)),
         }
+    }
+
+    pub fn set_shared_horizontal_levels(&mut self, levels: Vec<chart::HorizontalLevel>) {
+        self.shared_horizontal_levels = levels.clone();
+        self.settings.horizontal_rays = levels
+            .iter()
+            .map(|level| data::layout::pane::HorizontalRay {
+                start_time: level.start_time,
+                price: level.price,
+            })
+            .collect();
+
+        match &mut self.content {
+            Content::Heatmap { chart: Some(c), .. } => c.set_horizontal_levels(levels),
+            Content::Kline { chart: Some(c), .. } => c.set_horizontal_levels(levels),
+            _ => {}
+        }
+    }
+
+    fn horizontal_level_mode(&self) -> bool {
+        self.horizontal_level_mode
     }
 
     pub fn set_content_and_streams(
@@ -211,6 +243,8 @@ impl State {
                         derived_plan.ticker_info,
                         &self.settings,
                         derived_plan.price_step,
+                        &self.shared_horizontal_levels,
+                        self.horizontal_level_mode,
                     );
 
                     let streams = vec![depth_stream(&derived_plan), trades_stream(&derived_plan)];
@@ -224,6 +258,8 @@ impl State {
                         derived_plan.ticker_info,
                         &self.settings,
                         derived_plan.price_step,
+                        &self.shared_horizontal_levels,
+                        self.horizontal_level_mode,
                     );
 
                     let streams = by_basis_default(
@@ -249,6 +285,8 @@ impl State {
                             derived_plan.ticker_info,
                             &self.settings,
                             base_ticker.min_ticksize.into(),
+                            &self.shared_horizontal_levels,
+                            self.horizontal_level_mode,
                         )
                     };
 
@@ -1153,6 +1191,17 @@ impl State {
             Event::HideModal => {
                 self.modal = None;
             }
+            Event::ToggleHorizontalLevelMode => match &mut self.content {
+                Content::Heatmap { chart: Some(c), .. } => {
+                    self.horizontal_level_mode = !self.horizontal_level_mode;
+                    c.set_horizontal_level_mode(self.horizontal_level_mode);
+                }
+                Content::Kline { chart: Some(c), .. } => {
+                    self.horizontal_level_mode = !self.horizontal_level_mode;
+                    c.set_horizontal_level_mode(self.horizontal_level_mode);
+                }
+                _ => {}
+            },
             Event::ContentSelected(kind) => {
                 self.content = Content::placeholder(kind);
 
@@ -1166,12 +1215,58 @@ impl State {
                 }
             }
             Event::ChartInteraction(msg) => match &mut self.content {
-                Content::Heatmap { chart: Some(c), .. } => {
-                    super::chart::update(c, &msg);
-                }
-                Content::Kline { chart: Some(c), .. } => {
-                    super::chart::update(c, &msg);
-                }
+                Content::Heatmap { chart: Some(c), .. } => match msg {
+                    chart::Message::CreateHorizontalLevel { start_time, price } => {
+                        return Some(Effect::SharedHorizontalLevel(
+                            chart::HorizontalLevelEvent::Create { start_time, price },
+                        ));
+                    }
+                    chart::Message::MoveHorizontalLevel {
+                        id,
+                        start_time,
+                        price,
+                    } => {
+                        return Some(Effect::SharedHorizontalLevel(
+                            chart::HorizontalLevelEvent::Move {
+                                id,
+                                start_time,
+                                price,
+                            },
+                        ));
+                    }
+                    chart::Message::DeleteHorizontalLevel(id) => {
+                        return Some(Effect::SharedHorizontalLevel(
+                            chart::HorizontalLevelEvent::Delete(id),
+                        ));
+                    }
+                    _ => super::chart::update(c, &msg),
+                },
+                Content::Kline { chart: Some(c), .. } => match msg {
+                    chart::Message::CreateHorizontalLevel { start_time, price } => {
+                        return Some(Effect::SharedHorizontalLevel(
+                            chart::HorizontalLevelEvent::Create { start_time, price },
+                        ));
+                    }
+                    chart::Message::MoveHorizontalLevel {
+                        id,
+                        start_time,
+                        price,
+                    } => {
+                        return Some(Effect::SharedHorizontalLevel(
+                            chart::HorizontalLevelEvent::Move {
+                                id,
+                                start_time,
+                                price,
+                            },
+                        ));
+                    }
+                    chart::Message::DeleteHorizontalLevel(id) => {
+                        return Some(Effect::SharedHorizontalLevel(
+                            chart::HorizontalLevelEvent::Delete(id),
+                        ));
+                    }
+                    _ => super::chart::update(c, &msg),
+                },
                 _ => {}
             },
             Event::PanelInteraction(msg) => match &mut self.content {
@@ -1582,6 +1677,18 @@ impl State {
                 tooltip_pos,
                 modal_btn_style(Modal::Indicators),
             ));
+
+            buttons = buttons.push(button_with_tooltip(
+                text("R")
+                    .font(style::AZERET_MONO)
+                    .size(12)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::PaneEvent(pane, Event::ToggleHorizontalLevelMode),
+                Some("Horizontal ray mode"),
+                tooltip_pos,
+                control_btn_style(self.horizontal_level_mode()),
+            ));
         }
 
         if is_popout {
@@ -1837,6 +1944,8 @@ impl Default for State {
             id: uuid::Uuid::new_v4(),
             modal: None,
             content: Content::Starter,
+            shared_horizontal_levels: vec![],
+            horizontal_level_mode: false,
             settings: Settings::default(),
             streams: ResolvedStream::waiting(vec![]),
             notifications: vec![],
@@ -1874,6 +1983,8 @@ impl Content {
         ticker_info: TickerInfo,
         settings: &Settings,
         price_step: exchange::unit::PriceStep,
+        shared_horizontal_levels: &[chart::HorizontalLevel],
+        horizontal_level_mode: bool,
     ) -> Self {
         let (enabled_indicators, layout, prev_studies) = if let Content::Heatmap {
             chart,
@@ -1908,7 +2019,7 @@ impl Content {
             .unwrap_or_else(|| Basis::default_heatmap_time(Some(ticker_info)));
         let config = settings.visual_config.clone().and_then(|cfg| cfg.heatmap());
 
-        let chart = HeatmapChart::new(
+        let mut chart = HeatmapChart::new(
             layout.clone(),
             basis,
             price_step,
@@ -1917,6 +2028,8 @@ impl Content {
             config,
             prev_studies.clone(),
         );
+        chart.set_horizontal_levels(shared_horizontal_levels.to_vec());
+        chart.set_horizontal_level_mode(horizontal_level_mode);
 
         Content::Heatmap {
             chart: Some(chart),
@@ -1932,6 +2045,8 @@ impl Content {
         ticker_info: TickerInfo,
         settings: &Settings,
         step: exchange::unit::PriceStep,
+        shared_horizontal_levels: &[chart::HorizontalLevel],
+        horizontal_level_mode: bool,
     ) -> Self {
         let (prev_indis, prev_layout, prev_kind_opt) = if let Content::Kline {
             chart,
@@ -2008,7 +2123,7 @@ impl Content {
                 autoscale: Some(data::chart::Autoscale::FitToVisible),
             });
 
-        let chart = KlineChart::new(
+        let mut chart = KlineChart::new(
             layout.clone(),
             basis,
             step,
@@ -2018,6 +2133,8 @@ impl Content {
             ticker_info,
             &determined_chart_kind,
         );
+        chart.set_horizontal_levels(shared_horizontal_levels.to_vec());
+        chart.set_horizontal_level_mode(horizontal_level_mode);
 
         Content::Kline {
             chart: Some(chart),

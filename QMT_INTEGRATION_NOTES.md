@@ -98,6 +98,55 @@ This is intentionally not additive:
 
 QMT tick is cumulative data. The correct merge behavior is replacement/override, not accumulation.
 
+### 5. Order bridge contract: `quantity` not `volume`
+
+The bridge order panel API (`/api/v1/order/panel`) must return `quantity` in `OrderBookLevel`, not `volume`.
+
+- Rust `OrderBookLevel` uses strict serde: only `quantity` is accepted.
+- If the bridge sends `volume`, deserialization fails with `"Invalid server response"`.
+- This is enforced by contract tests in `exchange/src/order.rs`.
+- The canonical field spec is in `QMT_ORDER_BRIDGE_API.md`.
+
+### 6. Order panel quantity input uses lots for A-shares
+
+For SSH/SSZ venues, the order entry panel accepts quantity in **lots** (手), not shares (股).
+
+- `QMT_ORDER_LOT_SIZE = 100.0` (defined in `order_entry.rs`)
+- User enters lots → multiplied by 100 before submitting to the bridge as shares.
+- Binance venues remain in raw quantity (scale factor = 1).
+- This matches QMT convention: `1 lot = 100 shares` for A-shares.
+
+### 7. Order ladder: click quote level to submit limit order
+
+The order entry panel uses a trading-ladder layout:
+
+- Click an **Ask** level → auto-submits a **Buy Limit** order at that price.
+- Click a **Bid** level → auto-submits a **Sell Limit** order at that price.
+- The quantity input must be pre-filled; clicking a level does not prompt for quantity.
+
+### 8. Horizontal lines (rays) persist across restart
+
+User-drawn horizontal price levels are shared across all panes of the same ticker.
+
+- Stored in `Dashboard.shared_horizontal_levels: HashMap<TickerInfo, Vec<HorizontalLevel>>`.
+- On startup, `resolve_streams` re-seeds the shared map from each pane's persisted `horizontal_rays` before syncing.
+- Without this seed step, the empty shared map would overwrite persisted rays.
+
+### 9. Order entry errors are now logged
+
+Order entry task failures (snapshot fetch, submit, cancel) are logged at `ERROR` level before being converted to a UI error message.
+
+- Previously only the UI text was set; the actual `AdapterError` was discarded.
+- Now `log::error!` captures the full error in the application log file.
+
+## QMT Constants Reference
+
+| Constant | Value | Location | Purpose |
+|----------|-------|----------|---------|
+| `QMT_VOLUME_LOT_SIZE` | `100.0` | `exchange/src/adapter/qmt.rs` | Historical tick volume → shares conversion |
+| `QMT_ORDER_LOT_SIZE` | `100.0` | `src/screen/dashboard/panel/order_entry.rs` | Order input lots → shares conversion |
+| `DEFAULT_QMT_BRIDGE_BASE` | `http://127.0.0.1:8765` | `exchange/src/adapter/qmt.rs` | Default bridge URL (override with `QMT_BRIDGE_BASE` env) |
+
 ### 5. Failed historical day fetches now cool down briefly
 
 If one historical `(symbol, trading_day)` fetch fails or times out:

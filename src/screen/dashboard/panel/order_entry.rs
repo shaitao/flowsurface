@@ -1,4 +1,5 @@
 use exchange::{
+    adapter::Venue,
     TickerInfo, Trade,
     depth::Depth,
     order::{
@@ -13,12 +14,13 @@ use iced::{
 use std::time::Instant;
 
 const ORDER_ENTRY_QUOTE_LEVELS: usize = 5;
+const QMT_ORDER_LOT_SIZE: f32 = 100.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
     PriceChanged(String),
     QuantityChanged(String),
-    QuotePriceSelected(f32),
+    QuoteLimitSubmit(OrderSide, f32),
     RefreshPressed,
     SubmitPressed(OrderSide, OrderType),
     CancelPressed(String),
@@ -218,10 +220,22 @@ impl OrderEntry {
             Message::QuantityChanged(value) => {
                 self.quantity_input = value;
             }
-            Message::QuotePriceSelected(price) => {
-                self.selected_order_type = OrderType::Limit;
+            Message::QuoteLimitSubmit(side, price) => {
+                if self.is_submitting {
+                    return None;
+                }
                 self.price_input = self.format_price(Some(price));
+                self.selected_side = side;
+                self.selected_order_type = OrderType::Limit;
+
+                let Some(request) = self.build_submit_request(side, OrderType::Limit) else {
+                    return None;
+                };
+
+                self.is_submitting = true;
                 self.error_message = None;
+                self.status_message = Some(format!("Submitting {} Limit @ {}...", side, self.format_price(Some(price))));
+                return Some(Action::Submit(request));
             }
             Message::RefreshPressed => {
                 if self.is_loading_snapshot {
@@ -262,21 +276,7 @@ impl OrderEntry {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let quote_summary = row![
-            metric_box("Bid", self.format_price(self.best_bid)),
-            metric_box("Ask", self.format_price(self.best_ask)),
-            metric_box("Last", self.format_price(self.last_price)),
-        ]
-        .spacing(8);
-
-        let account_summary = row![
-            metric_box("Cash", format_optional_number(self.available_cash)),
-            metric_box("Position", format_optional_number(self.position_qty)),
-            metric_box("Available", format_optional_number(self.available_qty)),
-        ]
-        .spacing(8);
-
-        let quick_buttons = row![
+        let market_buttons = row![
             order_button(
                 "Buy Market",
                 self.selected_side == OrderSide::Buy
@@ -284,13 +284,7 @@ impl OrderEntry {
                 !self.is_submitting,
                 Some(Message::SubmitPressed(OrderSide::Buy, OrderType::Market)),
             ),
-            order_button(
-                "Buy Limit",
-                self.selected_side == OrderSide::Buy
-                    && self.selected_order_type == OrderType::Limit,
-                !self.is_submitting,
-                Some(Message::SubmitPressed(OrderSide::Buy, OrderType::Limit)),
-            ),
+            iced::widget::space::horizontal(),
             order_button(
                 "Sell Market",
                 self.selected_side == OrderSide::Sell
@@ -298,6 +292,21 @@ impl OrderEntry {
                 !self.is_submitting,
                 Some(Message::SubmitPressed(OrderSide::Sell, OrderType::Market)),
             ),
+        ];
+
+        let ask_ladder = quote_ladder_section(
+            "Asks",
+            &self.ask_levels,
+            self.ticker_info,
+            OrderSide::Buy,
+            true,
+        );
+
+        let price_row = row![
+            text_input("Price", &self.price_input)
+                .on_input(Message::PriceChanged)
+                .padding(4)
+                .width(Length::Fixed(80.0)),
             order_button(
                 "Sell Limit",
                 self.selected_side == OrderSide::Sell
@@ -306,51 +315,66 @@ impl OrderEntry {
                 Some(Message::SubmitPressed(OrderSide::Sell, OrderType::Limit)),
             ),
         ]
-        .spacing(8);
+        .spacing(4)
+        .align_y(Alignment::Center);
 
-        let controls = row![
-            text_input("Price", &self.price_input)
-                .on_input(Message::PriceChanged)
-                .padding(8),
-            text_input("Quantity", &self.quantity_input)
+        let qty_row = row![
+            text_input(self.quantity_input_placeholder(), &self.quantity_input)
                 .on_input(Message::QuantityChanged)
-                .padding(8),
+                .padding(4)
+                .width(Length::Fixed(80.0)),
+            order_button(
+                "Buy Limit",
+                self.selected_side == OrderSide::Buy
+                    && self.selected_order_type == OrderType::Limit,
+                !self.is_submitting,
+                Some(Message::SubmitPressed(OrderSide::Buy, OrderType::Limit)),
+            ),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+
+        let bid_ladder = quote_ladder_section(
+            "Bids",
+            &self.bid_levels,
+            self.ticker_info,
+            OrderSide::Sell,
+            false,
+        );
+
+        let feedback: Element<_> = if let Some(err) = &self.error_message {
+            text(format!("Error: {err}")).size(12).into()
+        } else if let Some(msg) = &self.status_message {
+            text(msg.clone()).size(12).into()
+        } else {
+            text("").size(12).into()
+        };
+
+        let account_row = row![
+            metric_box("Cash", format_optional_number(self.available_cash)),
+            metric_box("Pos", format_optional_number(self.position_qty)),
+            metric_box("Avail", format_optional_number(self.available_qty)),
             button(text(if self.is_loading_snapshot {
-                "Refreshing..."
+                "..."
             } else {
                 "Refresh"
             }))
             .width(Length::Shrink)
             .on_press_maybe((!self.is_loading_snapshot).then_some(Message::RefreshPressed)),
         ]
-        .spacing(8)
+        .spacing(4)
         .align_y(Alignment::Center);
 
-        let quote_ladder = row![
-            quote_column("Ask 5", &self.ask_levels, self.ticker_info),
-            quote_column("Bid 5", &self.bid_levels, self.ticker_info),
-        ]
-        .spacing(8);
-
-        let status_line = self
-            .status_message
-            .as_ref()
-            .map(|message| text(message.clone()).size(13));
-        let error_line = self
-            .error_message
-            .as_ref()
-            .map(|message| text(format!("Error: {message}")).size(13));
-
         let working_orders: Element<_> = if self.working_orders.is_empty() {
-            container(text("No working orders").size(13))
-                .padding(8)
+            container(text("No working orders").size(12))
+                .padding(4)
                 .width(Length::Fill)
                 .into()
         } else {
             let rows = self
                 .working_orders
                 .iter()
-                .fold(column![].spacing(6), |column, order| {
+                .fold(column![].spacing(2), |column, order| {
                     let is_cancelling =
                         self.cancelling_order_id.as_deref() == Some(order.order_id.as_str());
                     let status = if is_cancelling {
@@ -360,38 +384,30 @@ impl OrderEntry {
                     };
 
                     column.push(
-                        container(
-                            row![
-                                column![
-                                    text(format!("{} {}", order.side, order.order_type)).size(13),
-                                    text(format!(
-                                        "Px {}  Qty {}  Fill {}  {}",
-                                        self.format_price(order.price),
-                                        format_plain_number(order.quantity),
-                                        format_plain_number(order.filled_quantity),
-                                        status,
-                                    ))
-                                    .size(12),
-                                    text(order.order_id.clone()).size(11),
-                                ]
-                                .spacing(2)
-                                .width(Length::Fill),
-                                button(text(if is_cancelling {
-                                    "Cancelling..."
-                                } else {
-                                    "Cancel"
-                                }))
+                        row![
+                            text(format!(
+                                "{} {} Px:{} Qty:{} Fill:{} {}",
+                                order.side,
+                                order.order_type,
+                                self.format_price(order.price),
+                                format_plain_number(order.quantity),
+                                format_plain_number(order.filled_quantity),
+                                status,
+                            ))
+                            .size(11)
+                            .width(Length::Fill),
+                            button(text(if is_cancelling { "..." } else { "Cancel" }).size(11))
                                 .on_press_maybe(
                                     (!is_cancelling
                                         && self.cancelling_order_id.is_none()
                                         && !self.is_submitting)
-                                        .then_some(Message::CancelPressed(order.order_id.clone(),)),
+                                        .then_some(Message::CancelPressed(
+                                            order.order_id.clone(),
+                                        )),
                                 )
-                            ]
-                            .align_y(Alignment::Center)
-                            .spacing(8),
-                        )
-                        .padding(8),
+                        ]
+                        .align_y(Alignment::Center)
+                        .spacing(4),
                     )
                 });
 
@@ -399,30 +415,19 @@ impl OrderEntry {
         };
 
         let content = column![
-            quote_summary,
-            account_summary,
-            quote_ladder,
-            text("Click a quote to fill the limit price. Market buttons ignore the price field.")
-                .size(12),
-            controls,
-            quick_buttons,
-            text(format!(
-                "Min tick {}  Min qty {}",
-                f32::from(self.ticker_info.min_ticksize),
-                f32::from(self.ticker_info.min_qty)
-            ))
-            .size(12),
-            status_line
-                .map(Element::from)
-                .unwrap_or_else(|| container(text("")).into()),
-            error_line
-                .map(Element::from)
-                .unwrap_or_else(|| container(text("")).into()),
-            text("Working Orders").size(14),
+            market_buttons,
+            ask_ladder,
+            price_row,
+            qty_row,
+            text(self.quantity_hint_text()).size(11),
+            bid_ladder,
+            feedback,
+            account_row,
+            text("Working Orders").size(12),
             working_orders,
         ]
-        .spacing(10)
-        .padding(12);
+        .spacing(4)
+        .padding(6);
 
         container(content)
             .width(Length::Fill)
@@ -438,10 +443,11 @@ impl OrderEntry {
         let quantity = match parse_positive_f32(&self.quantity_input) {
             Some(value) => value,
             None => {
-                self.apply_request_error("Quantity must be a positive number".to_string());
+                self.apply_request_error(self.invalid_quantity_message());
                 return None;
             }
         };
+        let quantity = quantity * self.order_quantity_scale();
 
         let price = match order_type {
             OrderType::Limit => match parse_positive_f32(&self.price_input) {
@@ -462,6 +468,44 @@ impl OrderEntry {
             price,
             quantity,
         })
+    }
+
+    fn order_quantity_scale(&self) -> f32 {
+        match self.ticker_info.exchange().venue() {
+            Venue::SSZ | Venue::SSH => QMT_ORDER_LOT_SIZE,
+            Venue::Binance => 1.0,
+        }
+    }
+
+    fn quantity_input_placeholder(&self) -> &'static str {
+        if self.order_quantity_scale() == QMT_ORDER_LOT_SIZE {
+            "Lots"
+        } else {
+            "Quantity"
+        }
+    }
+
+    fn quantity_hint_text(&self) -> String {
+        if self.order_quantity_scale() == QMT_ORDER_LOT_SIZE {
+            format!(
+                "Min tick {}  Quantity input uses lots (1 lot = 100 shares)",
+                f32::from(self.ticker_info.min_ticksize),
+            )
+        } else {
+            format!(
+                "Min tick {}  Min qty {}",
+                f32::from(self.ticker_info.min_ticksize),
+                f32::from(self.ticker_info.min_qty)
+            )
+        }
+    }
+
+    fn invalid_quantity_message(&self) -> String {
+        if self.order_quantity_scale() == QMT_ORDER_LOT_SIZE {
+            "Quantity (lots) must be a positive number".to_string()
+        } else {
+            "Quantity must be a positive number".to_string()
+        }
     }
 
     fn format_price(&self, value: Option<f32>) -> String {
@@ -517,44 +561,58 @@ fn order_button<'a>(
 }
 
 fn metric_box<'a>(label: &'a str, value: String) -> Element<'a, Message> {
-    container(column![text(label).size(12), text(value).size(15)].spacing(4))
-        .padding(8)
+    container(column![text(label).size(11), text(value).size(13)].spacing(2))
+        .padding(4)
         .width(Length::FillPortion(1))
         .into()
 }
 
-fn quote_column<'a>(
+fn quote_ladder_section<'a>(
     label: &'a str,
     levels: &[OrderBookLevel],
     ticker_info: TickerInfo,
+    click_side: OrderSide,
+    reverse: bool,
 ) -> Element<'a, Message> {
-    let mut content = column![text(label).size(12)].spacing(6);
+    let mut rows = column![].spacing(2).width(Length::Fill);
 
     if levels.is_empty() {
-        content = content.push(container(text("—").size(13)).padding(8).width(Length::Fill));
+        rows = rows.push(
+            container(text("—").size(12))
+                .padding(4)
+                .width(Length::Fill),
+        );
     } else {
-        for level in levels {
+        let ordered: Vec<_> = if reverse {
+            levels.iter().rev().collect()
+        } else {
+            levels.iter().collect()
+        };
+        for level in ordered {
             let price = exchange::unit::Price::from_f32(level.price)
                 .round_to_min_tick(ticker_info.min_ticksize)
                 .to_string(ticker_info.min_ticksize);
             let quantity = format_plain_number(level.quantity);
 
-            content = content.push(
+            rows = rows.push(
                 button(
-                    row![text(price).size(13), text(quantity).size(12),]
-                        .spacing(8)
-                        .width(Length::Fill)
-                        .align_y(Alignment::Center),
+                    row![
+                        text(price).size(12).width(Length::FillPortion(1)),
+                        text(quantity).size(11).width(Length::FillPortion(1)),
+                    ]
+                    .spacing(6)
+                    .width(Length::Fill)
+                    .align_y(Alignment::Center),
                 )
                 .width(Length::Fill)
-                .on_press(Message::QuotePriceSelected(level.price)),
+                .on_press(Message::QuoteLimitSubmit(click_side, level.price)),
             );
         }
     }
 
-    container(content)
-        .padding(8)
-        .width(Length::FillPortion(1))
+    column![text(label).size(11), rows]
+        .spacing(2)
+        .width(Length::Fill)
         .into()
 }
 
@@ -573,4 +631,31 @@ fn format_plain_number(value: f32) -> String {
 fn parse_positive_f32(value: &str) -> Option<f32> {
     let parsed = value.trim().parse::<f32>().ok()?;
     (parsed > 0.0).then_some(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::{Ticker, adapter::Exchange};
+
+    fn qmt_order_entry() -> OrderEntry {
+        OrderEntry::new(TickerInfo::new(
+            Ticker::new("600309.SH", Exchange::SSH),
+            0.01,
+            1.0,
+            None,
+        ))
+    }
+
+    #[test]
+    fn qmt_market_order_quantity_is_scaled_from_lots_to_shares() {
+        let mut order_entry = qmt_order_entry();
+        order_entry.quantity_input = "2".to_string();
+
+        let request = order_entry
+            .build_submit_request(OrderSide::Buy, OrderType::Market)
+            .expect("market order request should be built");
+
+        assert_eq!(request.quantity, 200.0);
+    }
 }

@@ -99,3 +99,64 @@ pub struct OrderCancelResponse {
     pub status: String,
     pub message: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_panel_snapshot_accepts_quantity_field() {
+        let json = r#"
+        {
+            "symbol": "600309.SH",
+            "bestBid": 89.12,
+            "bestAsk": 89.14,
+            "lastPrice": 89.12,
+            "bids": [
+                { "price": 89.12, "quantity": 1.0 }
+            ],
+            "asks": [
+                { "price": 89.14, "quantity": 42.0 }
+            ],
+            "availableCash": 12122.71,
+            "positionQty": 1000.0,
+            "availableQty": 0.0,
+            "workingOrders": []
+        }
+        "#;
+
+        let snapshot: OrderPanelSnapshot =
+            serde_json::from_str(json).expect("bridge payload should deserialize");
+
+        assert_eq!(snapshot.bids[0].quantity, 1.0);
+        assert_eq!(snapshot.asks[0].quantity, 42.0);
+    }
+
+    #[test]
+    fn order_panel_snapshot_rejects_volume_field() {
+        let json = r#"
+        {
+            "ok": true,
+            "symbol": "600309.SH",
+            "bestBid": 89.12,
+            "bestAsk": 89.14,
+            "lastPrice": 89.12,
+            "bids": [
+                { "price": 89.12, "volume": 1.0 }
+            ],
+            "asks": [
+                { "price": 89.14, "volume": 42.0 }
+            ],
+            "availableCash": 12122.71,
+            "positionQty": 1000.0,
+            "availableQty": 0.0,
+            "workingOrders": []
+        }
+        "#;
+
+        let error = serde_json::from_str::<OrderPanelSnapshot>(json)
+            .expect_err("bridge payload with volume should be rejected");
+
+        assert!(error.to_string().contains("quantity"));
+    }
+}

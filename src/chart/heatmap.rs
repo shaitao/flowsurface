@@ -1,5 +1,6 @@
 use super::{
-    Chart, Interaction, Message, PlotConstants, TEXT_SIZE, ViewState, scale::linear::PriceInfoLabel,
+    Chart, HorizontalLevel, Interaction, Message, PlotConstants, TEXT_SIZE, ViewState,
+    scale::linear::PriceInfoLabel,
 };
 use crate::{
     modal::pane::settings::study::{self, Study},
@@ -108,6 +109,24 @@ impl Chart for HeatmapChart {
     fn is_empty(&self) -> bool {
         self.heatmap.is_empty() && self.trades.datapoints.is_empty()
     }
+
+    fn horizontal_levels(&self) -> &[HorizontalLevel] {
+        &self.horizontal_levels
+    }
+
+    fn set_horizontal_levels(&mut self, levels: Vec<HorizontalLevel>) {
+        self.horizontal_levels = levels;
+        self.invalidate(None);
+    }
+
+    fn horizontal_level_mode(&self) -> bool {
+        self.horizontal_level_mode
+    }
+
+    fn set_horizontal_level_mode(&mut self, armed: bool) {
+        self.horizontal_level_mode = armed;
+        self.invalidate(None);
+    }
 }
 
 impl PlotConstants for HeatmapChart {
@@ -150,6 +169,8 @@ pub struct HeatmapChart {
     chart: ViewState,
     trades: TimeSeries<HeatmapDataPoint>,
     indicators: EnumMap<HeatmapIndicator, Option<IndicatorData>>,
+    horizontal_levels: Vec<HorizontalLevel>,
+    horizontal_level_mode: bool,
     pause_buffer: Vec<(u64, Box<[Trade]>, Depth)>,
     pending_history_trades: BTreeMap<u64, Vec<Trade>>,
     pending_history_depths: BTreeMap<u64, Depth>,
@@ -197,6 +218,8 @@ impl HeatmapChart {
         HeatmapChart {
             chart: view_state,
             indicators,
+            horizontal_levels: vec![],
+            horizontal_level_mode: false,
             pause_buffer: vec![],
             pending_history_trades: BTreeMap::new(),
             pending_history_depths: BTreeMap::new(),
@@ -739,6 +762,38 @@ impl canvas::Program<Message> for HeatmapChart {
                 }
             };
 
+            let mut price_trace = canvas::path::Builder::new();
+            let mut has_price_trace = false;
+
+            for (time, dp) in self.trades.datapoints.range(earliest..=latest) {
+                if dp.grouped_trades.is_empty() {
+                    continue;
+                }
+
+                let point = Point::new(chart.interval_to_x(*time), chart.price_to_y(dp.last_price()));
+                if has_price_trace {
+                    price_trace.line_to(point);
+                } else {
+                    price_trace.move_to(point);
+                    has_price_trace = true;
+                }
+            }
+
+            if has_price_trace {
+                frame.stroke(
+                    &Path::new(|builder| {
+                        *builder = price_trace;
+                    }),
+                    iced::widget::canvas::Stroke::with_color(
+                        iced::widget::canvas::Stroke {
+                            width: 1.0,
+                            ..iced::widget::canvas::Stroke::default()
+                        },
+                        palette.primary.weak.color.scale_alpha(0.9),
+                    ),
+                );
+            }
+
             self.trades
                 .datapoints
                 .range(earliest..=latest)
@@ -889,6 +944,15 @@ impl canvas::Program<Message> for HeatmapChart {
                     palette.background.base.text.scale_alpha(0.4),
                 );
             }
+
+            super::draw_horizontal_levels(
+                self,
+                frame,
+                theme,
+                palette,
+                &self.horizontal_levels,
+                interaction.active_horizontal_level_id(),
+            );
         });
 
         if !self.is_empty() {
@@ -1024,16 +1088,7 @@ impl canvas::Program<Message> for HeatmapChart {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        match interaction {
-            Interaction::Panning { .. } => mouse::Interaction::Grabbing,
-            Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
-            Interaction::None | Interaction::Ruler { .. } => {
-                if cursor.is_over(bounds) {
-                    return mouse::Interaction::Crosshair;
-                }
-                mouse::Interaction::default()
-            }
-        }
+        super::chart_mouse_interaction(self, interaction, bounds, cursor)
     }
 }
 

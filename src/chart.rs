@@ -20,6 +20,7 @@ use iced::{
     Alignment, Element, Length, Point, Rectangle, Size, Theme, Vector, keyboard, mouse, padding,
     widget::{button, center, column, container, mouse_area, row, rule, text},
 };
+use uuid::Uuid;
 
 const ZOOM_SENSITIVITY: f32 = 30.0;
 const TEXT_SIZE: f32 = 12.0;
@@ -28,6 +29,7 @@ const TEXT_SIZE: f32 = 12.0;
 pub enum Interaction {
     #[default]
     None,
+    ArmedHorizontalLevel,
     Zoomin {
         last_position: Point,
     },
@@ -35,15 +37,58 @@ pub enum Interaction {
         translation: Vector,
         start: Point,
     },
+    DraggingHorizontalLevel {
+        id: Uuid,
+    },
     Ruler {
         start: Option<Point>,
     },
+}
+
+impl Interaction {
+    fn active_horizontal_level_id(&self) -> Option<Uuid> {
+        match self {
+            Interaction::DraggingHorizontalLevel { id } => Some(*id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum AxisScaleClicked {
     X,
     Y,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HorizontalLevel {
+    pub id: Uuid,
+    pub start_time: u64,
+    pub price: Price,
+}
+
+impl HorizontalLevel {
+    pub fn new(start_time: u64, price: Price) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            start_time,
+            price,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum HorizontalLevelEvent {
+    Create {
+        start_time: u64,
+        price: Price,
+    },
+    Move {
+        id: Uuid,
+        start_time: u64,
+        price: Price,
+    },
+    Delete(Uuid),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +102,16 @@ pub enum Message {
     BoundsChanged(Rectangle),
     SplitDragged(usize, f32),
     DoubleClick(AxisScaleClicked),
+    CreateHorizontalLevel {
+        start_time: u64,
+        price: Price,
+    },
+    MoveHorizontalLevel {
+        id: Uuid,
+        start_time: u64,
+        price: Price,
+    },
+    DeleteHorizontalLevel(Uuid),
 }
 
 pub trait Chart: PlotConstants + canvas::Program<Message> {
@@ -81,6 +136,231 @@ pub trait Chart: PlotConstants + canvas::Program<Message> {
     fn supports_fit_autoscaling(&self) -> bool;
 
     fn is_empty(&self) -> bool;
+
+    fn horizontal_levels(&self) -> &[HorizontalLevel];
+
+    fn set_horizontal_levels(&mut self, levels: Vec<HorizontalLevel>);
+
+    fn horizontal_level_mode(&self) -> bool;
+
+    fn set_horizontal_level_mode(&mut self, armed: bool);
+}
+
+fn cursor_chart_position(state: &ViewState, bounds: Rectangle, cursor_position: Point) -> Point {
+    let center = Point::new(bounds.width / 2.0, bounds.height / 2.0);
+    let cursor_to_center = cursor_position - center;
+
+    Point::new(
+        cursor_to_center.x / state.scaling - state.translation.x,
+        cursor_to_center.y / state.scaling - state.translation.y,
+    )
+}
+
+fn cursor_price(state: &ViewState, bounds: Rectangle, cursor_position: Point) -> Price {
+    let chart_position = cursor_chart_position(state, bounds, cursor_position);
+    let min_tick: PriceStep = state.ticker_info.min_ticksize.into();
+    state.y_to_price(chart_position.y).round_to_step(min_tick)
+}
+
+fn cursor_anchor_time<T: Chart>(chart: &T, bounds: Rectangle, cursor_position: Point) -> u64 {
+    let state = chart.state();
+    let region = state.visible_region(bounds.size());
+
+    match state.basis {
+        Basis::Time(_) => {
+            state
+                .snap_x_to_index(cursor_position.x, bounds.size(), region)
+                .0
+        }
+        Basis::Tick(_) | Basis::Volume(_) => {
+            let Some(keys) = chart.interval_keys() else {
+                return state.latest_x;
+            };
+            if keys.is_empty() {
+                return state.latest_x;
+            }
+
+            let chart_position = cursor_chart_position(state, bounds, cursor_position);
+            let reverse_index = ((-chart_position.x / state.cell_width).round().max(0.0)) as usize;
+            let reverse_index = reverse_index.min(keys.len().saturating_sub(1));
+            let forward_index = keys.len().saturating_sub(1 + reverse_index);
+            keys[forward_index]
+        }
+    }
+}
+
+fn hit_test_horizontal_level<T: Chart>(
+    chart: &T,
+    bounds: Rectangle,
+    cursor: mouse::Cursor,
+) -> Option<Uuid> {
+    let cursor_position = cursor.position_in(bounds)?;
+    let state = chart.state();
+    let cursor_chart_position = cursor_chart_position(state, bounds, cursor_position);
+    let cursor_chart_y = cursor_chart_position.y;
+    let hit_threshold = 6.0 / state.scaling.max(0.001);
+
+    chart
+        .horizontal_levels()
+        .iter()
+        .find(|level| {
+            let Some(start_x) = horizontal_level_start_x(chart, level.start_time) else {
+                return false;
+            };
+            (state.price_to_y(level.price) - cursor_chart_y).abs() <= hit_threshold
+                && cursor_chart_position.x >= start_x - hit_threshold
+        })
+        .map(|level| level.id)
+}
+
+pub(super) fn chart_mouse_interaction<T: Chart>(
+    chart: &T,
+    interaction: &Interaction,
+    bounds: Rectangle,
+    cursor: mouse::Cursor,
+) -> mouse::Interaction {
+    match interaction {
+        Interaction::Panning { .. } | Interaction::DraggingHorizontalLevel { .. } => {
+            mouse::Interaction::Grabbing
+        }
+        Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
+        Interaction::ArmedHorizontalLevel => {
+            if cursor.is_over(bounds) {
+                mouse::Interaction::Crosshair
+            } else {
+                mouse::Interaction::default()
+            }
+        }
+        Interaction::None | Interaction::Ruler { .. } => {
+            if hit_test_horizontal_level(chart, bounds, cursor).is_some() {
+                mouse::Interaction::Pointer
+            } else if chart.horizontal_level_mode() && cursor.is_over(bounds) {
+                mouse::Interaction::Crosshair
+            } else if cursor.is_over(bounds) {
+                mouse::Interaction::Crosshair
+            } else {
+                mouse::Interaction::default()
+            }
+        }
+    }
+}
+
+pub(super) fn draw_horizontal_levels(
+    chart: &impl Chart,
+    frame: &mut Frame,
+    theme: &Theme,
+    palette: &Extended,
+    levels: &[HorizontalLevel],
+    active_level: Option<Uuid>,
+) {
+    if levels.is_empty() {
+        return;
+    }
+
+    let state = chart.state();
+    let region = state.visible_region(frame.size());
+    let line_width = style::horizontal_ray_width(theme);
+    let handle_radius = style::horizontal_ray_handle_radius(theme) / state.scaling.max(0.001);
+    let text_size = 12.0 / state.scaling.max(0.001);
+    let label_padding_x = 6.0 / state.scaling.max(0.001);
+    let label_padding_y = 3.0 / state.scaling.max(0.001);
+    let label_margin = 4.0 / state.scaling.max(0.001);
+
+    for level in levels {
+        let Some(start_x_unclipped) = horizontal_level_start_x(chart, level.start_time) else {
+            continue;
+        };
+        let y = state.price_to_y(level.price);
+        if y < region.y - 12.0 || y > region.y + region.height + 12.0 {
+            continue;
+        }
+
+        let right_x = region.x + region.width;
+        if start_x_unclipped > right_x {
+            continue;
+        }
+
+        let start_x = start_x_unclipped.max(region.x);
+        let is_active = active_level == Some(level.id);
+        let line_color = if is_active {
+            palette.primary.strong.color
+        } else {
+            palette.primary.base.color.scale_alpha(0.9)
+        };
+        let label_text_color = palette.primary.base.text;
+        let label = format!("{:.*}", state.decimals, level.price.to_f32_lossy());
+        let approx_label_width =
+            text_size * 0.62 * label.chars().count() as f32 + label_padding_x * 2.0;
+        let label_height = text_size + label_padding_y * 2.0;
+        let label_x = region.x + region.width - approx_label_width - label_margin;
+        let label_y = y - label_height / 2.0;
+
+        frame.stroke(
+            &Path::line(Point::new(start_x, y), Point::new(right_x, y)),
+            Stroke::with_color(
+                Stroke {
+                    width: line_width,
+                    ..Stroke::default()
+                },
+                line_color,
+            ),
+        );
+
+        if start_x_unclipped >= region.x && start_x_unclipped <= right_x {
+            frame.fill(
+                &Path::circle(Point::new(start_x_unclipped, y), handle_radius),
+                palette.background.weakest.color,
+            );
+            frame.stroke(
+                &Path::circle(Point::new(start_x_unclipped, y), handle_radius),
+                Stroke::with_color(
+                    Stroke {
+                        width: line_width,
+                        ..Stroke::default()
+                    },
+                    line_color,
+                ),
+            );
+        }
+
+        frame.fill_rectangle(
+            Point::new(label_x, label_y),
+            Size::new(approx_label_width, label_height),
+            line_color,
+        );
+
+        frame.fill_text(canvas::Text {
+            content: label,
+            position: Point::new(label_x + label_padding_x, y),
+            size: iced::Pixels(text_size),
+            color: label_text_color,
+            font: style::AZERET_MONO,
+            align_y: Alignment::Center.into(),
+            ..canvas::Text::default()
+        });
+    }
+}
+
+fn horizontal_level_start_x<T: Chart>(chart: &T, start_time: u64) -> Option<f32> {
+    let state = chart.state();
+
+    match state.basis {
+        Basis::Time(_) => Some(state.interval_to_x(start_time)),
+        Basis::Tick(_) | Basis::Volume(_) => {
+            let keys = chart.interval_keys()?;
+            if keys.is_empty() {
+                return None;
+            }
+
+            let mut forward_index = keys.partition_point(|timestamp| *timestamp < start_time);
+            if forward_index >= keys.len() {
+                forward_index = keys.len().saturating_sub(1);
+            }
+
+            let reverse_index = keys.len().saturating_sub(1 + forward_index);
+            Some(state.interval_to_x(reverse_index as u64))
+        }
+    }
 }
 
 fn canvas_interaction<T: Chart>(
@@ -99,7 +379,9 @@ fn canvas_interaction<T: Chart>(
 
     if let Event::Mouse(mouse::Event::ButtonReleased(_)) = event {
         match interaction {
-            Interaction::Panning { .. } | Interaction::Zoomin { .. } => {
+            Interaction::Panning { .. }
+            | Interaction::Zoomin { .. }
+            | Interaction::DraggingHorizontalLevel { .. } => {
                 *interaction = Interaction::None;
             }
             _ => {}
@@ -120,25 +402,73 @@ fn canvas_interaction<T: Chart>(
                 mouse::Event::ButtonPressed(button) => {
                     let cursor_in_bounds = cursor_position?;
 
-                    if let mouse::Button::Left = button {
-                        match interaction {
-                            Interaction::None
-                            | Interaction::Panning { .. }
-                            | Interaction::Zoomin { .. } => {
-                                *interaction = Interaction::Panning {
-                                    translation: state.translation,
-                                    start: cursor_in_bounds,
-                                };
+                    match button {
+                        mouse::Button::Left => {
+                            if let Some(id) = hit_test_horizontal_level(chart, bounds, cursor) {
+                                *interaction = Interaction::DraggingHorizontalLevel { id };
+                                return Some(canvas::Action::request_redraw().and_capture());
                             }
-                            Interaction::Ruler { start } if start.is_none() => {
-                                *interaction = Interaction::Ruler {
-                                    start: Some(cursor_in_bounds),
-                                };
-                            }
-                            Interaction::Ruler { .. } => {
-                                *interaction = Interaction::None;
+
+                            match interaction {
+                                Interaction::ArmedHorizontalLevel => {
+                                    let price = cursor_price(state, bounds, cursor_in_bounds);
+                                    let start_time =
+                                        cursor_anchor_time(chart, bounds, cursor_in_bounds);
+                                    *interaction = Interaction::None;
+                                    return Some(
+                                        canvas::Action::publish(Message::CreateHorizontalLevel {
+                                            start_time,
+                                            price,
+                                        })
+                                        .and_capture(),
+                                    );
+                                }
+                                Interaction::None
+                                | Interaction::Panning { .. }
+                                | Interaction::Zoomin { .. }
+                                    if chart.horizontal_level_mode() =>
+                                {
+                                    let price = cursor_price(state, bounds, cursor_in_bounds);
+                                    let start_time =
+                                        cursor_anchor_time(chart, bounds, cursor_in_bounds);
+                                    return Some(
+                                        canvas::Action::publish(Message::CreateHorizontalLevel {
+                                            start_time,
+                                            price,
+                                        })
+                                        .and_capture(),
+                                    );
+                                }
+                                Interaction::None
+                                | Interaction::Panning { .. }
+                                | Interaction::Zoomin { .. } => {
+                                    *interaction = Interaction::Panning {
+                                        translation: state.translation,
+                                        start: cursor_in_bounds,
+                                    };
+                                }
+                                Interaction::DraggingHorizontalLevel { .. } => {
+                                    *interaction = Interaction::None;
+                                }
+                                Interaction::Ruler { start } if start.is_none() => {
+                                    *interaction = Interaction::Ruler {
+                                        start: Some(cursor_in_bounds),
+                                    };
+                                }
+                                Interaction::Ruler { .. } => {
+                                    *interaction = Interaction::None;
+                                }
                             }
                         }
+                        mouse::Button::Right => {
+                            if let Some(id) = hit_test_horizontal_level(chart, bounds, cursor) {
+                                return Some(
+                                    canvas::Action::publish(Message::DeleteHorizontalLevel(id))
+                                        .and_capture(),
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                     Some(canvas::Action::request_redraw().and_capture())
                 }
@@ -150,7 +480,22 @@ fn canvas_interaction<T: Chart>(
                         );
                         Some(canvas::Action::publish(msg).and_capture())
                     }
-                    Interaction::None | Interaction::Ruler { .. } => {
+                    Interaction::DraggingHorizontalLevel { id } => {
+                        let cursor_in_bounds = cursor_position?;
+                        let price = cursor_price(state, bounds, cursor_in_bounds);
+                        let start_time = cursor_anchor_time(chart, bounds, cursor_in_bounds);
+                        Some(
+                            canvas::Action::publish(Message::MoveHorizontalLevel {
+                                id,
+                                start_time,
+                                price,
+                            })
+                            .and_capture(),
+                        )
+                    }
+                    Interaction::None
+                    | Interaction::ArmedHorizontalLevel
+                    | Interaction::Ruler { .. } => {
                         Some(canvas::Action::publish(Message::CrosshairMoved))
                     }
                     _ => None,
@@ -260,7 +605,20 @@ fn canvas_interaction<T: Chart>(
                         *interaction = Interaction::Ruler { start: None };
                         Some(canvas::Action::request_redraw().and_capture())
                     }
+                    keyboard::Key::Named(keyboard::key::Named::Alt) => {
+                        *interaction = Interaction::ArmedHorizontalLevel;
+                        Some(canvas::Action::request_redraw().and_capture())
+                    }
                     keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                        *interaction = Interaction::None;
+                        Some(canvas::Action::request_redraw().and_capture())
+                    }
+                    _ => None,
+                },
+                iced::keyboard::Event::KeyReleased { key, .. } => match key.as_ref() {
+                    keyboard::Key::Named(keyboard::key::Named::Alt)
+                        if matches!(interaction, Interaction::ArmedHorizontalLevel) =>
+                    {
                         *interaction = Interaction::None;
                         Some(canvas::Action::request_redraw().and_capture())
                     }
@@ -485,6 +843,9 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
                 *split = (size * 100.0).round() / 100.0;
             }
         }
+        Message::CreateHorizontalLevel { .. }
+        | Message::MoveHorizontalLevel { .. }
+        | Message::DeleteHorizontalLevel(_) => return,
         Message::CrosshairMoved => return chart.invalidate_crosshair(),
     }
     chart.invalidate_all();

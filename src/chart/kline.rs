@@ -1,6 +1,6 @@
 use super::{
-    Action, Basis, Chart, Interaction, Message, PlotConstants, PlotData, TEXT_SIZE, ViewState,
-    indicator, request_fetch, scale::linear::PriceInfoLabel,
+    Action, Basis, Chart, HorizontalLevel, Interaction, Message, PlotConstants, PlotData,
+    TEXT_SIZE, ViewState, indicator, request_fetch, scale::linear::PriceInfoLabel,
 };
 use crate::chart::indicator::kline::KlineIndicatorImpl;
 use crate::connector::fetcher::{FetchRange, RequestHandler, is_trade_fetch_enabled};
@@ -157,6 +157,24 @@ impl Chart for KlineChart {
             PlotData::TickBased(tick_aggr) => tick_aggr.datapoints.is_empty(),
         }
     }
+
+    fn horizontal_levels(&self) -> &[HorizontalLevel] {
+        &self.horizontal_levels
+    }
+
+    fn set_horizontal_levels(&mut self, levels: Vec<HorizontalLevel>) {
+        self.horizontal_levels = levels;
+        self.invalidate(None);
+    }
+
+    fn horizontal_level_mode(&self) -> bool {
+        self.horizontal_level_mode
+    }
+
+    fn set_horizontal_level_mode(&mut self, armed: bool) {
+        self.horizontal_level_mode = armed;
+        self.invalidate(None);
+    }
 }
 
 impl PlotConstants for KlineChart {
@@ -194,6 +212,8 @@ pub struct KlineChart {
     data_source: PlotData<KlineDataPoint>,
     raw_trades: Vec<Trade>,
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
+    horizontal_levels: Vec<HorizontalLevel>,
+    horizontal_level_mode: bool,
     fetching_trades: (bool, Option<Handle>),
     pub(crate) kind: KlineChartKind,
     request_handler: RequestHandler,
@@ -348,6 +368,8 @@ impl KlineChart {
                     data_source,
                     raw_trades,
                     indicators,
+                    horizontal_levels: vec![],
+                    horizontal_level_mode: false,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
                     kind: kind.clone(),
@@ -412,6 +434,8 @@ impl KlineChart {
                     data_source,
                     raw_trades,
                     indicators,
+                    horizontal_levels: vec![],
+                    horizontal_level_mode: false,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
                     kind: kind.clone(),
@@ -1289,6 +1313,15 @@ impl canvas::Program<Message> for KlineChart {
                 }
             }
 
+            super::draw_horizontal_levels(
+                self,
+                frame,
+                theme,
+                palette,
+                &self.horizontal_levels,
+                interaction.active_horizontal_level_id(),
+            );
+
             chart.draw_last_price_line(frame, palette, region);
         });
 
@@ -1316,17 +1349,7 @@ impl canvas::Program<Message> for KlineChart {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        match interaction {
-            Interaction::Panning { .. } => mouse::Interaction::Grabbing,
-            Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
-            Interaction::None | Interaction::Ruler { .. } => {
-                if cursor.is_over(bounds) {
-                    mouse::Interaction::Crosshair
-                } else {
-                    mouse::Interaction::default()
-                }
-            }
-        }
+        super::chart_mouse_interaction(self, interaction, bounds, cursor)
     }
 }
 
