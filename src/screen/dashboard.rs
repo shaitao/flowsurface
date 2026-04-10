@@ -1135,7 +1135,7 @@ impl Dashboard {
                 tickers_table,
             )
         })
-        .min_size(240)
+        .min_size(168)
         .on_click(pane::Message::PaneClicked)
         .on_drag(pane::Message::PaneDragged)
         .on_resize(8, pane::Message::PaneResized)

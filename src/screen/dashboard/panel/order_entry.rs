@@ -23,6 +23,7 @@ pub enum Message {
     QuoteLimitSubmit(OrderSide, f32),
     RefreshPressed,
     SubmitPressed(OrderSide, OrderType),
+    FlattenPressed,
     CancelPressed(String),
 }
 
@@ -261,6 +262,28 @@ impl OrderEntry {
                 self.status_message = Some(format!("Submitting {} {}...", side, order_type));
                 return Some(Action::Submit(request));
             }
+            Message::FlattenPressed => {
+                if self.is_submitting {
+                    return None;
+                }
+                let quantity = match self.available_qty {
+                    Some(qty) if qty > 0.0 => qty,
+                    _ => {
+                        self.apply_request_error("No available position to flatten".to_string());
+                        return None;
+                    }
+                };
+                let request = OrderSubmitRequest {
+                    side: OrderSide::Sell,
+                    order_type: OrderType::Market,
+                    price: None,
+                    quantity,
+                };
+                self.is_submitting = true;
+                self.error_message = None;
+                self.status_message = Some(format!("Flattening: Sell Market {quantity} shares..."));
+                return Some(Action::Submit(request));
+            }
             Message::CancelPressed(order_id) => {
                 if self.cancelling_order_id.is_some() {
                     return None;
@@ -314,6 +337,11 @@ impl OrderEntry {
                 !self.is_submitting,
                 Some(Message::SubmitPressed(OrderSide::Sell, OrderType::Limit)),
             ),
+            button(text("Flatten").size(12))
+                .on_press_maybe(
+                    (!self.is_submitting && self.available_qty.is_some_and(|q| q > 0.0))
+                        .then_some(Message::FlattenPressed),
+                ),
         ]
         .spacing(4)
         .align_y(Alignment::Center);
