@@ -408,7 +408,7 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
 
                         state.interval_to_x(cursor_time)
                     }
-                    Basis::Tick(_) => {
+                    Basis::Tick(_) | Basis::Volume(_) => {
                         let tick_index = cursor_chart_x / state.cell_width;
                         state.cell_width = new_width;
 
@@ -723,13 +723,13 @@ impl ViewState {
                 self.ticker_info.exchange().venue(),
                 timeframe,
             ),
-            Basis::Tick(_) => false,
+            Basis::Tick(_) | Basis::Volume(_) => false,
         }
     }
 
     fn interval_range(&self, region: &Rectangle) -> (u64, u64) {
         match self.basis {
-            Basis::Tick(_) => (
+            Basis::Tick(_) | Basis::Volume(_) => (
                 self.x_to_interval(region.x + region.width),
                 self.x_to_interval(region.x),
             ),
@@ -794,7 +794,7 @@ impl ViewState {
                 let diff = value as f64 - self.latest_x as f64;
                 (diff / interval * cell_width) as f32
             }
-            Basis::Tick(_) => -((value as f32) * self.cell_width),
+            Basis::Tick(_) | Basis::Volume(_) => -((value as f32) * self.cell_width),
         }
     }
 
@@ -822,7 +822,7 @@ impl ViewState {
                     self.latest_x.saturating_add(diff)
                 }
             }
-            Basis::Tick(_) => {
+            Basis::Tick(_) | Basis::Volume(_) => {
                 let tick = -(x / self.cell_width);
                 tick.round() as u64
             }
@@ -919,12 +919,13 @@ impl ViewState {
                     };
                     data::util::format_duration_ms(diff_ms)
                 }
-                Basis::Tick(_) => {
+                Basis::Tick(_) | Basis::Volume(_) => {
                     let (tick1, _) = self.snap_x_to_index(p1.x, bounds, region);
                     let (tick2, _) = self.snap_x_to_index(p2.x, bounds, region);
 
                     let tick_diff = tick1.abs_diff(tick2);
-                    format!("{} ticks", tick_diff)
+                    let unit = self.basis.trade_axis_label().unwrap_or("units");
+                    format!("{} {}", tick_diff, unit)
                 }
             };
 
@@ -988,12 +989,13 @@ impl ViewState {
                     };
                     format!("{} bars", datapoints)
                 }
-                Basis::Tick(aggregation) => {
+                Basis::Tick(_) | Basis::Volume(_) => {
                     let (tick1, _) = self.snap_x_to_index(p1.x, bounds, region);
                     let (tick2, _) = self.snap_x_to_index(p2.x, bounds, region);
 
                     let tick_diff = tick1.abs_diff(tick2);
-                    let datapoints = (tick_diff / u64::from(aggregation.0)).max(1);
+                    let datapoints =
+                        (tick_diff / self.basis.trade_x_axis_step().unwrap_or(1)).max(1);
                     format!("{} bars", datapoints)
                 }
             };
@@ -1085,7 +1087,7 @@ impl ViewState {
                 );
                 (rounded_price, rounded_timestamp)
             }
-            Basis::Tick(aggregation) => {
+            Basis::Tick(_) | Basis::Volume(_) => {
                 let (chart_x_min, chart_x_max) = (region.x, region.x + region.width);
                 let crosshair_pos = chart_x_min + (cursor_position.x / bounds.width) * region.width;
 
@@ -1094,7 +1096,8 @@ impl ViewState {
                 let snapped_crosshair = cell_index * self.cell_width;
                 let snap_ratio = (snapped_crosshair - chart_x_min) / (chart_x_max - chart_x_min);
 
-                let rounded_tick = (-cell_index as u64) * (u64::from(aggregation.0));
+                let rounded_tick =
+                    (-cell_index as u64) * self.basis.trade_x_axis_step().unwrap_or(1);
 
                 frame.stroke(
                     &Path::line(
@@ -1201,7 +1204,7 @@ impl ViewState {
 
                 (rounded_timestamp, snap_ratio)
             }
-            Basis::Tick(aggregation) => {
+            Basis::Tick(_) | Basis::Volume(_) => {
                 let (chart_x_min, chart_x_max) = (region.x, region.x + region.width);
                 let chart_x = chart_x_min + x_ratio * (chart_x_max - chart_x_min);
 
@@ -1214,7 +1217,8 @@ impl ViewState {
                     0.5
                 };
 
-                let rounded_tick = (-cell_index as u64) * u64::from(aggregation.0);
+                let rounded_tick =
+                    (-cell_index as u64) * self.basis.trade_x_axis_step().unwrap_or(1);
 
                 (rounded_tick, snap_ratio)
             }

@@ -92,9 +92,10 @@ pub enum AnySeries<'a, Y> {
 
 impl<'a, Y> AnySeries<'a, Y> {
     pub fn for_basis(basis: Basis, data: &'a BTreeMap<u64, Y>) -> Self {
-        match basis {
-            Basis::Tick(_) => Self::Reversed(ReversedBTreeSeries::new(data)),
-            Basis::Time(_) => Self::Forward(data),
+        if basis.is_trade_based() {
+            Self::Reversed(ReversedBTreeSeries::new(data))
+        } else {
+            Self::Forward(data)
         }
     }
 }
@@ -288,7 +289,7 @@ where
                         };
                         (rx, sr)
                     }
-                    Basis::Tick(_) => {
+                    Basis::Tick(_) | Basis::Volume(_) => {
                         let world_x = region.x + (cursor_position.x / bounds.width) * region.width;
                         let snapped_world_x = (world_x / ctx.cell_width).round() * ctx.cell_width;
 

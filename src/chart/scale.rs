@@ -244,6 +244,30 @@ impl AxisLabelsX<'_> {
         bounds.shrink(AXIS_DRAG_EDGE_GUARD)
     }
 
+    fn trade_axis_span_ms(&self) -> Option<u64> {
+        let interval_keys = self.interval_keys.as_ref()?;
+        let first = *interval_keys.first()?;
+        let last = *interval_keys.last()?;
+        Some(last.abs_diff(first))
+    }
+
+    fn format_trade_axis_label(&self, timestamp: u64) -> Option<String> {
+        let visible_span_ms = self.trade_axis_span_ms().unwrap_or_default();
+        let label_kind = if visible_span_ms >= timeseries::ONE_DAY_MS {
+            TimeLabelKind::Custom("%m-%d %H:%M")
+        } else if visible_span_ms < 10 * 60 * 1000 {
+            TimeLabelKind::Axis {
+                timeframe: exchange::Timeframe::MS1000,
+            }
+        } else {
+            TimeLabelKind::Axis {
+                timeframe: exchange::Timeframe::M1,
+            }
+        };
+
+        self.timezone.format_with_kind(timestamp as i64, label_kind)
+    }
+
     fn calc_crosshair_pos(&self, cursor_pos: Point, region: Rectangle) -> (f32, f32, i32) {
         let crosshair_ratio = f64::from(cursor_pos.x) / f64::from(self.chart_bounds.width);
         let chart_x_min = region.x;
@@ -259,7 +283,7 @@ impl AxisLabelsX<'_> {
                 self.ticker_info.exchange().venue(),
                 timeframe,
             ),
-            Basis::Tick(_) => false,
+            Basis::Tick(_) | Basis::Volume(_) => false,
         }
     }
 
@@ -271,7 +295,7 @@ impl AxisLabelsX<'_> {
         palette: &Extended,
     ) -> Option<AxisLabel> {
         match self.basis {
-            Basis::Tick(_) => {
+            Basis::Tick(_) | Basis::Volume(_) => {
                 let Some(interval_keys) = &self.interval_keys else {
                     return None;
                 };
@@ -425,7 +449,7 @@ impl AxisLabelsX<'_> {
                     self.max.saturating_add(diff)
                 }
             }
-            Basis::Tick(_) => {
+            Basis::Tick(_) | Basis::Volume(_) => {
                 let tick = -(x / self.cell_width);
                 tick.round() as u64
             }
@@ -532,7 +556,7 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
             let mut labels: Vec<AxisLabel> = Vec::with_capacity(label_count + 1); // +1 for crosshair
 
             match self.basis {
-                Basis::Tick(_) => {
+                Basis::Tick(_) | Basis::Volume(_) => {
                     if let Some(interval_keys) = &self.interval_keys {
                         let last_idx = interval_keys.len() - 1;
                         let mut last_x: Option<f32> = None;
@@ -550,12 +574,7 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                             let snap_x = snap_ratio * bounds.width;
 
                             if last_x.is_none_or(|lx| (snap_x - lx).abs() >= target_spacing) {
-                                let label_content = self.timezone.format_with_kind(
-                                    *timestamp as i64,
-                                    TimeLabelKind::Axis {
-                                        timeframe: exchange::Timeframe::MS100,
-                                    },
-                                );
+                                let label_content = self.format_trade_axis_label(*timestamp);
 
                                 if let Some(content) = label_content {
                                     labels.push(AxisLabel::new_x(
@@ -833,7 +852,7 @@ impl canvas::Program<Message> for AxisLabelsY<'_> {
                             None
                         }
                     }
-                    Basis::Tick(_) => None,
+                    Basis::Tick(_) | Basis::Volume(_) => None,
                 };
 
                 let (price, color) = label.get_with_color(palette);

@@ -27,6 +27,7 @@ pub enum FetchedData {
     Trades {
         batch: Vec<Trade>,
         until_time: u64,
+        req_id: Option<uuid::Uuid>,
     },
     KlinesAndTrades {
         klines: Vec<Kline>,
@@ -331,6 +332,7 @@ pub fn request_fetch(
                             let data = FetchedData::Trades {
                                 batch,
                                 until_time: to_time,
+                                req_id: Some(req_id),
                             };
 
                             FetchUpdate::Data {
@@ -349,7 +351,7 @@ pub fn request_fetch(
                                 log::error!("Trade fetch failed: {err}");
                                 FetchUpdate::Error {
                                     pane_id,
-                                    req_id: None,
+                                    req_id: Some(req_id),
                                     stream: Some(stream),
                                     error: err.ui_message(),
                                 }
@@ -379,6 +381,7 @@ pub fn request_fetch(
                                 let data = FetchedData::Trades {
                                     batch,
                                     until_time: completed_until_time,
+                                    req_id: Some(req_id),
                                 };
                                 FetchUpdate::Data {
                                     layout_id,
@@ -389,7 +392,7 @@ pub fn request_fetch(
                             }
                             Err(err) => FetchUpdate::Error {
                                 pane_id,
-                                req_id: None,
+                                req_id: Some(req_id),
                                 stream: Some(stream),
                                 error: err,
                             },

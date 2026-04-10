@@ -333,7 +333,7 @@ impl State {
 
                         if let Some(tf) = derived_plan.basis.and_then(|basis| match basis {
                             Basis::Time(tf) => Some(tf),
-                            Basis::Tick(_) => None,
+                            Basis::Tick(_) | Basis::Volume(_) => None,
                         }) && supports(tf)
                         {
                             tf
@@ -1336,7 +1336,7 @@ impl State {
                                                 Basis::Time(tf) => {
                                                     *push_freq = exchange::PushFrequency::Custom(tf)
                                                 }
-                                                Basis::Tick(_) => {
+                                                Basis::Tick(_) | Basis::Volume(_) => {
                                                     *push_freq =
                                                         exchange::PushFrequency::ServerDefault
                                                 }
@@ -1392,7 +1392,7 @@ impl State {
                                                         effect = Some(Effect::RequestFetch(fetch));
                                                     }
                                                 }
-                                                Basis::Tick(_) => {
+                                                Basis::Tick(_) | Basis::Volume(_) => {
                                                     let depth_aggr = if base_ticker
                                                         .exchange()
                                                         .is_depth_client_aggr()
@@ -2412,6 +2412,6 @@ fn by_basis_default<T>(
 ) -> T {
     match basis.unwrap_or(Basis::Time(default_tf)) {
         Basis::Time(tf) => on_time(tf),
-        Basis::Tick(_) => on_tick(),
+        Basis::Tick(_) | Basis::Volume(_) => on_tick(),
     }
 }

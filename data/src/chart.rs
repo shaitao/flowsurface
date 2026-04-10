@@ -69,11 +69,41 @@ pub enum Basis {
     ///
     /// The u16 value represents the number of trades per aggregation unit.
     Tick(aggr::TickCount),
+
+    /// Trade-based aggregation where each datapoint represents a fixed traded quantity.
+    ///
+    /// The integer value is measured in the raw trade `qty` units carried by the stream.
+    Volume(aggr::VolumeThreshold),
 }
 
 impl Basis {
     pub fn is_time(&self) -> bool {
         matches!(self, Basis::Time(_))
+    }
+
+    pub fn is_trade_based(&self) -> bool {
+        matches!(self, Basis::Tick(_) | Basis::Volume(_))
+    }
+
+    pub fn trade_aggregation(&self) -> Option<aggr::TradeAggregation> {
+        match self {
+            Basis::Tick(count) => Some(aggr::TradeAggregation::Tick(*count)),
+            Basis::Volume(threshold) => Some(aggr::TradeAggregation::Volume(*threshold)),
+            Basis::Time(_) => None,
+        }
+    }
+
+    pub fn trade_x_axis_step(&self) -> Option<u64> {
+        self.trade_aggregation()
+            .map(aggr::TradeAggregation::x_axis_step)
+    }
+
+    pub fn trade_axis_label(&self) -> Option<&'static str> {
+        match self {
+            Basis::Tick(_) => Some("ticks"),
+            Basis::Volume(_) => Some("lots"),
+            Basis::Time(_) => None,
+        }
     }
 
     pub fn default_kline_time(
@@ -118,6 +148,7 @@ impl std::fmt::Display for Basis {
         match self {
             Basis::Time(timeframe) => write!(f, "{timeframe}"),
             Basis::Tick(count) => write!(f, "{count}"),
+            Basis::Volume(threshold) => write!(f, "{threshold}"),
         }
     }
 }

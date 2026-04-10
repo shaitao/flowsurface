@@ -780,9 +780,9 @@ pub mod study {
         ) -> Element<'a, Message<Self>> {
             let interval_ms = match basis {
                 data::chart::Basis::Time(interval) => interval.to_milliseconds(),
-                data::chart::Basis::Tick(_) => {
+                data::chart::Basis::Tick(_) | data::chart::Basis::Volume(_) => {
                     return iced::widget::center(text(
-                        "Heatmap studies are not supported for tick-based charts",
+                        "Heatmap studies are not supported for trade-based charts",
                     ))
                     .into();
                 }

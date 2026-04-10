@@ -79,6 +79,75 @@ pub(super) fn qmt_session_bounds(venue: Venue, day: NaiveDate) -> Option<[(u64, 
     ])
 }
 
+fn qmt_effective_trading_timestamp(
+    venue: Venue,
+    timestamp_ms: u64,
+) -> Option<(NaiveDate, [(u64, u64); 2], u64)> {
+    let dt = china_datetime(timestamp_ms)?;
+    let day = dt.date_naive();
+    if !is_qmt_trading_day(venue, day) {
+        return None;
+    }
+
+    let sessions = qmt_session_bounds(venue, day)?;
+    let final_session_end = sessions.last().map(|(_, session_end)| *session_end)?;
+    let mut effective_ts = timestamp_ms;
+    if final_session_end <= timestamp_ms
+        && timestamp_ms <= final_session_end.saturating_add(QMT_CLOSE_BUCKET_GRACE_MS)
+    {
+        effective_ts = final_session_end.saturating_sub(1);
+    }
+
+    Some((day, sessions, effective_ts))
+}
+
+fn qmt_total_trading_ms(venue: Venue, day: NaiveDate) -> Option<u64> {
+    let sessions = qmt_session_bounds(venue, day)?;
+    Some(
+        sessions
+            .into_iter()
+            .map(|(session_start, session_end)| session_end.saturating_sub(session_start))
+            .sum(),
+    )
+}
+
+fn qmt_trading_elapsed_ms(venue: Venue, timestamp_ms: u64) -> Option<(NaiveDate, u64)> {
+    let (day, sessions, effective_ts) = qmt_effective_trading_timestamp(venue, timestamp_ms)?;
+    let mut elapsed_ms = 0_u64;
+
+    for (session_start, session_end) in sessions {
+        if session_start <= effective_ts && effective_ts < session_end {
+            return Some((day, elapsed_ms + (effective_ts - session_start)));
+        }
+        elapsed_ms = elapsed_ms.saturating_add(session_end.saturating_sub(session_start));
+    }
+
+    None
+}
+
+fn qmt_timestamp_at_trading_elapsed(venue: Venue, day: NaiveDate, elapsed_ms: u64) -> Option<u64> {
+    let sessions = qmt_session_bounds(venue, day)?;
+    let mut remaining = elapsed_ms;
+
+    for (index, (session_start, session_end)) in sessions.iter().copied().enumerate() {
+        let session_len = session_end.saturating_sub(session_start);
+        if remaining < session_len {
+            return Some(session_start + remaining);
+        }
+
+        if remaining == session_len {
+            return sessions
+                .get(index + 1)
+                .map(|(next_start, _)| *next_start)
+                .or(Some(session_end));
+        }
+
+        remaining = remaining.saturating_sub(session_len);
+    }
+
+    None
+}
+
 pub(super) fn qmt_bucket_start(
     venue: Venue,
     timestamp_ms: u64,
@@ -98,24 +167,9 @@ pub(super) fn qmt_bucket_start(
     }
 
     let interval_ms = qmt_timeframe_ms(timeframe)?;
-    let sessions = qmt_session_bounds(venue, dt.date_naive())?;
-    let final_session_end = sessions.last().map(|(_, session_end)| *session_end)?;
-    let mut effective_ts = timestamp_ms;
-    if final_session_end <= timestamp_ms
-        && timestamp_ms <= final_session_end.saturating_add(QMT_CLOSE_BUCKET_GRACE_MS)
-    {
-        effective_ts = final_session_end.saturating_sub(1);
-    }
-
-    for (session_start, session_end) in sessions {
-        if session_start <= effective_ts && effective_ts < session_end {
-            return Some(
-                session_start + ((effective_ts - session_start) / interval_ms) * interval_ms,
-            );
-        }
-    }
-
-    None
+    let (day, elapsed_ms) = qmt_trading_elapsed_ms(venue, timestamp_ms)?;
+    let bucket_elapsed = (elapsed_ms / interval_ms) * interval_ms;
+    qmt_timestamp_at_trading_elapsed(venue, day, bucket_elapsed)
 }
 
 pub fn is_trading_bucket_start(venue: Venue, timestamp_ms: u64, timeframe: Timeframe) -> bool {
@@ -153,32 +207,17 @@ fn qmt_gapless_axis_bucket_start(
     }
 
     let interval_ms = qmt_gapless_axis_timeframe_ms(timeframe)?;
-    let sessions = qmt_session_bounds(venue, dt.date_naive())?;
-    let final_session_end = sessions.last().map(|(_, session_end)| *session_end)?;
-    let mut effective_ts = timestamp_ms;
-    if final_session_end <= timestamp_ms
-        && timestamp_ms <= final_session_end.saturating_add(QMT_CLOSE_BUCKET_GRACE_MS)
-    {
-        effective_ts = final_session_end.saturating_sub(1);
-    }
-
-    for (session_start, session_end) in sessions {
-        if session_start <= effective_ts && effective_ts < session_end {
-            return Some(
-                session_start + ((effective_ts - session_start) / interval_ms) * interval_ms,
-            );
-        }
-    }
-
-    None
+    let (day, elapsed_ms) = qmt_trading_elapsed_ms(venue, timestamp_ms)?;
+    let bucket_elapsed = (elapsed_ms / interval_ms) * interval_ms;
+    qmt_timestamp_at_trading_elapsed(venue, day, bucket_elapsed)
 }
 
-fn qmt_session_bucket_count(session_start: u64, session_end: u64, interval_ms: u64) -> u64 {
-    if interval_ms == 0 || session_end <= session_start {
+fn qmt_trading_bucket_count(total_trading_ms: u64, interval_ms: u64) -> u64 {
+    if interval_ms == 0 || total_trading_ms == 0 {
         return 0;
     }
 
-    (session_end - session_start).div_ceil(interval_ms)
+    total_trading_ms.div_ceil(interval_ms)
 }
 
 fn qmt_gapless_axis_buckets_per_day(
@@ -191,13 +230,8 @@ fn qmt_gapless_axis_buckets_per_day(
     }
 
     let interval_ms = qmt_gapless_axis_timeframe_ms(timeframe)?;
-    let sessions = qmt_session_bounds(venue, day)?;
-    let buckets = sessions
-        .into_iter()
-        .map(|(session_start, session_end)| {
-            qmt_session_bucket_count(session_start, session_end, interval_ms)
-        })
-        .sum::<u64>();
+    let total_trading_ms = qmt_total_trading_ms(venue, day)?;
+    let buckets = qmt_trading_bucket_count(total_trading_ms, interval_ms);
 
     i64::try_from(buckets).ok()
 }
@@ -207,34 +241,14 @@ fn qmt_gapless_axis_bucket_position(
     timestamp_ms: u64,
     timeframe: Timeframe,
 ) -> Option<(NaiveDate, usize)> {
-    let day = china_trading_day(timestamp_ms)?;
-    let bucket = qmt_gapless_axis_bucket_start(venue, timestamp_ms, timeframe)?;
-
     if timeframe == Timeframe::D1 {
+        let day = china_trading_day(timestamp_ms)?;
         return Some((day, 0));
     }
 
     let interval_ms = qmt_gapless_axis_timeframe_ms(timeframe)?;
-    let sessions = qmt_session_bounds(venue, day)?;
-    let mut bucket_index = 0usize;
-
-    for (session_start, session_end) in sessions {
-        let session_bucket_count = usize::try_from(qmt_session_bucket_count(
-            session_start,
-            session_end,
-            interval_ms,
-        ))
-        .ok()?;
-
-        if session_start <= bucket && bucket < session_end {
-            let offset_in_session = usize::try_from((bucket - session_start) / interval_ms).ok()?;
-            return Some((day, bucket_index + offset_in_session));
-        }
-
-        bucket_index = bucket_index.saturating_add(session_bucket_count);
-    }
-
-    None
+    let (day, elapsed_ms) = qmt_trading_elapsed_ms(venue, timestamp_ms)?;
+    Some((day, usize::try_from(elapsed_ms / interval_ms).ok()?))
 }
 
 fn qmt_gapless_axis_bucket_at_index(
@@ -256,19 +270,15 @@ fn qmt_gapless_axis_bucket_at_index(
     }
 
     let interval_ms = qmt_gapless_axis_timeframe_ms(timeframe)?;
-    let sessions = qmt_session_bounds(venue, day)?;
-    let mut remaining = u64::try_from(bucket_index).ok()?;
-
-    for (session_start, session_end) in sessions {
-        let session_bucket_count =
-            qmt_session_bucket_count(session_start, session_end, interval_ms);
-        if remaining < session_bucket_count {
-            return Some(session_start + remaining * interval_ms);
-        }
-        remaining -= session_bucket_count;
+    let elapsed_ms = u64::try_from(bucket_index)
+        .ok()?
+        .saturating_mul(interval_ms);
+    let total_trading_ms = qmt_total_trading_ms(venue, day)?;
+    if elapsed_ms >= total_trading_ms {
+        return None;
     }
 
-    None
+    qmt_timestamp_at_trading_elapsed(venue, day, elapsed_ms)
 }
 
 fn qmt_trading_day_distance(venue: Venue, from_day: NaiveDate, to_day: NaiveDate) -> i64 {
@@ -414,23 +424,19 @@ pub(super) fn qmt_trading_bucket_starts(
             {
                 buckets.push(bucket);
             }
-        } else if let Some(sessions) = qmt_session_bounds(venue, day) {
-            for (session_start, session_end) in sessions {
-                let mut bucket = if start_ms > session_start {
-                    session_start + ((start_ms - session_start) / interval_ms) * interval_ms
-                } else {
-                    session_start
+        } else if let Some(total_trading_ms) = qmt_total_trading_ms(venue, day) {
+            let bucket_count = qmt_trading_bucket_count(total_trading_ms, interval_ms);
+            for bucket_index in 0..bucket_count {
+                let Some(bucket) = qmt_timestamp_at_trading_elapsed(
+                    venue,
+                    day,
+                    bucket_index.saturating_mul(interval_ms),
+                ) else {
+                    continue;
                 };
 
-                if bucket >= session_end {
-                    continue;
-                }
-
-                while bucket < session_end && bucket <= end_ms {
-                    if bucket.saturating_add(interval_ms) > start_ms {
-                        buckets.push(bucket);
-                    }
-                    bucket += interval_ms;
+                if bucket <= end_ms && bucket.saturating_add(interval_ms) > start_ms {
+                    buckets.push(bucket);
                 }
             }
         }

@@ -197,6 +197,31 @@ impl Dashboard {
             );
         }
 
+        if matches!(
+            content_kind,
+            ContentKind::CandlestickChart | ContentKind::FootprintChart
+        ) && let pane::Content::Kline { chart: Some(c), .. } = &mut state.content
+            && c.basis().is_trade_based()
+            && let Some(chart::Action::RequestFetch(reqs)) = c.invalidate(Some(Instant::now()))
+        {
+            return Some(
+                fetcher::request_fetch_many(
+                    pane_id,
+                    streams,
+                    layout_id,
+                    reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
+                    |handle| {
+                        if let pane::Content::Kline { chart, .. } = &mut state.content
+                            && let Some(c) = chart
+                        {
+                            c.set_handle(handle);
+                        }
+                    },
+                )
+                .map(Message::from),
+            );
+        }
+
         for stream in streams {
             if let StreamKind::Kline { ticker_info, .. } = stream {
                 let task = if matches!(content_kind, ContentKind::FootprintChart)
@@ -1255,12 +1280,16 @@ impl Dashboard {
         }
 
         match data {
-            FetchedData::Trades { batch, until_time } => {
+            FetchedData::Trades {
+                batch,
+                until_time,
+                req_id,
+            } => {
                 let last_trade_time = batch.last().map_or(0, |trade| trade.time);
 
                 if last_trade_time < until_time {
                     if let Err(reason) =
-                        self.insert_fetched_trades(main_window, pane_id, &batch, false)
+                        self.insert_fetched_trades(main_window, pane_id, req_id, &batch, false)
                     {
                         return self.handle_error(Some(pane_id), &reason, main_window);
                     }
@@ -1271,9 +1300,13 @@ impl Dashboard {
                         .copied()
                         .collect::<Vec<_>>();
 
-                    if let Err(reason) =
-                        self.insert_fetched_trades(main_window, pane_id, &filtered_batch, true)
-                    {
+                    if let Err(reason) = self.insert_fetched_trades(
+                        main_window,
+                        pane_id,
+                        req_id,
+                        &filtered_batch,
+                        true,
+                    ) {
                         return self.handle_error(Some(pane_id), &reason, main_window);
                     }
                 }
@@ -1314,7 +1347,7 @@ impl Dashboard {
                 }
 
                 if let Err(reason) =
-                    self.insert_fetched_trades(main_window, pane_id, &trades, is_batches_done)
+                    self.insert_fetched_trades(main_window, pane_id, None, &trades, is_batches_done)
                 {
                     return self.handle_error(Some(pane_id), &reason, main_window);
                 }
@@ -1356,6 +1389,7 @@ impl Dashboard {
         &mut self,
         main_window: window::Id,
         pane_id: uuid::Uuid,
+        req_id: Option<uuid::Uuid>,
         trades: &[Trade],
         is_batches_done: bool,
     ) -> Result<(), DashboardError> {
@@ -1379,7 +1413,7 @@ impl Dashboard {
         match &mut pane_state.content {
             pane::Content::Kline { chart, .. } => {
                 if let Some(c) = chart {
-                    c.insert_raw_trades(trades.to_owned(), is_batches_done);
+                    c.insert_raw_trades(req_id, trades.to_owned(), is_batches_done);
 
                     if is_batches_done {
                         Self::set_idle_pane_status(pane_state);

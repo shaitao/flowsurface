@@ -638,12 +638,42 @@ fn qmt_bucket_start_does_not_map_lunch_grace_to_morning_bucket() {
 }
 
 #[test]
+fn qmt_bucket_start_compresses_lunch_for_custom_timeframes() {
+    let afternoon_tick = china_ms(2026, 4, 9, 13, 10, 0);
+    let expected = china_ms(2026, 4, 9, 11, 0, 0);
+    assert_eq!(
+        qmt_bucket_start(Venue::SSH, afternoon_tick, Timeframe::CustomMinutes(45)),
+        Some(expected)
+    );
+}
+
+#[test]
 fn qmt_bucket_start_maps_custom_close_grace_to_last_bucket() {
     let closing_tick = china_ms(2026, 4, 9, 15, 0, 2);
-    let expected = china_ms(2026, 4, 9, 14, 30, 0);
+    let expected = china_ms(2026, 4, 9, 14, 45, 0);
     assert_eq!(
         qmt_bucket_start(Venue::SSH, closing_tick, Timeframe::CustomMinutes(45)),
         Some(expected)
+    );
+}
+
+#[test]
+fn qmt_trading_bucket_starts_compress_lunch_for_custom_timeframes() {
+    let start = china_ms(2026, 4, 9, 9, 30, 0);
+    let end = china_ms(2026, 4, 9, 15, 0, 0);
+
+    let buckets = qmt_trading_bucket_starts(Venue::SSH, start, end, Timeframe::CustomMinutes(45));
+
+    assert_eq!(
+        buckets,
+        vec![
+            china_ms(2026, 4, 9, 9, 30, 0),
+            china_ms(2026, 4, 9, 10, 15, 0),
+            china_ms(2026, 4, 9, 11, 0, 0),
+            china_ms(2026, 4, 9, 13, 15, 0),
+            china_ms(2026, 4, 9, 14, 0, 0),
+            china_ms(2026, 4, 9, 14, 45, 0),
+        ]
     );
 }
 

@@ -18,10 +18,13 @@ use iced::{
 };
 use serde::{Deserialize, Serialize};
 
-const NUMERIC_INPUT_BUF_SIZE: usize = 5; // Max 5 digits for u16 (65535)
+const NUMERIC_INPUT_BUF_SIZE: usize = 9;
 
 const TICK_COUNT_MIN: u16 = 4;
 const TICK_COUNT_MAX: u16 = 1000;
+
+const VOLUME_THRESHOLD_MIN: u32 = 1;
+const VOLUME_THRESHOLD_MAX: u32 = 100_000_000;
 
 const TICK_MULTIPLIER_MIN: u16 = 1;
 const TICK_MULTIPLIER_MAX: u16 = 2000;
@@ -71,6 +74,10 @@ impl NumericInput {
         Self::from_str(&tc.0.to_string())
     }
 
+    pub fn from_volume_threshold(threshold: data::aggr::VolumeThreshold) -> Self {
+        Self::from_str(&threshold.0.to_string())
+    }
+
     pub fn to_display_string(self) -> String {
         if self.len == 0 {
             return String::new();
@@ -100,6 +107,16 @@ impl NumericInput {
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .map(data::aggr::TickCount)
+    }
+
+    pub fn parse_volume_threshold(self) -> Option<data::aggr::VolumeThreshold> {
+        if self.len == 0 {
+            return None;
+        }
+        std::str::from_utf8(&self.buffer[..self.len as usize])
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(data::aggr::VolumeThreshold)
     }
 
     pub fn parse_timeframe(self) -> Option<Timeframe> {
@@ -155,6 +172,11 @@ pub enum SelectedTab {
         parsed_input: Option<data::aggr::TickCount>,
         is_input_valid: bool,
     },
+    VolumeThreshold {
+        raw_input_buf: NumericInput,
+        parsed_input: Option<data::aggr::VolumeThreshold>,
+        is_input_valid: bool,
+    },
 }
 
 pub enum Action {
@@ -173,6 +195,7 @@ pub enum Message {
     SyntheticBookLevelsInputChanged(String),
     SyntheticBookLevelsSelected(u16),
     TickCountInputChanged(String),
+    VolumeThresholdInputChanged(String),
     TimeframeInputChanged(String),
 }
 
@@ -319,6 +342,26 @@ impl Modifier {
                         None
                     }
                 }
+                Basis::Volume(new_threshold) => {
+                    if let SelectedTab::VolumeThreshold {
+                        raw_input_buf,
+                        parsed_input,
+                        is_input_valid,
+                    } = &mut self.tab
+                    {
+                        if *parsed_input == Some(new_threshold) {
+                            *is_input_valid = true;
+                        } else {
+                            *raw_input_buf = NumericInput::default();
+                            *parsed_input = None;
+                            *is_input_valid = true;
+                        };
+
+                        Some(Action::BasisSelected(basis))
+                    } else {
+                        None
+                    }
+                }
             },
             Message::TicksizeSelected(new_ticksize) => {
                 if let ViewMode::TicksizeSelection {
@@ -431,6 +474,29 @@ impl Modifier {
                 }
                 None
             }
+            Message::VolumeThresholdInputChanged(value_str) => {
+                if let SelectedTab::VolumeThreshold {
+                    ref mut raw_input_buf,
+                    ref mut parsed_input,
+                    ref mut is_input_valid,
+                } = self.tab
+                {
+                    let numeric_value_str: String =
+                        value_str.chars().filter(char::is_ascii_digit).collect();
+
+                    *raw_input_buf = NumericInput::from_str(&numeric_value_str);
+                    *parsed_input = raw_input_buf.parse_volume_threshold();
+
+                    if raw_input_buf.is_empty() {
+                        *is_input_valid = true;
+                    } else {
+                        *is_input_valid = parsed_input.is_some_and(|threshold| {
+                            (VOLUME_THRESHOLD_MIN..=VOLUME_THRESHOLD_MAX).contains(&threshold.0)
+                        });
+                    }
+                }
+                None
+            }
             Message::TimeframeInputChanged(value_str) => {
                 if let SelectedTab::Timeframe {
                     ref mut raw_input_buf,
@@ -496,7 +562,7 @@ impl Modifier {
                 let mut basis_selection_column =
                     column![].padding(4).spacing(8).align_x(Horizontal::Center);
 
-                let allows_tick_basis = match kind {
+                let allows_trade_basis = match kind {
                     ModifierKind::Candlestick(_) | ModifierKind::Footprint(_, _) => true,
                     ModifierKind::Heatmap(_, _)
                     | ModifierKind::Orderbook(_, _)
@@ -504,42 +570,100 @@ impl Modifier {
                 };
 
                 if selected_basis.is_some() {
-                    let (timeframe_tab_is_selected, tick_count_tab_is_selected) = match self.tab {
-                        SelectedTab::Timeframe { .. } => (true, false),
-                        SelectedTab::TickCount { .. } => (false, true),
+                    let (
+                        timeframe_tab_is_selected,
+                        tick_count_tab_is_selected,
+                        volume_tab_is_selected,
+                    ) = match self.tab {
+                        SelectedTab::Timeframe { .. } => (true, false, false),
+                        SelectedTab::TickCount { .. } => (false, true, false),
+                        SelectedTab::VolumeThreshold { .. } => (false, false, true),
+                    };
+
+                    let tab_button = |content: iced::widget::text::Text<'a>,
+                                      msg: Option<Message>,
+                                      active: bool,
+                                      checkmark: bool| {
+                        let content = if checkmark {
+                            row![
+                                content,
+                                iced::widget::space::horizontal(),
+                                icon_text(style::Icon::Checkmark, 12)
+                            ]
+                        } else {
+                            row![content]
+                        }
+                        .width(Length::Fill);
+
+                        let btn = button(content).style(move |theme, status| {
+                            style::button::transparent(theme, status, active)
+                        });
+
+                        if let Some(msg) = msg {
+                            btn.on_press(msg)
+                        } else {
+                            btn
+                        }
+                    };
+
+                    let make_timeframe_tab = || match self.tab {
+                        SelectedTab::Timeframe {
+                            raw_input_buf,
+                            parsed_input,
+                            is_input_valid,
+                        } => SelectedTab::Timeframe {
+                            raw_input_buf,
+                            parsed_input,
+                            is_input_valid,
+                        },
+                        _ => SelectedTab::Timeframe {
+                            raw_input_buf: NumericInput::default(),
+                            parsed_input: None,
+                            is_input_valid: true,
+                        },
+                    };
+
+                    let make_tick_count_tab = || match self.tab {
+                        SelectedTab::TickCount {
+                            raw_input_buf,
+                            parsed_input,
+                            is_input_valid,
+                        } => SelectedTab::TickCount {
+                            raw_input_buf,
+                            parsed_input,
+                            is_input_valid,
+                        },
+                        _ => SelectedTab::TickCount {
+                            raw_input_buf: NumericInput::default(),
+                            parsed_input: None,
+                            is_input_valid: true,
+                        },
+                    };
+
+                    let make_volume_threshold_tab = || match self.tab {
+                        SelectedTab::VolumeThreshold {
+                            raw_input_buf,
+                            parsed_input,
+                            is_input_valid,
+                        } => SelectedTab::VolumeThreshold {
+                            raw_input_buf,
+                            parsed_input,
+                            is_input_valid,
+                        },
+                        _ => SelectedTab::VolumeThreshold {
+                            raw_input_buf: NumericInput::default(),
+                            parsed_input: None,
+                            is_input_valid: true,
+                        },
                     };
 
                     let tabs_row = {
-                        if allows_tick_basis {
+                        if allows_trade_basis {
                             let is_timeframe_selected =
                                 matches!(selected_basis, Some(Basis::Time(_)));
-
-                            let tab_button =
-                                |content: iced::widget::text::Text<'a>,
-                                 msg: Option<Message>,
-                                 active: bool,
-                                 checkmark: bool| {
-                                    let content = if checkmark {
-                                        row![
-                                            content,
-                                            iced::widget::space::horizontal(),
-                                            icon_text(style::Icon::Checkmark, 12)
-                                        ]
-                                    } else {
-                                        row![content]
-                                    }
-                                    .width(Length::Fill);
-
-                                    let btn = button(content).style(move |theme, status| {
-                                        style::button::transparent(theme, status, active)
-                                    });
-
-                                    if let Some(msg) = msg {
-                                        btn.on_press(msg)
-                                    } else {
-                                        btn
-                                    }
-                                };
+                            let is_tick_selected = matches!(selected_basis, Some(Basis::Tick(_)));
+                            let is_volume_selected =
+                                matches!(selected_basis, Some(Basis::Volume(_)));
 
                             row![
                                 tab_button(
@@ -547,23 +671,7 @@ impl Modifier {
                                     if timeframe_tab_is_selected {
                                         None
                                     } else {
-                                        let timeframe_tab = match self.tab {
-                                            SelectedTab::Timeframe {
-                                                raw_input_buf,
-                                                parsed_input,
-                                                is_input_valid,
-                                            } => SelectedTab::Timeframe {
-                                                raw_input_buf,
-                                                parsed_input,
-                                                is_input_valid,
-                                            },
-                                            _ => SelectedTab::Timeframe {
-                                                raw_input_buf: NumericInput::default(),
-                                                parsed_input: None,
-                                                is_input_valid: true,
-                                            },
-                                        };
-                                        Some(Message::TabSelected(timeframe_tab))
+                                        Some(Message::TabSelected(make_timeframe_tab()))
                                     },
                                     !timeframe_tab_is_selected,
                                     is_timeframe_selected,
@@ -573,26 +681,20 @@ impl Modifier {
                                     if tick_count_tab_is_selected {
                                         None
                                     } else {
-                                        let tick_count_tab = match self.tab {
-                                            SelectedTab::TickCount {
-                                                raw_input_buf,
-                                                parsed_input,
-                                                is_input_valid,
-                                            } => SelectedTab::TickCount {
-                                                raw_input_buf,
-                                                parsed_input,
-                                                is_input_valid,
-                                            },
-                                            _ => SelectedTab::TickCount {
-                                                raw_input_buf: NumericInput::default(),
-                                                parsed_input: None,
-                                                is_input_valid: true,
-                                            },
-                                        };
-                                        Some(Message::TabSelected(tick_count_tab))
+                                        Some(Message::TabSelected(make_tick_count_tab()))
                                     },
                                     !tick_count_tab_is_selected,
-                                    !is_timeframe_selected,
+                                    is_tick_selected,
+                                ),
+                                tab_button(
+                                    text("Volume"),
+                                    if volume_tab_is_selected {
+                                        None
+                                    } else {
+                                        Some(Message::TabSelected(make_volume_threshold_tab()))
+                                    },
+                                    !volume_tab_is_selected,
+                                    is_volume_selected,
                                 ),
                             ]
                             .spacing(4)
@@ -691,6 +793,44 @@ impl Modifier {
                         };
                         basis_selection_column = basis_selection_column.push(custom_input);
                         basis_selection_column = basis_selection_column.push(tick_count_grid);
+                    }
+                    SelectedTab::VolumeThreshold {
+                        raw_input_buf,
+                        parsed_input,
+                        is_input_valid,
+                    } => {
+                        let selected_threshold = match selected_basis {
+                            Some(Basis::Volume(threshold)) => Some(threshold),
+                            _ => None,
+                        };
+
+                        let threshold_grid = modifiers_grid(
+                            &data::aggr::VolumeThreshold::ALL,
+                            selected_threshold,
+                            |threshold| Message::BasisSelected(Basis::Volume(threshold)),
+                            &create_button,
+                            3,
+                        );
+
+                        let custom_input = {
+                            let threshold_to_submit = parsed_input.filter(|threshold| {
+                                (VOLUME_THRESHOLD_MIN..=VOLUME_THRESHOLD_MAX).contains(&threshold.0)
+                            });
+
+                            numeric_input_box::<_, Message>(
+                                "Custom: ",
+                                &format!("{}-{}", VOLUME_THRESHOLD_MIN, VOLUME_THRESHOLD_MAX),
+                                &raw_input_buf.to_display_string(),
+                                is_input_valid,
+                                Message::VolumeThresholdInputChanged,
+                                threshold_to_submit.map(|threshold| {
+                                    Message::BasisSelected(Basis::Volume(threshold))
+                                }),
+                            )
+                        };
+
+                        basis_selection_column = basis_selection_column.push(custom_input);
+                        basis_selection_column = basis_selection_column.push(threshold_grid);
                     }
                 }
 
@@ -1006,6 +1146,19 @@ impl From<&ModifierKind> for SelectedTab {
                         NumericInput::default()
                     },
                     parsed_input: if tc.is_custom() { Some(*tc) } else { None },
+                    is_input_valid: true,
+                },
+                Basis::Volume(threshold) => SelectedTab::VolumeThreshold {
+                    raw_input_buf: if threshold.is_custom() {
+                        NumericInput::from_volume_threshold(*threshold)
+                    } else {
+                        NumericInput::default()
+                    },
+                    parsed_input: if threshold.is_custom() {
+                        Some(*threshold)
+                    } else {
+                        None
+                    },
                     is_input_valid: true,
                 },
             },

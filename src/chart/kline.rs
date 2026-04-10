@@ -5,6 +5,7 @@ use super::{
 use crate::chart::indicator::kline::KlineIndicatorImpl;
 use crate::connector::fetcher::{FetchRange, RequestHandler, is_trade_fetch_enabled};
 use crate::{modal::pane::settings::study, style};
+use data::aggr::TradeSessionSplit;
 use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::chart::indicator::{Indicator, KlineIndicator};
@@ -24,6 +25,26 @@ use iced::{Alignment, Element, Point, Rectangle, Renderer, Size, Theme, Vector, 
 
 use enum_map::EnumMap;
 use std::time::Instant;
+
+const TRADE_BASED_INITIAL_HISTORY_LOOKBACK_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn trade_sort_key(trade: &Trade) -> (u64, i64, i64, bool) {
+    (
+        trade.time,
+        trade.price.units,
+        trade.qty.units,
+        trade.is_sell,
+    )
+}
+
+fn trade_session_split(ticker_info: TickerInfo) -> TradeSessionSplit {
+    match ticker_info.exchange().venue() {
+        exchange::adapter::Venue::SSH | exchange::adapter::Venue::SSZ => {
+            TradeSessionSplit::ChinaTradingDay
+        }
+        _ => TradeSessionSplit::None,
+    }
+}
 
 fn filter_integrity_gaps_for_ticker(
     ticker_info: TickerInfo,
@@ -181,6 +202,70 @@ pub struct KlineChart {
 }
 
 impl KlineChart {
+    fn trade_time_at_reverse_index(tick_aggr: &TickAggr, reverse_index: usize) -> Option<u64> {
+        let forward_index = tick_aggr.datapoints.len().checked_sub(1 + reverse_index)?;
+        tick_aggr
+            .datapoints
+            .get(forward_index)
+            .map(|dp| dp.kline.time)
+    }
+
+    fn merge_historical_trades(&mut self, mut incoming: Vec<Trade>) -> Vec<Trade> {
+        if incoming.is_empty() {
+            return vec![];
+        }
+
+        incoming.sort_by_key(trade_sort_key);
+        incoming.dedup_by(|a, b| trade_sort_key(a) == trade_sort_key(b));
+
+        if self.raw_trades.is_empty() {
+            self.raw_trades = incoming.clone();
+            return incoming;
+        }
+
+        self.raw_trades.sort_by_key(trade_sort_key);
+        self.raw_trades
+            .dedup_by(|a, b| trade_sort_key(a) == trade_sort_key(b));
+
+        let existing = std::mem::take(&mut self.raw_trades);
+        let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+        let mut inserted = Vec::with_capacity(incoming.len());
+        let mut existing_index = 0usize;
+        let mut incoming_index = 0usize;
+
+        while existing_index < existing.len() && incoming_index < incoming.len() {
+            let existing_trade = existing[existing_index];
+            let incoming_trade = incoming[incoming_index];
+
+            match trade_sort_key(&existing_trade).cmp(&trade_sort_key(&incoming_trade)) {
+                std::cmp::Ordering::Less => {
+                    merged.push(existing_trade);
+                    existing_index += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    merged.push(incoming_trade);
+                    inserted.push(incoming_trade);
+                    incoming_index += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    merged.push(existing_trade);
+                    existing_index += 1;
+                    incoming_index += 1;
+                }
+            }
+        }
+
+        merged.extend_from_slice(&existing[existing_index..]);
+
+        for &trade in &incoming[incoming_index..] {
+            merged.push(trade);
+            inserted.push(trade);
+        }
+
+        self.raw_trades = merged;
+        inserted
+    }
+
     pub fn new(
         layout: ViewConfig,
         basis: Basis,
@@ -270,7 +355,10 @@ impl KlineChart {
                     last_tick: Instant::now(),
                 }
             }
-            Basis::Tick(interval) => {
+            basis @ (Basis::Tick(_) | Basis::Volume(_)) => {
+                let interval = basis
+                    .trade_aggregation()
+                    .expect("trade-based basis must expose trade aggregation");
                 let cell_width = match kind {
                     KlineChartKind::Footprint { .. } => 80.0,
                     KlineChartKind::Candles => 4.0,
@@ -305,7 +393,12 @@ impl KlineChart {
                 };
                 chart.translation.x = x_translation;
 
-                let data_source = PlotData::TickBased(TickAggr::new(interval, step, &raw_trades));
+                let data_source = PlotData::TickBased(TickAggr::new(
+                    interval,
+                    step,
+                    &raw_trades,
+                    trade_session_split(ticker_info),
+                ));
 
                 let mut indicators = EnumMap::default();
                 for &i in enabled_indicators {
@@ -489,8 +582,56 @@ impl KlineChart {
                     }
                 }
             }
-            PlotData::TickBased(_) => {
-                // TODO: implement trade fetch
+            PlotData::TickBased(tick_aggr) => {
+                if self.fetching_trades.0 {
+                    return None;
+                }
+
+                if self.raw_trades.is_empty() {
+                    let latest = chrono::Utc::now().timestamp_millis() as u64;
+                    let earliest = latest.saturating_sub(TRADE_BASED_INITIAL_HISTORY_LOOKBACK_MS);
+
+                    if let Some(action) = request_fetch(
+                        &mut self.request_handler,
+                        FetchRange::Trades(earliest, latest),
+                    ) {
+                        self.fetching_trades = (true, None);
+                        return Some(action);
+                    }
+                }
+
+                let (visible_earliest, visible_latest) = self.visible_timerange()?;
+                let loaded_bar_count = tick_aggr.datapoints.len();
+                if loaded_bar_count == 0 {
+                    return None;
+                }
+
+                let oldest_loaded_index = loaded_bar_count.saturating_sub(1) as u64;
+                if visible_latest < oldest_loaded_index {
+                    return None;
+                }
+
+                let newest_visible_index = visible_earliest.min(oldest_loaded_index) as usize;
+                let oldest_visible_index = visible_latest.min(oldest_loaded_index) as usize;
+                let newest_visible_time =
+                    Self::trade_time_at_reverse_index(tick_aggr, newest_visible_index)?;
+                let oldest_visible_time =
+                    Self::trade_time_at_reverse_index(tick_aggr, oldest_visible_index)?;
+                let visible_span_ms = newest_visible_time
+                    .saturating_sub(oldest_visible_time)
+                    .max(1);
+                let earliest_loaded_trade_time = self.raw_trades.first()?.time;
+                let fetch_from = earliest_loaded_trade_time.saturating_sub(visible_span_ms);
+
+                if fetch_from < earliest_loaded_trade_time
+                    && let Some(action) = request_fetch(
+                        &mut self.request_handler,
+                        FetchRange::Trades(fetch_from, earliest_loaded_trade_time),
+                    )
+                {
+                    self.fetching_trades = (true, None);
+                    return Some(action);
+                }
             }
         }
 
@@ -611,9 +752,16 @@ impl KlineChart {
                 let timeseries = TimeSeries::<KlineDataPoint>::new(interval, step, &[]);
                 self.data_source = PlotData::TimeBased(timeseries);
             }
-            Basis::Tick(tick_count) => {
+            basis @ (Basis::Tick(_) | Basis::Volume(_)) => {
                 let step = self.chart.tick_size;
-                let tick_aggr = TickAggr::new(tick_count, step, &self.raw_trades);
+                let tick_aggr = TickAggr::new(
+                    basis
+                        .trade_aggregation()
+                        .expect("trade-based basis must expose trade aggregation"),
+                    step,
+                    &self.raw_trades,
+                    trade_session_split(self.chart.ticker_info),
+                );
                 self.data_source = PlotData::TickBased(tick_aggr);
             }
         }
@@ -680,13 +828,56 @@ impl KlineChart {
         }
     }
 
-    pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
+    pub fn insert_raw_trades(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        raw_trades: Vec<Trade>,
+        is_batches_done: bool,
+    ) {
+        let merged_trades = self.merge_historical_trades(raw_trades);
+
         match self.data_source {
             PlotData::TickBased(ref mut tick_aggr) => {
-                tick_aggr.insert_trades(&raw_trades);
+                *tick_aggr = TickAggr::new(
+                    tick_aggr.interval,
+                    tick_aggr.tick_size,
+                    &self.raw_trades,
+                    tick_aggr.session_split,
+                );
+
+                if let Some(last_dp) = tick_aggr.datapoints.last() {
+                    self.chart.last_price =
+                        Some(PriceInfoLabel::new(last_dp.kline.close, last_dp.kline.open));
+                } else {
+                    self.chart.last_price = None;
+                }
+
+                if is_batches_done {
+                    self.fetching_trades = (false, None);
+                    if let Some(req_id) = req_id {
+                        if merged_trades.is_empty() {
+                            self.request_handler
+                                .mark_failed(req_id, "No data received".to_string());
+                        } else {
+                            self.request_handler.mark_completed(req_id);
+                        }
+                    }
+                }
             }
             PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades_existing_buckets(&raw_trades);
+                timeseries.insert_trades_existing_buckets(&merged_trades);
+
+                if is_batches_done {
+                    self.fetching_trades = (false, None);
+                    if let Some(req_id) = req_id {
+                        if merged_trades.is_empty() {
+                            self.request_handler
+                                .mark_failed(req_id, "No data received".to_string());
+                        } else {
+                            self.request_handler.mark_completed(req_id);
+                        }
+                    }
+                }
             }
         }
 
@@ -695,13 +886,7 @@ impl KlineChart {
             .filter_map(Option::as_mut)
             .for_each(|indi| indi.rebuild_from_source(&self.data_source));
 
-        self.raw_trades.extend(raw_trades);
-
         self.invalidate(None);
-
-        if is_batches_done {
-            self.fetching_trades = (false, None);
-        }
     }
 
     pub fn insert_hist_klines(
@@ -1241,15 +1426,19 @@ fn render_data_source<F>(
         PlotData::TickBased(tick_aggr) => {
             let earliest = earliest as usize;
             let latest = latest as usize;
+            let total = tick_aggr.datapoints.len();
 
             tick_aggr
                 .datapoints
                 .iter()
-                .rev()
                 .enumerate()
-                .filter(|(index, _)| *index <= latest && *index >= earliest)
-                .for_each(|(index, tick_aggr)| {
-                    let x_position = interval_to_x(index as u64);
+                .filter_map(|(forward_index, tick_aggr)| {
+                    let reverse_index = total.checked_sub(1 + forward_index)?;
+                    (reverse_index <= latest && reverse_index >= earliest)
+                        .then_some((reverse_index as u64, tick_aggr))
+                })
+                .for_each(|(interval, tick_aggr)| {
+                    let x_position = interval_to_x(interval);
 
                     draw_fn(frame, x_position, &tick_aggr.kline, &tick_aggr.footprint);
                 });
@@ -1855,7 +2044,7 @@ fn draw_crosshair_tooltip(
                 }
             }),
         PlotData::TickBased(tick_aggr) => {
-            let index = (at_interval / u64::from(tick_aggr.interval.0)) as usize;
+            let index = (at_interval / tick_aggr.interval.x_axis_step()) as usize;
             if index < tick_aggr.datapoints.len() {
                 Some(&tick_aggr.datapoints[tick_aggr.datapoints.len() - 1 - index].kline)
             } else {
