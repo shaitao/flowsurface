@@ -1,6 +1,6 @@
 use exchange::{
-    adapter::Venue,
     TickerInfo, Trade,
+    adapter::Venue,
     depth::Depth,
     order::{
         OrderBookLevel, OrderCancelRequest, OrderCancelResponse, OrderPanelSnapshot, OrderSide,
@@ -235,7 +235,11 @@ impl OrderEntry {
 
                 self.is_submitting = true;
                 self.error_message = None;
-                self.status_message = Some(format!("Submitting {} Limit @ {}...", side, self.format_price(Some(price))));
+                self.status_message = Some(format!(
+                    "Submitting {} Limit @ {}...",
+                    side,
+                    self.format_price(Some(price))
+                ));
                 return Some(Action::Submit(request));
             }
             Message::RefreshPressed => {
@@ -337,11 +341,10 @@ impl OrderEntry {
                 !self.is_submitting,
                 Some(Message::SubmitPressed(OrderSide::Sell, OrderType::Limit)),
             ),
-            button(text("Flatten").size(12))
-                .on_press_maybe(
-                    (!self.is_submitting && self.available_qty.is_some_and(|q| q > 0.0))
-                        .then_some(Message::FlattenPressed),
-                ),
+            button(text("Flatten").size(12)).on_press_maybe(
+                (!self.is_submitting && self.available_qty.is_some_and(|q| q > 0.0))
+                    .then_some(Message::FlattenPressed),
+            ),
         ]
         .spacing(4)
         .align_y(Alignment::Center);
@@ -429,9 +432,7 @@ impl OrderEntry {
                                     (!is_cancelling
                                         && self.cancelling_order_id.is_none()
                                         && !self.is_submitting)
-                                        .then_some(Message::CancelPressed(
-                                            order.order_id.clone(),
-                                        )),
+                                        .then_some(Message::CancelPressed(order.order_id.clone(),)),
                                 )
                         ]
                         .align_y(Alignment::Center)
@@ -605,11 +606,7 @@ fn quote_ladder_section<'a>(
     let mut rows = column![].spacing(2).width(Length::Fill);
 
     if levels.is_empty() {
-        rows = rows.push(
-            container(text("—").size(12))
-                .padding(4)
-                .width(Length::Fill),
-        );
+        rows = rows.push(container(text("—").size(12)).padding(4).width(Length::Fill));
     } else {
         let ordered: Vec<_> = if reverse {
             levels.iter().rev().collect()

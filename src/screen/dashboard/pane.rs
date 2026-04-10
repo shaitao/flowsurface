@@ -48,6 +48,7 @@ pub enum Effect {
     ReloadHeatmapHistory,
     RequestFetch(Vec<FetchSpec>),
     SharedHorizontalLevel(chart::HorizontalLevelEvent),
+    SharedRightRect(chart::RightRectEvent),
     OrderEntry(panel::order_entry::Action),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
@@ -95,6 +96,7 @@ pub enum Event {
     PanelInteraction(super::panel::Message),
     OrderEntryInteraction(super::panel::order_entry::Message),
     ToggleHorizontalLevelMode,
+    ToggleRightRectMode,
     ToggleIndicator(UiIndicator),
     DeleteNotification(usize),
     ReorderIndicator(column_drag::DragEvent),
@@ -111,7 +113,9 @@ pub struct State {
     pub modal: Option<Modal>,
     pub content: Content,
     shared_horizontal_levels: Vec<chart::HorizontalLevel>,
+    shared_right_rects: Vec<chart::RightRect>,
     horizontal_level_mode: bool,
+    right_rect_mode: bool,
     pub settings: Settings,
     pub notifications: Vec<Toast>,
     pub streams: ResolvedStream,
@@ -140,6 +144,7 @@ impl State {
             content,
             settings,
             shared_horizontal_levels,
+            shared_right_rects: vec![],
             streams: ResolvedStream::waiting(streams),
             link_group,
             ..Default::default()
@@ -189,8 +194,22 @@ impl State {
         }
     }
 
+    pub fn set_shared_right_rects(&mut self, rects: Vec<chart::RightRect>) {
+        self.shared_right_rects = rects.clone();
+
+        match &mut self.content {
+            Content::Heatmap { chart: Some(c), .. } => c.set_right_rects(rects),
+            Content::Kline { chart: Some(c), .. } => c.set_right_rects(rects),
+            _ => {}
+        }
+    }
+
     fn horizontal_level_mode(&self) -> bool {
         self.horizontal_level_mode
+    }
+
+    fn right_rect_mode(&self) -> bool {
+        self.right_rect_mode
     }
 
     pub fn set_content_and_streams(
@@ -245,6 +264,8 @@ impl State {
                         derived_plan.price_step,
                         &self.shared_horizontal_levels,
                         self.horizontal_level_mode,
+                        &self.shared_right_rects,
+                        self.right_rect_mode,
                     );
 
                     let streams = vec![depth_stream(&derived_plan), trades_stream(&derived_plan)];
@@ -260,6 +281,8 @@ impl State {
                         derived_plan.price_step,
                         &self.shared_horizontal_levels,
                         self.horizontal_level_mode,
+                        &self.shared_right_rects,
+                        self.right_rect_mode,
                     );
 
                     let streams = by_basis_default(
@@ -287,6 +310,8 @@ impl State {
                             base_ticker.min_ticksize.into(),
                             &self.shared_horizontal_levels,
                             self.horizontal_level_mode,
+                            &self.shared_right_rects,
+                            self.right_rect_mode,
                         )
                     };
 
@@ -1194,10 +1219,37 @@ impl State {
             Event::ToggleHorizontalLevelMode => match &mut self.content {
                 Content::Heatmap { chart: Some(c), .. } => {
                     self.horizontal_level_mode = !self.horizontal_level_mode;
+                    if self.horizontal_level_mode {
+                        self.right_rect_mode = false;
+                    }
                     c.set_horizontal_level_mode(self.horizontal_level_mode);
+                    c.set_right_rect_mode(self.right_rect_mode);
                 }
                 Content::Kline { chart: Some(c), .. } => {
                     self.horizontal_level_mode = !self.horizontal_level_mode;
+                    if self.horizontal_level_mode {
+                        self.right_rect_mode = false;
+                    }
+                    c.set_horizontal_level_mode(self.horizontal_level_mode);
+                    c.set_right_rect_mode(self.right_rect_mode);
+                }
+                _ => {}
+            },
+            Event::ToggleRightRectMode => match &mut self.content {
+                Content::Heatmap { chart: Some(c), .. } => {
+                    self.right_rect_mode = !self.right_rect_mode;
+                    if self.right_rect_mode {
+                        self.horizontal_level_mode = false;
+                    }
+                    c.set_right_rect_mode(self.right_rect_mode);
+                    c.set_horizontal_level_mode(self.horizontal_level_mode);
+                }
+                Content::Kline { chart: Some(c), .. } => {
+                    self.right_rect_mode = !self.right_rect_mode;
+                    if self.right_rect_mode {
+                        self.horizontal_level_mode = false;
+                    }
+                    c.set_right_rect_mode(self.right_rect_mode);
                     c.set_horizontal_level_mode(self.horizontal_level_mode);
                 }
                 _ => {}
@@ -1239,6 +1291,33 @@ impl State {
                             chart::HorizontalLevelEvent::Delete(id),
                         ));
                     }
+                    chart::Message::CreateRightRect {
+                        start_time,
+                        price_a,
+                        price_b,
+                    } => {
+                        return Some(Effect::SharedRightRect(chart::RightRectEvent::Create {
+                            start_time,
+                            price_a,
+                            price_b,
+                        }));
+                    }
+                    chart::Message::MoveRightRectHandle {
+                        id,
+                        handle,
+                        start_time,
+                        price,
+                    } => {
+                        return Some(Effect::SharedRightRect(chart::RightRectEvent::MoveHandle {
+                            id,
+                            handle,
+                            start_time,
+                            price,
+                        }));
+                    }
+                    chart::Message::DeleteRightRect(id) => {
+                        return Some(Effect::SharedRightRect(chart::RightRectEvent::Delete(id)));
+                    }
                     _ => super::chart::update(c, &msg),
                 },
                 Content::Kline { chart: Some(c), .. } => match msg {
@@ -1264,6 +1343,33 @@ impl State {
                         return Some(Effect::SharedHorizontalLevel(
                             chart::HorizontalLevelEvent::Delete(id),
                         ));
+                    }
+                    chart::Message::CreateRightRect {
+                        start_time,
+                        price_a,
+                        price_b,
+                    } => {
+                        return Some(Effect::SharedRightRect(chart::RightRectEvent::Create {
+                            start_time,
+                            price_a,
+                            price_b,
+                        }));
+                    }
+                    chart::Message::MoveRightRectHandle {
+                        id,
+                        handle,
+                        start_time,
+                        price,
+                    } => {
+                        return Some(Effect::SharedRightRect(chart::RightRectEvent::MoveHandle {
+                            id,
+                            handle,
+                            start_time,
+                            price,
+                        }));
+                    }
+                    chart::Message::DeleteRightRect(id) => {
+                        return Some(Effect::SharedRightRect(chart::RightRectEvent::Delete(id)));
                     }
                     _ => super::chart::update(c, &msg),
                 },
@@ -1689,6 +1795,18 @@ impl State {
                 tooltip_pos,
                 control_btn_style(self.horizontal_level_mode()),
             ));
+
+            buttons = buttons.push(button_with_tooltip(
+                text("Z")
+                    .font(style::AZERET_MONO)
+                    .size(12)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::PaneEvent(pane, Event::ToggleRightRectMode),
+                Some("Right rectangle mode"),
+                tooltip_pos,
+                control_btn_style(self.right_rect_mode()),
+            ));
         }
 
         if is_popout {
@@ -1945,7 +2063,9 @@ impl Default for State {
             modal: None,
             content: Content::Starter,
             shared_horizontal_levels: vec![],
+            shared_right_rects: vec![],
             horizontal_level_mode: false,
+            right_rect_mode: false,
             settings: Settings::default(),
             streams: ResolvedStream::waiting(vec![]),
             notifications: vec![],
@@ -1985,6 +2105,8 @@ impl Content {
         price_step: exchange::unit::PriceStep,
         shared_horizontal_levels: &[chart::HorizontalLevel],
         horizontal_level_mode: bool,
+        shared_right_rects: &[chart::RightRect],
+        right_rect_mode: bool,
     ) -> Self {
         let (enabled_indicators, layout, prev_studies) = if let Content::Heatmap {
             chart,
@@ -2030,6 +2152,8 @@ impl Content {
         );
         chart.set_horizontal_levels(shared_horizontal_levels.to_vec());
         chart.set_horizontal_level_mode(horizontal_level_mode);
+        chart.set_right_rects(shared_right_rects.to_vec());
+        chart.set_right_rect_mode(right_rect_mode);
 
         Content::Heatmap {
             chart: Some(chart),
@@ -2047,6 +2171,8 @@ impl Content {
         step: exchange::unit::PriceStep,
         shared_horizontal_levels: &[chart::HorizontalLevel],
         horizontal_level_mode: bool,
+        shared_right_rects: &[chart::RightRect],
+        right_rect_mode: bool,
     ) -> Self {
         let (prev_indis, prev_layout, prev_kind_opt) = if let Content::Kline {
             chart,
@@ -2135,6 +2261,8 @@ impl Content {
         );
         chart.set_horizontal_levels(shared_horizontal_levels.to_vec());
         chart.set_horizontal_level_mode(horizontal_level_mode);
+        chart.set_right_rects(shared_right_rects.to_vec());
+        chart.set_right_rect_mode(right_rect_mode);
 
         Content::Kline {
             chart: Some(chart),

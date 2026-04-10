@@ -1,5 +1,5 @@
 use super::{
-    Chart, HorizontalLevel, Interaction, Message, PlotConstants, TEXT_SIZE, ViewState,
+    Chart, HorizontalLevel, Interaction, Message, PlotConstants, RightRect, TEXT_SIZE, ViewState,
     scale::linear::PriceInfoLabel,
 };
 use crate::{
@@ -127,6 +127,24 @@ impl Chart for HeatmapChart {
         self.horizontal_level_mode = armed;
         self.invalidate(None);
     }
+
+    fn right_rects(&self) -> &[RightRect] {
+        &self.right_rects
+    }
+
+    fn set_right_rects(&mut self, rects: Vec<RightRect>) {
+        self.right_rects = rects;
+        self.invalidate(None);
+    }
+
+    fn right_rect_mode(&self) -> bool {
+        self.right_rect_mode
+    }
+
+    fn set_right_rect_mode(&mut self, armed: bool) {
+        self.right_rect_mode = armed;
+        self.invalidate(None);
+    }
 }
 
 impl PlotConstants for HeatmapChart {
@@ -171,6 +189,8 @@ pub struct HeatmapChart {
     indicators: EnumMap<HeatmapIndicator, Option<IndicatorData>>,
     horizontal_levels: Vec<HorizontalLevel>,
     horizontal_level_mode: bool,
+    right_rects: Vec<RightRect>,
+    right_rect_mode: bool,
     pause_buffer: Vec<(u64, Box<[Trade]>, Depth)>,
     pending_history_trades: BTreeMap<u64, Vec<Trade>>,
     pending_history_depths: BTreeMap<u64, Depth>,
@@ -220,6 +240,8 @@ impl HeatmapChart {
             indicators,
             horizontal_levels: vec![],
             horizontal_level_mode: false,
+            right_rects: vec![],
+            right_rect_mode: false,
             pause_buffer: vec![],
             pending_history_trades: BTreeMap::new(),
             pending_history_depths: BTreeMap::new(),
@@ -770,7 +792,10 @@ impl canvas::Program<Message> for HeatmapChart {
                     continue;
                 }
 
-                let point = Point::new(chart.interval_to_x(*time), chart.price_to_y(dp.last_price()));
+                let point = Point::new(
+                    chart.interval_to_x(*time),
+                    chart.price_to_y(dp.last_price()),
+                );
                 if has_price_trace {
                     price_trace.line_to(point);
                 } else {
@@ -945,6 +970,15 @@ impl canvas::Program<Message> for HeatmapChart {
                 );
             }
 
+            super::draw_right_rects(
+                self,
+                frame,
+                theme,
+                palette,
+                &self.right_rects,
+                interaction.active_right_rect_handle(),
+            );
+
             super::draw_horizontal_levels(
                 self,
                 frame,
@@ -971,6 +1005,16 @@ impl canvas::Program<Message> for HeatmapChart {
                     {
                         return;
                     }
+
+                    super::draw_drafting_right_rect(
+                        self,
+                        frame,
+                        theme,
+                        palette,
+                        interaction,
+                        bounds,
+                        cursor,
+                    );
 
                     let aggr_time: u64 = match chart.basis {
                         Basis::Time(interval) => interval.into(),

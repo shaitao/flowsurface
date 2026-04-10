@@ -30,6 +30,10 @@ pub enum Interaction {
     #[default]
     None,
     ArmedHorizontalLevel,
+    DraftingRightRect {
+        start_time: u64,
+        price: Price,
+    },
     Zoomin {
         last_position: Point,
     },
@@ -39,6 +43,10 @@ pub enum Interaction {
     },
     DraggingHorizontalLevel {
         id: Uuid,
+    },
+    DraggingRightRectHandle {
+        id: Uuid,
+        handle: RightRectHandle,
     },
     Ruler {
         start: Option<Point>,
@@ -52,6 +60,13 @@ impl Interaction {
             _ => None,
         }
     }
+
+    fn active_right_rect_handle(&self) -> Option<(Uuid, RightRectHandle)> {
+        match self {
+            Interaction::DraggingRightRectHandle { id, handle } => Some((*id, *handle)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -61,10 +76,35 @@ pub enum AxisScaleClicked {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightRectHandle {
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HorizontalLevel {
     pub id: Uuid,
     pub start_time: u64,
     pub price: Price,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RightRect {
+    pub id: Uuid,
+    pub start_time: u64,
+    pub high_price: Price,
+    pub low_price: Price,
+}
+
+impl RightRect {
+    pub fn new(start_time: u64, price_a: Price, price_b: Price) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            start_time,
+            high_price: price_a.max(price_b),
+            low_price: price_a.min(price_b),
+        }
+    }
 }
 
 impl HorizontalLevel {
@@ -92,6 +132,22 @@ pub enum HorizontalLevelEvent {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum RightRectEvent {
+    Create {
+        start_time: u64,
+        price_a: Price,
+        price_b: Price,
+    },
+    MoveHandle {
+        id: Uuid,
+        handle: RightRectHandle,
+        start_time: u64,
+        price: Price,
+    },
+    Delete(Uuid),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum Message {
     Translated(Vector),
     Scaled(f32, Vector),
@@ -112,6 +168,18 @@ pub enum Message {
         price: Price,
     },
     DeleteHorizontalLevel(Uuid),
+    CreateRightRect {
+        start_time: u64,
+        price_a: Price,
+        price_b: Price,
+    },
+    MoveRightRectHandle {
+        id: Uuid,
+        handle: RightRectHandle,
+        start_time: u64,
+        price: Price,
+    },
+    DeleteRightRect(Uuid),
 }
 
 pub trait Chart: PlotConstants + canvas::Program<Message> {
@@ -144,6 +212,14 @@ pub trait Chart: PlotConstants + canvas::Program<Message> {
     fn horizontal_level_mode(&self) -> bool;
 
     fn set_horizontal_level_mode(&mut self, armed: bool);
+
+    fn right_rects(&self) -> &[RightRect];
+
+    fn set_right_rects(&mut self, rects: Vec<RightRect>);
+
+    fn right_rect_mode(&self) -> bool;
+
+    fn set_right_rect_mode(&mut self, armed: bool);
 }
 
 fn cursor_chart_position(state: &ViewState, bounds: Rectangle, cursor_position: Point) -> Point {
@@ -213,6 +289,75 @@ fn hit_test_horizontal_level<T: Chart>(
         .map(|level| level.id)
 }
 
+fn hit_test_right_rect_handle<T: Chart>(
+    chart: &T,
+    bounds: Rectangle,
+    cursor: mouse::Cursor,
+) -> Option<(Uuid, RightRectHandle)> {
+    let cursor_position = cursor.position_in(bounds)?;
+    let state = chart.state();
+    let cursor_chart_position = cursor_chart_position(state, bounds, cursor_position);
+    let hit_threshold = 6.0 / state.scaling.max(0.001);
+
+    chart.right_rects().iter().find_map(|rect| {
+        let start_x = horizontal_level_start_x(chart, rect.start_time)?;
+        let high_y = state.price_to_y(rect.high_price);
+        let low_y = state.price_to_y(rect.low_price);
+
+        let near_left_edge = (cursor_chart_position.x - start_x).abs() <= hit_threshold;
+        if !near_left_edge {
+            return None;
+        }
+
+        if (cursor_chart_position.y - high_y).abs() <= hit_threshold {
+            Some((rect.id, RightRectHandle::Top))
+        } else if (cursor_chart_position.y - low_y).abs() <= hit_threshold {
+            Some((rect.id, RightRectHandle::Bottom))
+        } else {
+            None
+        }
+    })
+}
+
+fn hit_test_right_rect_body<T: Chart>(
+    chart: &T,
+    bounds: Rectangle,
+    cursor: mouse::Cursor,
+) -> Option<Uuid> {
+    let cursor_position = cursor.position_in(bounds)?;
+    let state = chart.state();
+    let cursor_chart_position = cursor_chart_position(state, bounds, cursor_position);
+    let region = state.visible_region(bounds.size());
+    let hit_threshold = 6.0 / state.scaling.max(0.001);
+    let right_x = region.x + region.width;
+
+    chart.right_rects().iter().find_map(|rect| {
+        let start_x_unclipped = horizontal_level_start_x(chart, rect.start_time)?;
+        if start_x_unclipped > right_x + hit_threshold {
+            return None;
+        }
+
+        let start_x = start_x_unclipped.max(region.x);
+        let top_y = state
+            .price_to_y(rect.high_price)
+            .min(state.price_to_y(rect.low_price));
+        let bottom_y = state
+            .price_to_y(rect.high_price)
+            .max(state.price_to_y(rect.low_price));
+
+        let within_x = cursor_chart_position.x >= start_x - hit_threshold
+            && cursor_chart_position.x <= right_x + hit_threshold;
+        let within_y = cursor_chart_position.y >= top_y - hit_threshold
+            && cursor_chart_position.y <= bottom_y + hit_threshold;
+
+        if within_x && within_y {
+            Some(rect.id)
+        } else {
+            None
+        }
+    })
+}
+
 pub(super) fn chart_mouse_interaction<T: Chart>(
     chart: &T,
     interaction: &Interaction,
@@ -220,11 +365,11 @@ pub(super) fn chart_mouse_interaction<T: Chart>(
     cursor: mouse::Cursor,
 ) -> mouse::Interaction {
     match interaction {
-        Interaction::Panning { .. } | Interaction::DraggingHorizontalLevel { .. } => {
-            mouse::Interaction::Grabbing
-        }
+        Interaction::Panning { .. }
+        | Interaction::DraggingHorizontalLevel { .. }
+        | Interaction::DraggingRightRectHandle { .. } => mouse::Interaction::Grabbing,
         Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
-        Interaction::ArmedHorizontalLevel => {
+        Interaction::ArmedHorizontalLevel | Interaction::DraftingRightRect { .. } => {
             if cursor.is_over(bounds) {
                 mouse::Interaction::Crosshair
             } else {
@@ -232,8 +377,13 @@ pub(super) fn chart_mouse_interaction<T: Chart>(
             }
         }
         Interaction::None | Interaction::Ruler { .. } => {
-            if hit_test_horizontal_level(chart, bounds, cursor).is_some() {
+            if hit_test_right_rect_handle(chart, bounds, cursor).is_some()
+                || hit_test_right_rect_body(chart, bounds, cursor).is_some()
+                || hit_test_horizontal_level(chart, bounds, cursor).is_some()
+            {
                 mouse::Interaction::Pointer
+            } else if chart.right_rect_mode() && cursor.is_over(bounds) {
+                mouse::Interaction::Crosshair
             } else if chart.horizontal_level_mode() && cursor.is_over(bounds) {
                 mouse::Interaction::Crosshair
             } else if cursor.is_over(bounds) {
@@ -243,6 +393,180 @@ pub(super) fn chart_mouse_interaction<T: Chart>(
             }
         }
     }
+}
+
+fn draw_single_right_rect(
+    chart: &impl Chart,
+    frame: &mut Frame,
+    palette: &Extended,
+    line_width: f32,
+    handle_radius: f32,
+    start_time: u64,
+    high_price: Price,
+    low_price: Price,
+    highlight_top: bool,
+    highlight_bottom: bool,
+) {
+    let state = chart.state();
+    let region = state.visible_region(frame.size());
+    let left_x_unclipped = match horizontal_level_start_x(chart, start_time) {
+        Some(x) => x,
+        None => return,
+    };
+    let right_x = region.x + region.width;
+    if left_x_unclipped > right_x {
+        return;
+    }
+
+    let left_x = left_x_unclipped.max(region.x);
+    let top_y = state
+        .price_to_y(high_price)
+        .min(state.price_to_y(low_price));
+    let bottom_y = state
+        .price_to_y(high_price)
+        .max(state.price_to_y(low_price));
+
+    if bottom_y < region.y || top_y > region.y + region.height {
+        return;
+    }
+
+    let border_color = palette.primary.base.color.scale_alpha(0.92);
+    let fill_color = palette.primary.base.color.scale_alpha(0.16);
+    let handle_fill = palette.background.weakest.color;
+
+    frame.fill_rectangle(
+        Point::new(left_x, top_y),
+        Size::new(
+            (right_x - left_x).max(1.0),
+            (bottom_y - top_y).max(line_width),
+        ),
+        fill_color,
+    );
+
+    for &(y, is_active) in &[(top_y, highlight_top), (bottom_y, highlight_bottom)] {
+        let line_color = if is_active {
+            palette.primary.strong.color
+        } else {
+            border_color
+        };
+        frame.stroke(
+            &Path::line(Point::new(left_x, y), Point::new(right_x, y)),
+            Stroke::with_color(
+                Stroke {
+                    width: line_width,
+                    ..Stroke::default()
+                },
+                line_color,
+            ),
+        );
+    }
+
+    frame.stroke(
+        &Path::line(
+            Point::new(left_x_unclipped, top_y),
+            Point::new(left_x_unclipped, bottom_y),
+        ),
+        Stroke::with_color(
+            Stroke {
+                width: line_width,
+                ..Stroke::default()
+            },
+            border_color,
+        ),
+    );
+
+    if left_x_unclipped >= region.x && left_x_unclipped <= right_x {
+        for &(y, is_active) in &[(top_y, highlight_top), (bottom_y, highlight_bottom)] {
+            let stroke_color = if is_active {
+                palette.primary.strong.color
+            } else {
+                border_color
+            };
+            frame.fill(
+                &Path::circle(Point::new(left_x_unclipped, y), handle_radius),
+                handle_fill,
+            );
+            frame.stroke(
+                &Path::circle(Point::new(left_x_unclipped, y), handle_radius),
+                Stroke::with_color(
+                    Stroke {
+                        width: line_width,
+                        ..Stroke::default()
+                    },
+                    stroke_color,
+                ),
+            );
+        }
+    }
+}
+
+pub(super) fn draw_right_rects(
+    chart: &impl Chart,
+    frame: &mut Frame,
+    theme: &Theme,
+    palette: &Extended,
+    rects: &[RightRect],
+    active_handle: Option<(Uuid, RightRectHandle)>,
+) {
+    if rects.is_empty() {
+        return;
+    }
+
+    let state = chart.state();
+    let line_width = style::horizontal_ray_width(theme);
+    let handle_radius = style::horizontal_ray_handle_radius(theme) / state.scaling.max(0.001);
+
+    for rect in rects {
+        let highlight_top = active_handle == Some((rect.id, RightRectHandle::Top));
+        let highlight_bottom = active_handle == Some((rect.id, RightRectHandle::Bottom));
+
+        draw_single_right_rect(
+            chart,
+            frame,
+            palette,
+            line_width,
+            handle_radius,
+            rect.start_time,
+            rect.high_price,
+            rect.low_price,
+            highlight_top,
+            highlight_bottom,
+        );
+    }
+}
+
+pub(super) fn draw_drafting_right_rect<T: Chart>(
+    chart: &T,
+    frame: &mut Frame,
+    theme: &Theme,
+    palette: &Extended,
+    interaction: &Interaction,
+    bounds: Rectangle,
+    cursor: mouse::Cursor,
+) {
+    let Interaction::DraftingRightRect { start_time, price } = interaction else {
+        return;
+    };
+    let Some(cursor_position) = cursor.position_in(bounds) else {
+        return;
+    };
+    let preview_price = cursor_price(chart.state(), bounds, cursor_position);
+    let line_width = style::horizontal_ray_width(theme);
+    let handle_radius =
+        style::horizontal_ray_handle_radius(theme) / chart.state().scaling.max(0.001);
+
+    draw_single_right_rect(
+        chart,
+        frame,
+        palette,
+        line_width,
+        handle_radius,
+        *start_time,
+        (*price).max(preview_price),
+        (*price).min(preview_price),
+        true,
+        true,
+    );
 }
 
 pub(super) fn draw_horizontal_levels(
@@ -381,7 +705,8 @@ fn canvas_interaction<T: Chart>(
         match interaction {
             Interaction::Panning { .. }
             | Interaction::Zoomin { .. }
-            | Interaction::DraggingHorizontalLevel { .. } => {
+            | Interaction::DraggingHorizontalLevel { .. }
+            | Interaction::DraggingRightRectHandle { .. } => {
                 *interaction = Interaction::None;
             }
             _ => {}
@@ -404,12 +729,33 @@ fn canvas_interaction<T: Chart>(
 
                     match button {
                         mouse::Button::Left => {
+                            if let Some((id, handle)) =
+                                hit_test_right_rect_handle(chart, bounds, cursor)
+                            {
+                                *interaction = Interaction::DraggingRightRectHandle { id, handle };
+                                return Some(canvas::Action::request_redraw().and_capture());
+                            }
+
                             if let Some(id) = hit_test_horizontal_level(chart, bounds, cursor) {
                                 *interaction = Interaction::DraggingHorizontalLevel { id };
                                 return Some(canvas::Action::request_redraw().and_capture());
                             }
 
                             match interaction {
+                                Interaction::DraftingRightRect { start_time, price } => {
+                                    let start_time = *start_time;
+                                    let price_a = *price;
+                                    let price_b = cursor_price(state, bounds, cursor_in_bounds);
+                                    *interaction = Interaction::None;
+                                    return Some(
+                                        canvas::Action::publish(Message::CreateRightRect {
+                                            start_time,
+                                            price_a,
+                                            price_b,
+                                        })
+                                        .and_capture(),
+                                    );
+                                }
                                 Interaction::ArmedHorizontalLevel => {
                                     let price = cursor_price(state, bounds, cursor_in_bounds);
                                     let start_time =
@@ -421,6 +767,21 @@ fn canvas_interaction<T: Chart>(
                                             price,
                                         })
                                         .and_capture(),
+                                    );
+                                }
+                                Interaction::None
+                                | Interaction::Panning { .. }
+                                | Interaction::Zoomin { .. }
+                                    if chart.right_rect_mode() =>
+                                {
+                                    let price = cursor_price(state, bounds, cursor_in_bounds);
+                                    let start_time =
+                                        cursor_anchor_time(chart, bounds, cursor_in_bounds);
+                                    *interaction =
+                                        Interaction::DraftingRightRect { start_time, price };
+                                    return Some(
+                                        canvas::Action::publish(Message::CrosshairMoved)
+                                            .and_capture(),
                                     );
                                 }
                                 Interaction::None
@@ -450,6 +811,9 @@ fn canvas_interaction<T: Chart>(
                                 Interaction::DraggingHorizontalLevel { .. } => {
                                     *interaction = Interaction::None;
                                 }
+                                Interaction::DraggingRightRectHandle { .. } => {
+                                    *interaction = Interaction::None;
+                                }
                                 Interaction::Ruler { start } if start.is_none() => {
                                     *interaction = Interaction::Ruler {
                                         start: Some(cursor_in_bounds),
@@ -461,6 +825,24 @@ fn canvas_interaction<T: Chart>(
                             }
                         }
                         mouse::Button::Right => {
+                            if matches!(interaction, Interaction::DraftingRightRect { .. }) {
+                                *interaction = Interaction::None;
+                                return Some(canvas::Action::publish(Message::CrosshairMoved));
+                            }
+
+                            if let Some((id, _)) = hit_test_right_rect_handle(chart, bounds, cursor)
+                            {
+                                return Some(
+                                    canvas::Action::publish(Message::DeleteRightRect(id))
+                                        .and_capture(),
+                                );
+                            }
+                            if let Some(id) = hit_test_right_rect_body(chart, bounds, cursor) {
+                                return Some(
+                                    canvas::Action::publish(Message::DeleteRightRect(id))
+                                        .and_capture(),
+                                );
+                            }
                             if let Some(id) = hit_test_horizontal_level(chart, bounds, cursor) {
                                 return Some(
                                     canvas::Action::publish(Message::DeleteHorizontalLevel(id))
@@ -492,6 +874,23 @@ fn canvas_interaction<T: Chart>(
                             })
                             .and_capture(),
                         )
+                    }
+                    Interaction::DraggingRightRectHandle { id, handle } => {
+                        let cursor_in_bounds = cursor_position?;
+                        let price = cursor_price(state, bounds, cursor_in_bounds);
+                        let start_time = cursor_anchor_time(chart, bounds, cursor_in_bounds);
+                        Some(
+                            canvas::Action::publish(Message::MoveRightRectHandle {
+                                id,
+                                handle,
+                                start_time,
+                                price,
+                            })
+                            .and_capture(),
+                        )
+                    }
+                    Interaction::DraftingRightRect { .. } => {
+                        Some(canvas::Action::publish(Message::CrosshairMoved).and_capture())
                     }
                     Interaction::None
                     | Interaction::ArmedHorizontalLevel
@@ -845,7 +1244,10 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
         }
         Message::CreateHorizontalLevel { .. }
         | Message::MoveHorizontalLevel { .. }
-        | Message::DeleteHorizontalLevel(_) => return,
+        | Message::DeleteHorizontalLevel(_)
+        | Message::CreateRightRect { .. }
+        | Message::MoveRightRectHandle { .. }
+        | Message::DeleteRightRect(_) => return,
         Message::CrosshairMoved => return chart.invalidate_crosshair(),
     }
     chart.invalidate_all();

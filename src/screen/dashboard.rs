@@ -82,6 +82,7 @@ pub struct Dashboard {
     pub popout: HashMap<window::Id, (pane_grid::State<pane::State>, WindowSpec)>,
     pub streams: UniqueStreams,
     shared_horizontal_levels: HashMap<TickerInfo, Vec<chart::HorizontalLevel>>,
+    shared_right_rects: HashMap<TickerInfo, Vec<chart::RightRect>>,
     layout_id: uuid::Uuid,
 }
 
@@ -96,6 +97,7 @@ impl Default for Dashboard {
             streams: UniqueStreams::default(),
             popout: HashMap::new(),
             shared_horizontal_levels: HashMap::new(),
+            shared_right_rects: HashMap::new(),
             layout_id: uuid::Uuid::new_v4(),
         }
     }
@@ -281,6 +283,13 @@ impl Dashboard {
             .unwrap_or_default()
     }
 
+    fn right_rects_for_ticker(&self, ticker_info: TickerInfo) -> Vec<chart::RightRect> {
+        self.shared_right_rects
+            .get(&ticker_info)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn sync_horizontal_levels_for_ticker(
         &mut self,
         main_window: window::Id,
@@ -290,6 +299,13 @@ impl Dashboard {
         self.iter_all_panes_mut(main_window)
             .filter(|(_, _, state)| state.stream_pair() == Some(ticker_info))
             .for_each(|(_, _, state)| state.set_shared_horizontal_levels(levels.clone()));
+    }
+
+    fn sync_right_rects_for_ticker(&mut self, main_window: window::Id, ticker_info: TickerInfo) {
+        let rects = self.right_rects_for_ticker(ticker_info);
+        self.iter_all_panes_mut(main_window)
+            .filter(|(_, _, state)| state.stream_pair() == Some(ticker_info))
+            .for_each(|(_, _, state)| state.set_shared_right_rects(rects.clone()));
     }
 
     fn apply_horizontal_level_event(
@@ -335,6 +351,54 @@ impl Dashboard {
         self.sync_horizontal_levels_for_ticker(main_window, ticker_info);
     }
 
+    fn apply_right_rect_event(
+        &mut self,
+        main_window: window::Id,
+        ticker_info: TickerInfo,
+        event: chart::RightRectEvent,
+    ) {
+        {
+            let rects = self.shared_right_rects.entry(ticker_info).or_default();
+
+            match event {
+                chart::RightRectEvent::Create {
+                    start_time,
+                    price_a,
+                    price_b,
+                } => rects.push(chart::RightRect::new(start_time, price_a, price_b)),
+                chart::RightRectEvent::MoveHandle {
+                    id,
+                    handle,
+                    start_time,
+                    price,
+                } => {
+                    if let Some(rect) = rects.iter_mut().find(|rect| rect.id == id) {
+                        rect.start_time = start_time;
+                        match handle {
+                            chart::RightRectHandle::Top => {
+                                rect.high_price = price.max(rect.low_price);
+                            }
+                            chart::RightRectHandle::Bottom => {
+                                rect.low_price = price.min(rect.high_price);
+                            }
+                        }
+                    }
+                }
+                chart::RightRectEvent::Delete(id) => rects.retain(|rect| rect.id != id),
+            }
+        }
+
+        if self
+            .shared_right_rects
+            .get(&ticker_info)
+            .is_some_and(|rects| rects.is_empty())
+        {
+            self.shared_right_rects.remove(&ticker_info);
+        }
+
+        self.sync_right_rects_for_ticker(main_window, ticker_info);
+    }
+
     fn order_entry_snapshot_task(pane_id: uuid::Uuid, ticker_info: TickerInfo) -> Task<Message> {
         Task::perform(
             async move {
@@ -368,11 +432,7 @@ impl Dashboard {
                 match exchange::adapter::submit_order(ticker_info, request).await {
                     Ok(response) => Ok(response),
                     Err(error) => {
-                        log::error!(
-                            "Order submit failed for {}: {}",
-                            ticker_info.ticker,
-                            error
-                        );
+                        log::error!("Order submit failed for {}: {}", ticker_info.ticker, error);
                         Err(error.ui_message())
                     }
                 }
@@ -395,11 +455,7 @@ impl Dashboard {
                 match exchange::adapter::cancel_order(ticker_info, request).await {
                     Ok(response) => Ok(response),
                     Err(error) => {
-                        log::error!(
-                            "Order cancel failed for {}: {}",
-                            ticker_info.ticker,
-                            error
-                        );
+                        log::error!("Order cancel failed for {}: {}", ticker_info.ticker, error);
                         Err(error.ui_message())
                     }
                 }
@@ -472,6 +528,7 @@ impl Dashboard {
             streams: UniqueStreams::default(),
             popout,
             shared_horizontal_levels: HashMap::new(),
+            shared_right_rects: HashMap::new(),
             layout_id,
         }
     }
@@ -776,6 +833,7 @@ impl Dashboard {
                     let mut initial_fetch = None;
                     let mut streams_to_add = None;
                     let all_shared_horizontal_levels = self.shared_horizontal_levels.clone();
+                    let all_shared_right_rects = self.shared_right_rects.clone();
 
                     if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         state.link_group = group;
@@ -790,10 +848,15 @@ impl Dashboard {
                                 .get(&ticker_info)
                                 .cloned()
                                 .unwrap_or_default();
+                            let shared_right_rects = all_shared_right_rects
+                                .get(&ticker_info)
+                                .cloned()
+                                .unwrap_or_default();
 
                             let streams =
                                 state.set_content_and_streams(vec![ticker_info], content_kind);
                             state.set_shared_horizontal_levels(shared_horizontal_levels);
+                            state.set_shared_right_rects(shared_right_rects);
                             Self::maybe_notify_qmt_trade_fetch_hint(state);
                             Self::set_idle_pane_status(state);
                             initial_fetch = Self::initial_history_fetch_task(
@@ -881,6 +944,13 @@ impl Dashboard {
                                     ticker_info,
                                     event,
                                 );
+                                Task::none()
+                            }
+                            pane::Effect::SharedRightRect(event) => {
+                                let Some(ticker_info) = state.stream_pair() else {
+                                    return (Task::none(), None);
+                                };
+                                self.apply_right_rect_event(main_window.id, ticker_info, event);
                                 Task::none()
                             }
                             pane::Effect::OrderEntry(action) => {
@@ -1228,11 +1298,13 @@ impl Dashboard {
         let mut initial_fetch = None;
         let mut streams_to_add = None;
         let shared_horizontal_levels = self.horizontal_levels_for_ticker(ticker_info);
+        let shared_right_rects = self.right_rects_for_ticker(ticker_info);
         if let Some(state) = self.get_mut_pane(main_window, window, selected_pane) {
             let pane_id = state.unique_id();
 
             let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
             state.set_shared_horizontal_levels(shared_horizontal_levels);
+            state.set_shared_right_rects(shared_right_rects);
             Self::maybe_notify_qmt_trade_fetch_hint(state);
             Self::set_idle_pane_status(state);
             initial_fetch =
@@ -1265,6 +1337,7 @@ impl Dashboard {
         let mut handled_focus = false;
         let mut streams_to_add = None;
         let shared_horizontal_levels = self.horizontal_levels_for_ticker(ticker_info);
+        let shared_right_rects = self.right_rects_for_ticker(ticker_info);
         if let Some((window, selected_pane)) = self.focus
             && let Some(state) = self.get_mut_pane(main_window, window, selected_pane)
         {
@@ -1276,6 +1349,7 @@ impl Dashboard {
 
             let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
             state.set_shared_horizontal_levels(shared_horizontal_levels);
+            state.set_shared_right_rects(shared_right_rects);
             Self::maybe_notify_qmt_trade_fetch_hint(state);
             Self::set_idle_pane_status(state);
 
@@ -1679,6 +1753,7 @@ impl Dashboard {
         let mut tasks = vec![];
         let layout_id = self.layout_id;
         let shared_horizontal_levels = self.shared_horizontal_levels.clone();
+        let shared_right_rects = self.shared_right_rects.clone();
 
         self.iter_all_panes_mut(main_window)
             .for_each(|(_window_id, _pane, state)| match state.tick(now) {
@@ -1726,6 +1801,7 @@ impl Dashboard {
                         let content_kind = state.content.kind();
                         let streams = state.set_content_and_streams(tickers, content_kind);
                         state.set_shared_horizontal_levels(vec![]);
+                        state.set_shared_right_rects(vec![]);
                         Self::maybe_notify_qmt_trade_fetch_hint(state);
                         Self::set_idle_pane_status(state);
                         if let Some(task) = Self::initial_history_fetch_task(
@@ -1746,7 +1822,10 @@ impl Dashboard {
                             .get(&ticker)
                             .cloned()
                             .unwrap_or_default();
+                        let shared_right_rects =
+                            shared_right_rects.get(&ticker).cloned().unwrap_or_default();
                         state.set_shared_horizontal_levels(shared_horizontal_levels);
+                        state.set_shared_right_rects(shared_right_rects);
                         Self::maybe_notify_qmt_trade_fetch_hint(state);
                         Self::set_idle_pane_status(state);
                         if let Some(task) = Self::initial_history_fetch_task(
@@ -1790,7 +1869,10 @@ impl Dashboard {
                 }
 
                 let ticker_info = streams.first()?.ticker_info();
-                if streams.iter().all(|stream| stream.ticker_info() == ticker_info) {
+                if streams
+                    .iter()
+                    .all(|stream| stream.ticker_info() == ticker_info)
+                {
                     Some((
                         ticker_info,
                         state

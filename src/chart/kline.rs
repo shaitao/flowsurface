@@ -1,6 +1,6 @@
 use super::{
     Action, Basis, Chart, HorizontalLevel, Interaction, Message, PlotConstants, PlotData,
-    TEXT_SIZE, ViewState, indicator, request_fetch, scale::linear::PriceInfoLabel,
+    RightRect, TEXT_SIZE, ViewState, indicator, request_fetch, scale::linear::PriceInfoLabel,
 };
 use crate::chart::indicator::kline::KlineIndicatorImpl;
 use crate::connector::fetcher::{FetchRange, RequestHandler, is_trade_fetch_enabled};
@@ -175,6 +175,24 @@ impl Chart for KlineChart {
         self.horizontal_level_mode = armed;
         self.invalidate(None);
     }
+
+    fn right_rects(&self) -> &[RightRect] {
+        &self.right_rects
+    }
+
+    fn set_right_rects(&mut self, rects: Vec<RightRect>) {
+        self.right_rects = rects;
+        self.invalidate(None);
+    }
+
+    fn right_rect_mode(&self) -> bool {
+        self.right_rect_mode
+    }
+
+    fn set_right_rect_mode(&mut self, armed: bool) {
+        self.right_rect_mode = armed;
+        self.invalidate(None);
+    }
 }
 
 impl PlotConstants for KlineChart {
@@ -214,6 +232,8 @@ pub struct KlineChart {
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
     horizontal_levels: Vec<HorizontalLevel>,
     horizontal_level_mode: bool,
+    right_rects: Vec<RightRect>,
+    right_rect_mode: bool,
     fetching_trades: (bool, Option<Handle>),
     pub(crate) kind: KlineChartKind,
     request_handler: RequestHandler,
@@ -370,6 +390,8 @@ impl KlineChart {
                     indicators,
                     horizontal_levels: vec![],
                     horizontal_level_mode: false,
+                    right_rects: vec![],
+                    right_rect_mode: false,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
                     kind: kind.clone(),
@@ -436,6 +458,8 @@ impl KlineChart {
                     indicators,
                     horizontal_levels: vec![],
                     horizontal_level_mode: false,
+                    right_rects: vec![],
+                    right_rect_mode: false,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
                     kind: kind.clone(),
@@ -1313,6 +1337,15 @@ impl canvas::Program<Message> for KlineChart {
                 }
             }
 
+            super::draw_right_rects(
+                self,
+                frame,
+                theme,
+                palette,
+                &self.right_rects,
+                interaction.active_right_rect_handle(),
+            );
+
             super::draw_horizontal_levels(
                 self,
                 frame,
@@ -1327,6 +1360,16 @@ impl canvas::Program<Message> for KlineChart {
 
         let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
             if let Some(cursor_position) = cursor.position_in(bounds) {
+                super::draw_drafting_right_rect(
+                    self,
+                    frame,
+                    theme,
+                    palette,
+                    interaction,
+                    bounds,
+                    cursor,
+                );
+
                 let (_, rounded_aggregation) =
                     chart.draw_crosshair(frame, theme, bounds_size, cursor_position, interaction);
 
