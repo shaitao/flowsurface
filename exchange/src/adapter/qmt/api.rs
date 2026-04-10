@@ -156,12 +156,14 @@ async fn fetch_tick_derived_history(
 
     let venue = ticker_info.exchange().venue();
     let calendar_seed_start = requested_start.saturating_sub(QMT_KLINE_SEED_CALENDAR_LOOKBACK_MS);
+    let calendar_started_at = Instant::now();
     if let Err(error) = ensure_trading_calendar(venue, calendar_seed_start, requested_end).await {
         log::warn!(
             "QMT trading calendar seed fetch failed for {}: {error}",
             ticker_info.ticker
         );
     }
+    let calendar_elapsed = calendar_started_at.elapsed();
 
     let (start, end) = if latest_day_only {
         let chunk = qmt_latest_history_chunk_range(venue, requested_start, requested_end)
@@ -195,7 +197,7 @@ async fn fetch_tick_derived_history(
     let derive_elapsed = derive_started_at.elapsed();
 
     log::info!(
-        "QMT derived history {} {} latest_day_only={} requested={:?} effective=({}..{}) seed_start={} ticks={} trades={} klines={} fetch_elapsed={:?} derive_elapsed={:?} total_elapsed={:?}",
+        "QMT derived history {} {} latest_day_only={} requested={:?} effective=({}..{}) seed_start={} ticks={} trades={} klines={} calendar_elapsed={:?} fetch_elapsed={:?} derive_elapsed={:?} total_elapsed={:?}",
         ticker_info.ticker,
         timeframe,
         latest_day_only,
@@ -206,6 +208,7 @@ async fn fetch_tick_derived_history(
         ticks.len(),
         filtered_trades.len(),
         klines.len(),
+        calendar_elapsed,
         fetch_elapsed,
         derive_elapsed,
         total_started_at.elapsed()
@@ -276,41 +279,64 @@ async fn fetch_ticks(
     ticker_info: TickerInfo,
     range: (u64, u64),
 ) -> Result<Vec<QmtTick>, AdapterError> {
+    let total_started_at = Instant::now();
     let (start, end) = range;
     let venue = ticker_info.exchange().venue();
+    let calendar_started_at = Instant::now();
     if let Err(error) = ensure_trading_calendar(venue, start, end).await {
         log::warn!(
             "QMT trading calendar fetch failed for {}: {error}",
             ticker_info.ticker
         );
     }
+    let calendar_elapsed = calendar_started_at.elapsed();
 
     let Some((start_day, end_day)) = trading_day_range_from_timestamps(start, end) else {
         return Ok(Vec::new());
     };
     let trading_days = qmt_trading_days_between(venue, start_day, end_day);
+    let trading_day_count = trading_days.len();
 
     if trading_days.is_empty() {
         return Ok(Vec::new());
     }
 
-    if trading_days.len() > 1 {
+    if trading_day_count > 1 {
         log::info!(
             "QMT historical tick fetch for {} spans {} trading days",
             ticker_info.ticker,
-            trading_days.len()
+            trading_day_count
         );
     }
 
     let mut ticks = Vec::new();
     for trading_day in trading_days {
+        let day_started_at = Instant::now();
         let mut chunk = if current_china_day() == Some(trading_day) {
             fetch_current_day_ticks(ticker_info, trading_day).await?
         } else {
             fetch_tick_day(ticker_info, trading_day).await?
         };
+        log::info!(
+            "QMT fetch_ticks day {} {} rows={} elapsed={:?}",
+            ticker_info.ticker,
+            trading_day,
+            chunk.len(),
+            day_started_at.elapsed()
+        );
         ticks.append(&mut chunk);
     }
+
+    log::info!(
+        "QMT fetch_ticks total {} range=({}..{}) trading_days={} rows={} calendar_elapsed={:?} total_elapsed={:?}",
+        ticker_info.ticker,
+        start,
+        end,
+        trading_day_count,
+        ticks.len(),
+        calendar_elapsed,
+        total_started_at.elapsed()
+    );
 
     Ok(ticks)
 }
@@ -319,6 +345,7 @@ async fn fetch_tick_day(
     ticker_info: TickerInfo,
     day: NaiveDate,
 ) -> Result<Vec<QmtTick>, AdapterError> {
+    let started_at = Instant::now();
     if let Some(error) = recent_tick_fetch_failure(ticker_info.ticker, day) {
         return Err(AdapterError::InvalidRequest(format!(
             "QMT historical tick fetch cooling down for {} on {} after previous failure: {}",
@@ -327,6 +354,13 @@ async fn fetch_tick_day(
     }
 
     if let Some(cached_ticks) = get_cached_tick_day(ticker_info.ticker, day) {
+        log::info!(
+            "QMT fetch_tick_day cache hit {} {} rows={} elapsed={:?}",
+            ticker_info.ticker,
+            day,
+            cached_ticks.len(),
+            started_at.elapsed()
+        );
         return Ok(cached_ticks);
     }
 
@@ -343,6 +377,13 @@ async fn fetch_tick_day(
     };
     clear_tick_fetch_failure(ticker_info.ticker, day);
     cache_tick_day(ticker_info.ticker, day, ticks.clone());
+    log::info!(
+        "QMT fetch_tick_day remote {} {} rows={} elapsed={:?}",
+        ticker_info.ticker,
+        day,
+        ticks.len(),
+        started_at.elapsed()
+    );
     Ok(ticks)
 }
 
@@ -350,11 +391,19 @@ async fn fetch_current_day_ticks(
     ticker_info: TickerInfo,
     day: NaiveDate,
 ) -> Result<Vec<QmtTick>, AdapterError> {
+    let started_at = Instant::now();
     if let Some(ticks) = current_day_history_snapshot_if_fresh(
         ticker_info.ticker,
         day,
         QMT_CURRENT_DAY_TICK_FETCH_TTL,
     ) {
+        log::info!(
+            "QMT current-day tick snapshot hit {} {} rows={} elapsed={:?}",
+            ticker_info.ticker,
+            day,
+            ticks.len(),
+            started_at.elapsed()
+        );
         return Ok(ticks);
     }
 
@@ -365,13 +414,23 @@ async fn fetch_current_day_ticks(
         )));
     }
 
+    let lock_started_at = Instant::now();
     let _fetch_guard = acquire_current_day_fetch_lock(ticker_info.ticker, day).await;
+    let lock_elapsed = lock_started_at.elapsed();
 
     if let Some(ticks) = current_day_history_snapshot_if_fresh(
         ticker_info.ticker,
         day,
         QMT_CURRENT_DAY_TICK_FETCH_TTL,
     ) {
+        log::info!(
+            "QMT current-day tick snapshot hit after lock {} {} rows={} lock_elapsed={:?} total_elapsed={:?}",
+            ticker_info.ticker,
+            day,
+            ticks.len(),
+            lock_elapsed,
+            started_at.elapsed()
+        );
         return Ok(ticks);
     }
 
@@ -387,17 +446,23 @@ async fn fetch_current_day_ticks(
         }
     };
     clear_tick_fetch_failure(ticker_info.ticker, day);
-    Ok(merge_current_day_history_and_live(
-        ticker_info,
+    let merged = merge_current_day_history_and_live(ticker_info, day, history_ticks);
+    log::info!(
+        "QMT current-day tick remote {} {} rows={} lock_elapsed={:?} total_elapsed={:?}",
+        ticker_info.ticker,
         day,
-        history_ticks,
-    ))
+        merged.len(),
+        lock_elapsed,
+        started_at.elapsed()
+    );
+    Ok(merged)
 }
 
 async fn fetch_tick_chunk(
     ticker_info: TickerInfo,
     range: (u64, u64),
 ) -> Result<Vec<QmtTick>, AdapterError> {
+    let total_started_at = Instant::now();
     let (start, end) = range;
     let url = qmt_bridge_http_url(
         "/api/v1/ticks",
@@ -408,9 +473,13 @@ async fn fetch_tick_chunk(
         ],
     )?;
 
+    let request_started_at = Instant::now();
     let response = reqwest::get(&url).await.map_err(AdapterError::from)?;
+    let request_elapsed = request_started_at.elapsed();
     let status = response.status();
+    let body_started_at = Instant::now();
     let text = response.text().await.map_err(AdapterError::from)?;
+    let body_elapsed = body_started_at.elapsed();
 
     if !status.is_success() {
         return Err(AdapterError::http_status_failed(
@@ -419,9 +488,24 @@ async fn fetch_tick_chunk(
         ));
     }
 
+    let parse_started_at = Instant::now();
     let parsed: BridgeItemsResponse<QmtTick> =
         serde_json::from_str(&text).map_err(|e| AdapterError::ParseError(e.to_string()))?;
-    Ok(sanitize_qmt_ticks(parsed.items))
+    let parse_elapsed = parse_started_at.elapsed();
+    let sanitized = sanitize_qmt_ticks(parsed.items);
+    log::info!(
+        "QMT fetch_tick_chunk {} range=({}..{}) status={} rows={} request_elapsed={:?} body_elapsed={:?} parse_elapsed={:?} total_elapsed={:?}",
+        ticker_info.ticker,
+        start,
+        end,
+        status,
+        sanitized.len(),
+        request_elapsed,
+        body_elapsed,
+        parse_elapsed,
+        total_started_at.elapsed()
+    );
+    Ok(sanitized)
 }
 
 pub async fn fetch_order_panel_snapshot(

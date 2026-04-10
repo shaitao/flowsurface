@@ -937,12 +937,108 @@ impl KlineChart {
         self.invalidate(None);
     }
 
+    pub fn insert_hist_klines_and_trades(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        klines_raw: &[Kline],
+        raw_trades: Vec<Trade>,
+        is_batches_done: bool,
+    ) {
+        let started_at = Instant::now();
+        let basis = self.chart.basis;
+        let ticker = self.chart.ticker_info.ticker;
+        let was_empty = self.is_empty();
+        let PlotData::TimeBased(_) = self.data_source else {
+            self.insert_raw_trades(req_id, raw_trades, is_batches_done);
+            return;
+        };
+
+        let klines_started_at = Instant::now();
+        {
+            let PlotData::TimeBased(ref mut timeseries) = self.data_source else {
+                unreachable!("time-based branch already checked");
+            };
+            timeseries.insert_klines(klines_raw);
+            timeseries.insert_trades_existing_buckets(&self.raw_trades);
+        }
+        let klines_elapsed = klines_started_at.elapsed();
+
+        let trades_started_at = Instant::now();
+        let merged_trades = self.merge_historical_trades(raw_trades);
+        let merge_elapsed = trades_started_at.elapsed();
+
+        let apply_trades_started_at = Instant::now();
+        {
+            let PlotData::TimeBased(ref mut timeseries) = self.data_source else {
+                unreachable!("time-based branch already checked");
+            };
+            timeseries.insert_trades_existing_buckets(&merged_trades);
+
+            if let Some(latest_timestamp) = timeseries.latest_timestamp() {
+                self.chart.latest_x = latest_timestamp;
+            }
+            if let Some(latest_kline) = timeseries.latest_kline() {
+                self.chart.last_price =
+                    Some(PriceInfoLabel::new(latest_kline.close, latest_kline.open));
+            }
+        }
+        let apply_trades_elapsed = apply_trades_started_at.elapsed();
+
+        if is_batches_done {
+            self.fetching_trades = (false, None);
+            if let Some(req_id) = req_id {
+                if klines_raw.is_empty() && merged_trades.is_empty() {
+                    self.request_handler
+                        .mark_failed(req_id, "No data received".to_string());
+                } else {
+                    self.request_handler.mark_completed(req_id);
+                }
+            }
+        }
+
+        let rebuild_started_at = Instant::now();
+        self.indicators
+            .values_mut()
+            .filter_map(Option::as_mut)
+            .for_each(|indi| indi.rebuild_from_source(&self.data_source));
+        let rebuild_elapsed = rebuild_started_at.elapsed();
+
+        self.invalidate(None);
+
+        let datapoints = match &self.data_source {
+            PlotData::TimeBased(timeseries) => timeseries.datapoints.len(),
+            PlotData::TickBased(tick_aggr) => tick_aggr.datapoints.len(),
+        };
+        log::info!(
+            "KlineChart applied combined batch ticker={} basis={:?} req_id={:?} klines={} merged_trades={} done={} was_empty={} now_empty={} datapoints={} raw_trades={} phase_klines={:?} phase_merge={:?} phase_apply_trades={:?} phase_rebuild={:?} total={:?}",
+            ticker,
+            basis,
+            req_id,
+            klines_raw.len(),
+            merged_trades.len(),
+            is_batches_done,
+            was_empty,
+            self.is_empty(),
+            datapoints,
+            self.raw_trades.len(),
+            klines_elapsed,
+            merge_elapsed,
+            apply_trades_elapsed,
+            rebuild_elapsed,
+            started_at.elapsed()
+        );
+    }
+
     pub fn insert_hist_klines(
         &mut self,
         req_id: uuid::Uuid,
         klines_raw: &[Kline],
         is_batches_done: bool,
     ) {
+        let started_at = Instant::now();
+        let basis = self.chart.basis;
+        let ticker = self.chart.ticker_info.ticker;
+        let was_empty = self.is_empty();
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_klines(klines_raw);
@@ -969,10 +1065,28 @@ impl KlineChart {
                         self.request_handler.mark_completed(req_id);
                     }
                 }
-                self.invalidate(None);
             }
             PlotData::TickBased(_) => {}
         }
+
+        let datapoints = match &self.data_source {
+            PlotData::TimeBased(timeseries) => timeseries.datapoints.len(),
+            PlotData::TickBased(tick_aggr) => tick_aggr.datapoints.len(),
+        };
+        self.invalidate(None);
+        log::info!(
+            "KlineChart applied kline batch ticker={} basis={:?} req_id={:?} klines={} done={} was_empty={} now_empty={} datapoints={} raw_trades={} total={:?}",
+            ticker,
+            basis,
+            req_id,
+            klines_raw.len(),
+            is_batches_done,
+            was_empty,
+            self.is_empty(),
+            datapoints,
+            self.raw_trades.len(),
+            started_at.elapsed()
+        );
     }
 
     pub fn insert_hist_klines_without_request(&mut self, klines_raw: &[Kline]) {

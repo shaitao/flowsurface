@@ -228,6 +228,18 @@ impl Dashboard {
 
         for stream in streams {
             if let StreamKind::Kline { ticker_info, .. } = stream {
+                log::info!(
+                    "Starting initial kline history fetch pane={} content={:?} stream={:?} combined_qmt={}",
+                    pane_id,
+                    content_kind,
+                    stream,
+                    matches!(content_kind, ContentKind::FootprintChart)
+                        && fetcher::is_trade_fetch_enabled()
+                        && matches!(
+                            ticker_info.exchange(),
+                            exchange::adapter::Exchange::SSH | exchange::adapter::Exchange::SSZ
+                        )
+                );
                 let task = if matches!(content_kind, ContentKind::FootprintChart)
                     && fetcher::is_trade_fetch_enabled()
                     && matches!(
@@ -1510,33 +1522,38 @@ impl Dashboard {
                     is_batches_done
                 );
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    let apply_started = Instant::now();
                     if let StreamKind::Kline {
                         timeframe,
                         ticker_info,
                     } = stream_type
                     {
-                        pane_state.insert_hist_klines(
+                        pane_state.insert_hist_klines_and_trades(
                             req_id,
                             timeframe,
                             ticker_info,
                             &klines,
+                            &trades,
                             is_batches_done,
                         );
                     }
+                    log::info!(
+                        "Dashboard applied QMT KlinesAndTrades pane={} stream={:?} req_id={:?} done={} elapsed={:?}",
+                        pane_id,
+                        stream_type,
+                        req_id,
+                        is_batches_done,
+                        apply_started.elapsed()
+                    );
 
                     if is_batches_done {
                         Self::set_idle_pane_status(pane_state);
                     }
                 }
-
-                if let Err(reason) =
-                    self.insert_fetched_trades(main_window, pane_id, None, &trades, is_batches_done)
-                {
-                    return self.handle_error(Some(pane_id), &reason, main_window);
-                }
             }
             FetchedData::Klines { data, req_id } => {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    let apply_started = Instant::now();
                     Self::set_idle_pane_status(pane_state);
 
                     if let StreamKind::Kline {
@@ -1546,6 +1563,14 @@ impl Dashboard {
                     {
                         pane_state.insert_hist_klines(req_id, timeframe, ticker_info, &data, true);
                     }
+                    log::info!(
+                        "Dashboard applied Klines pane={} stream={:?} req_id={:?} klines={} elapsed={:?}",
+                        pane_id,
+                        stream_type,
+                        req_id,
+                        data.len(),
+                        apply_started.elapsed()
+                    );
                 }
             }
             FetchedData::HeatmapHistory { trades, depths } => {

@@ -466,6 +466,8 @@ impl State {
                 let Some(chart) = chart else {
                     panic!("chart wasn't initialized when inserting klines");
                 };
+                let started_at = Instant::now();
+                let was_empty = chart.is_empty();
 
                 if let Some(id) = req_id {
                     if chart.basis() != Basis::Time(timeframe) {
@@ -496,6 +498,19 @@ impl State {
                         );
                     }
                 }
+                log::info!(
+                    "Pane applied kline history pane={} ticker={} timeframe={} req_id={:?} klines={} done={} was_empty={} now_empty={} basis={:?} elapsed={:?}",
+                    self.id,
+                    ticker_info.ticker,
+                    timeframe,
+                    req_id,
+                    klines.len(),
+                    is_batches_done,
+                    was_empty,
+                    chart.is_empty(),
+                    chart.basis(),
+                    started_at.elapsed()
+                );
             }
             Content::Comparison(chart) => {
                 let Some(chart) = chart else {
@@ -519,6 +534,84 @@ impl State {
                         Some(chart.serializable_config()),
                     );
                 }
+            }
+            _ => {
+                log::error!("pane content not candlestick or footprint");
+            }
+        }
+    }
+
+    pub fn insert_hist_klines_and_trades(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        timeframe: Timeframe,
+        ticker_info: TickerInfo,
+        klines: &[Kline],
+        trades: &[Trade],
+        is_batches_done: bool,
+    ) {
+        match &mut self.content {
+            Content::Kline {
+                chart, indicators, ..
+            } => {
+                let Some(chart) = chart else {
+                    panic!("chart wasn't initialized when inserting combined kline history");
+                };
+                let started_at = Instant::now();
+                let was_empty = chart.is_empty();
+
+                if let Some(id) = req_id {
+                    if chart.basis() != Basis::Time(timeframe) {
+                        log::warn!(
+                            "Ignoring stale combined kline fetch for timeframe {:?}; chart basis = {:?}",
+                            timeframe,
+                            chart.basis()
+                        );
+                        return;
+                    }
+
+                    chart.insert_hist_klines_and_trades(
+                        Some(id),
+                        klines,
+                        trades.to_vec(),
+                        is_batches_done,
+                    );
+                } else if chart.basis() == Basis::Time(timeframe) {
+                    chart.insert_hist_klines_and_trades(
+                        None,
+                        klines,
+                        trades.to_vec(),
+                        is_batches_done,
+                    );
+                } else {
+                    let tick_size = chart.tick_size();
+                    let layout = chart.chart_layout();
+
+                    *chart = KlineChart::new(
+                        layout,
+                        Basis::Time(timeframe),
+                        tick_size,
+                        klines,
+                        trades.to_vec(),
+                        indicators,
+                        ticker_info,
+                        chart.kind(),
+                    );
+                }
+                log::info!(
+                    "Pane applied combined kline history pane={} ticker={} timeframe={} req_id={:?} klines={} trades={} done={} was_empty={} now_empty={} basis={:?} elapsed={:?}",
+                    self.id,
+                    ticker_info.ticker,
+                    timeframe,
+                    req_id,
+                    klines.len(),
+                    trades.len(),
+                    is_batches_done,
+                    was_empty,
+                    chart.is_empty(),
+                    chart.basis(),
+                    started_at.elapsed()
+                );
             }
             _ => {
                 log::error!("pane content not candlestick or footprint");
