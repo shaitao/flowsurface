@@ -62,6 +62,29 @@ fn build_daily_seed_prices(ticks: &[QmtTick]) -> HashMap<NaiveDate, f32> {
     seeds
 }
 
+fn build_daily_seed_prices_from_klines(bars: &[QmtKlineBar]) -> HashMap<NaiveDate, f32> {
+    let mut seeds = HashMap::new();
+
+    for bar in bars {
+        let Some(day) = china_trading_day(bar.time) else {
+            continue;
+        };
+        if seeds.contains_key(&day) {
+            continue;
+        }
+
+        if let Some(price) = bar
+            .valid_pre_close()
+            .or_else(|| bar.valid_open())
+            .or_else(|| bar.valid_close())
+        {
+            seeds.insert(day, price);
+        }
+    }
+
+    seeds
+}
+
 pub(super) fn synthesize_trades_from_ticks(
     ticks: &[QmtTick],
     ticker_info: TickerInfo,
@@ -275,6 +298,183 @@ pub(super) fn aggregate_trades_to_klines(
     }
 
     Ok(klines)
+}
+
+pub(super) fn aggregate_source_klines_to_klines(
+    bars: &[QmtKlineBar],
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<Vec<Kline>, AdapterError> {
+    if end_ms < start_ms {
+        return Ok(Vec::new());
+    }
+
+    let interval_ms = qmt_timeframe_ms(timeframe).ok_or_else(|| {
+        AdapterError::InvalidRequest(format!(
+            "unsupported QMT timeframe for source-klines aggregation: {timeframe}"
+        ))
+    })?;
+
+    #[derive(Clone, Copy)]
+    struct AggBar {
+        time: u64,
+        open: f32,
+        high: f32,
+        low: f32,
+        close: f32,
+        volume: f32,
+    }
+
+    let venue = ticker_info.exchange().venue();
+    let mut aggregated = HashMap::<u64, AggBar>::new();
+
+    for source_bar in bars.iter().cloned() {
+        let Some(bucket) = qmt_bucket_start(venue, source_bar.time, timeframe) else {
+            continue;
+        };
+        if bucket > end_ms || bucket.saturating_add(interval_ms) <= start_ms {
+            continue;
+        }
+
+        let Some(open) = source_bar.valid_open() else {
+            continue;
+        };
+        let high = source_bar.valid_high().unwrap_or(open);
+        let low = source_bar.valid_low().unwrap_or(open);
+        let close = source_bar.valid_close().unwrap_or(open);
+        let volume = source_bar.volume_qty();
+
+        match aggregated.get_mut(&bucket) {
+            Some(bar) => {
+                bar.high = bar.high.max(high);
+                bar.low = bar.low.min(low);
+                bar.close = close;
+                bar.volume += volume;
+            }
+            None => {
+                aggregated.insert(
+                    bucket,
+                    AggBar {
+                        time: bucket,
+                        open,
+                        high,
+                        low,
+                        close,
+                        volume,
+                    },
+                );
+            }
+        }
+    }
+
+    let seed_prices = build_daily_seed_prices_from_klines(bars);
+    let bucket_starts = qmt_trading_bucket_starts(venue, start_ms, end_ms, timeframe);
+    if bucket_starts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut previous_close = None::<f32>;
+    let mut klines = Vec::with_capacity(bucket_starts.len());
+    for bucket in bucket_starts {
+        if let Some(bar) = aggregated.remove(&bucket) {
+            previous_close = Some(bar.close);
+            klines.push(Kline::new(
+                bar.time,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                Volume::TotalOnly(Qty::from_f32(bar.volume).round_to_min_qty(ticker_info.min_qty)),
+                ticker_info.min_ticksize,
+            ));
+            continue;
+        }
+
+        let Some(day) = china_trading_day(bucket) else {
+            continue;
+        };
+        if previous_close.is_none() {
+            previous_close = seed_prices.get(&day).copied();
+        }
+        let Some(close) = previous_close else {
+            continue;
+        };
+
+        klines.push(Kline::new(
+            bucket,
+            close,
+            close,
+            close,
+            close,
+            Volume::TotalOnly(Qty::ZERO),
+            ticker_info.min_ticksize,
+        ));
+    }
+
+    Ok(klines)
+}
+
+pub(super) fn synthesize_trades_from_1m_klines(
+    bars: &[QmtKlineBar],
+    ticker_info: TickerInfo,
+) -> Vec<Trade> {
+    let mut trades = Vec::new();
+
+    for bar in bars {
+        let Some(open) = bar.valid_open() else {
+            continue;
+        };
+        let Some(close) = bar.valid_close() else {
+            continue;
+        };
+
+        let total_qty = Qty::from_f32(bar.volume_qty()).round_to_min_qty(ticker_info.min_qty);
+        if total_qty <= Qty::ZERO {
+            continue;
+        }
+
+        if close > open + f32::EPSILON {
+            trades.push(Trade {
+                time: bar.time,
+                is_sell: false,
+                price: Price::from_f32(close),
+                qty: total_qty,
+            });
+            continue;
+        }
+
+        if close + f32::EPSILON < open {
+            trades.push(Trade {
+                time: bar.time,
+                is_sell: true,
+                price: Price::from_f32(close),
+                qty: total_qty,
+            });
+            continue;
+        }
+
+        let (buy_qty, sell_qty) = split_synthetic_qty(total_qty);
+        if buy_qty > Qty::ZERO {
+            trades.push(Trade {
+                time: bar.time,
+                is_sell: false,
+                price: Price::from_f32(close),
+                qty: buy_qty,
+            });
+        }
+        if sell_qty > Qty::ZERO {
+            trades.push(Trade {
+                time: bar.time.saturating_add(1),
+                is_sell: true,
+                price: Price::from_f32(close),
+                qty: sell_qty,
+            });
+        }
+    }
+
+    trades
 }
 
 fn split_synthetic_qty(total_qty: Qty) -> (Qty, Qty) {

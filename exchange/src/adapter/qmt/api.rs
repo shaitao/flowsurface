@@ -62,7 +62,7 @@ pub async fn fetch_klines(
     range: Option<(u64, u64)>,
 ) -> Result<Vec<Kline>, AdapterError> {
     Ok(
-        fetch_tick_derived_history(ticker_info, timeframe, range, false)
+        fetch_history_with_kline_fallback(ticker_info, timeframe, range, false)
             .await?
             .0,
     )
@@ -73,7 +73,7 @@ pub async fn fetch_klines_and_trades(
     timeframe: Timeframe,
     range: Option<(u64, u64)>,
 ) -> Result<(Vec<Kline>, Vec<Trade>), AdapterError> {
-    fetch_tick_derived_history(ticker_info, timeframe, range, true).await
+    fetch_history_with_kline_fallback(ticker_info, timeframe, range, true).await
 }
 
 pub async fn historical_day_ranges(
@@ -205,13 +205,153 @@ async fn fetch_tick_derived_history(
     Ok((klines, filtered_trades))
 }
 
+async fn fetch_history_with_kline_fallback(
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    range: Option<(u64, u64)>,
+    latest_day_only: bool,
+) -> Result<(Vec<Kline>, Vec<Trade>), AdapterError> {
+    match fetch_tick_derived_history(ticker_info, timeframe, range, latest_day_only).await {
+        Ok((klines, trades)) if !klines.is_empty() || !trades.is_empty() => Ok((klines, trades)),
+        Ok((klines, trades)) => {
+            log::warn!(
+                "QMT tick-derived history empty for {} {} latest_day_only={} range={:?}; falling back to 1m klines",
+                ticker_info.ticker,
+                timeframe,
+                latest_day_only,
+                range
+            );
+            let fallback =
+                fetch_history_from_1m_klines(ticker_info, timeframe, range, latest_day_only)
+                    .await?;
+            if fallback.0.is_empty() {
+                Ok((klines, trades))
+            } else {
+                Ok(fallback)
+            }
+        }
+        Err(error) => {
+            log::warn!(
+                "QMT tick-derived history failed for {} {} latest_day_only={} range={:?}; falling back to 1m klines: {}",
+                ticker_info.ticker,
+                timeframe,
+                latest_day_only,
+                range,
+                error
+            );
+            let fallback =
+                fetch_history_from_1m_klines(ticker_info, timeframe, range, latest_day_only)
+                    .await?;
+            if fallback.0.is_empty() {
+                Err(error)
+            } else {
+                Ok(fallback)
+            }
+        }
+    }
+}
+
+fn qmt_kline_fallback_source_start(venue: Venue, start_ms: u64, timeframe: Timeframe) -> u64 {
+    qmt_bucket_start(venue, start_ms, timeframe)
+        .or_else(|| qmt_kline_seed_start(venue, start_ms))
+        .unwrap_or(start_ms)
+}
+
+async fn fetch_history_from_1m_klines(
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    range: Option<(u64, u64)>,
+    latest_day_only: bool,
+) -> Result<(Vec<Kline>, Vec<Trade>), AdapterError> {
+    let total_started_at = Instant::now();
+    let (requested_start, requested_end) = range
+        .or_else(|| qmt_default_kline_range(timeframe))
+        .ok_or_else(|| {
+            AdapterError::InvalidRequest(format!(
+                "unsupported QMT timeframe for fallback klines: {timeframe}"
+            ))
+        })?;
+
+    let venue = ticker_info.exchange().venue();
+    let (start, end) = if latest_day_only {
+        qmt_latest_history_chunk_range(venue, requested_start, requested_end)
+            .unwrap_or((requested_start, requested_end))
+    } else {
+        (requested_start, requested_end)
+    };
+
+    let source_start = qmt_kline_fallback_source_start(venue, start, timeframe);
+    let fetch_started_at = Instant::now();
+    let source_bars = fetch_kline_chunk(ticker_info, "1m", (source_start, end)).await?;
+    let fetch_elapsed = fetch_started_at.elapsed();
+
+    let derive_started_at = Instant::now();
+    let all_trades = synthesize_trades_from_1m_klines(&source_bars, ticker_info);
+    let klines =
+        aggregate_source_klines_to_klines(&source_bars, ticker_info, timeframe, start, end)?;
+    let trades = all_trades
+        .into_iter()
+        .filter(|trade| start <= trade.time && trade.time <= end)
+        .collect::<Vec<_>>();
+    let derive_elapsed = derive_started_at.elapsed();
+
+    log::info!(
+        "QMT 1m-kline fallback {} {} latest_day_only={} requested={:?} effective=({}..{}) source_start={} source_bars={} klines={} trades={} fetch_elapsed={:?} derive_elapsed={:?} total_elapsed={:?}",
+        ticker_info.ticker,
+        timeframe,
+        latest_day_only,
+        range,
+        start,
+        end,
+        source_start,
+        source_bars.len(),
+        klines.len(),
+        trades.len(),
+        fetch_elapsed,
+        derive_elapsed,
+        total_started_at.elapsed()
+    );
+
+    Ok((klines, trades))
+}
+
 pub async fn fetch_trades(
     ticker_info: TickerInfo,
     range: (u64, u64),
 ) -> Result<Vec<Trade>, AdapterError> {
     let (start, end) = range;
-    let ticks = fetch_ticks(ticker_info, (start, end)).await?;
-    Ok(synthesize_trades_from_ticks(&ticks, ticker_info)
+    match fetch_ticks(ticker_info, (start, end)).await {
+        Ok(ticks) => {
+            let trades = synthesize_trades_from_ticks(&ticks, ticker_info)
+                .into_iter()
+                .filter(|trade| start <= trade.time && trade.time <= end)
+                .collect::<Vec<_>>();
+            if !trades.is_empty() {
+                return Ok(trades);
+            }
+
+            log::warn!(
+                "QMT fetch_trades {} range=({}..{}) had no tick-derived trades; falling back to 1m klines",
+                ticker_info.ticker,
+                start,
+                end
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "QMT fetch_trades {} range=({}..{}) tick fetch failed; falling back to 1m klines: {}",
+                ticker_info.ticker,
+                start,
+                end,
+                error
+            );
+        }
+    }
+
+    let source_start =
+        qmt_kline_fallback_source_start(ticker_info.exchange().venue(), start, Timeframe::M1);
+    let source_bars = fetch_kline_chunk(ticker_info, "1m", (source_start, end)).await?;
+    Ok(synthesize_trades_from_1m_klines(&source_bars, ticker_info)
         .into_iter()
         .filter(|trade| start <= trade.time && trade.time <= end)
         .collect())
@@ -538,6 +678,72 @@ async fn fetch_tick_chunk(
         total_started_at.elapsed()
     );
     Ok(sanitized)
+}
+
+async fn fetch_kline_chunk(
+    ticker_info: TickerInfo,
+    period: &str,
+    range: (u64, u64),
+) -> Result<Vec<QmtKlineBar>, AdapterError> {
+    let total_started_at = Instant::now();
+    let (start, end) = range;
+    let url = qmt_bridge_http_url(
+        "/api/v1/klines",
+        &[
+            ("symbol", ticker_info.ticker.to_string()),
+            ("period", period.to_string()),
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+        ],
+    )?;
+
+    let request_started_at = Instant::now();
+    let response = qmt_bridge_http_client()
+        .get(&url)
+        .header(reqwest::header::ACCEPT, QMT_BRIDGE_MSGPACK_CONTENT_TYPE)
+        .send()
+        .await
+        .map_err(AdapterError::from)?;
+    let request_elapsed = request_started_at.elapsed();
+    let status = response.status();
+    let is_msgpack = qmt_response_is_msgpack(&response);
+    let body_started_at = Instant::now();
+    let bytes = response.bytes().await.map_err(AdapterError::from)?;
+    let body_elapsed = body_started_at.elapsed();
+
+    if !status.is_success() {
+        return Err(AdapterError::http_status_failed(
+            status,
+            format!(
+                "GET {url} failed: {}",
+                qmt_response_body_to_error_detail(&bytes, is_msgpack)
+            ),
+        ));
+    }
+
+    if !is_msgpack {
+        return Err(AdapterError::ParseError(format!(
+            "QMT bridge returned unexpected content type for GET {url}"
+        )));
+    }
+
+    let parse_started_at = Instant::now();
+    let parsed: BridgeItemsResponse<QmtKlineBar> = qmt_decode_msgpack(&bytes)?;
+    let parse_elapsed = parse_started_at.elapsed();
+    log::info!(
+        "QMT fetch_kline_chunk {} period={} range=({}..{}) status={} rows={} request_elapsed={:?} body_elapsed={:?} parse_elapsed={:?} total_elapsed={:?}",
+        ticker_info.ticker,
+        period,
+        start,
+        end,
+        status,
+        parsed.items.len(),
+        request_elapsed,
+        body_elapsed,
+        parse_elapsed,
+        total_started_at.elapsed()
+    );
+    Ok(parsed.items)
 }
 
 pub async fn fetch_order_panel_snapshot(

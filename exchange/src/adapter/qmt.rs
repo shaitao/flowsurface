@@ -296,6 +296,46 @@ impl QmtTick {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QmtKlineBar {
+    time: u64,
+    open: f32,
+    high: f32,
+    low: f32,
+    close: f32,
+    volume: f32,
+    #[allow(dead_code)]
+    amount: f32,
+    pre_close: Option<f32>,
+}
+
+impl QmtKlineBar {
+    fn valid_open(&self) -> Option<f32> {
+        positive_f32(self.open)
+    }
+
+    fn valid_high(&self) -> Option<f32> {
+        positive_f32(self.high)
+    }
+
+    fn valid_low(&self) -> Option<f32> {
+        positive_f32(self.low)
+    }
+
+    fn valid_close(&self) -> Option<f32> {
+        positive_f32(self.close)
+    }
+
+    fn valid_pre_close(&self) -> Option<f32> {
+        self.pre_close.and_then(positive_f32)
+    }
+
+    fn volume_qty(&self) -> f32 {
+        self.volume.max(0.0) * QMT_VOLUME_LOT_SIZE
+    }
+}
+
 fn positive_f32(value: f32) -> Option<f32> {
     (value > 0.0).then_some(value)
 }

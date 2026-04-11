@@ -41,6 +41,19 @@ fn sample_tick(time: u64) -> QmtTick {
     }
 }
 
+fn sample_kline_bar(time: u64) -> QmtKlineBar {
+    QmtKlineBar {
+        time,
+        open: 82.0,
+        high: 82.0,
+        low: 82.0,
+        close: 82.0,
+        volume: 1.0,
+        amount: 8_200.0,
+        pre_close: Some(81.8),
+    }
+}
+
 fn sample_depth_seed() -> Depth {
     let bids = [
         (99.96, 960.0),
@@ -467,6 +480,114 @@ fn aggregate_trades_to_klines_uses_tick_open_for_opening_bucket() {
     assert_eq!(first.high.to_f32(), 82.37);
     assert!((first.low.to_f32() - 81.80).abs() < 0.001);
     assert_eq!(first.close.to_f32(), 82.02);
+}
+
+#[test]
+fn aggregate_source_klines_to_klines_aggregates_from_1m_bars() {
+    let ticker_info = sample_ticker_info();
+    let start = china_ms(2026, 4, 9, 9, 30, 0);
+    let end = start + 180_000;
+
+    let mut bar1 = sample_kline_bar(start);
+    bar1.open = 82.00;
+    bar1.high = 82.05;
+    bar1.low = 81.98;
+    bar1.close = 82.04;
+    bar1.volume = 2.0;
+
+    let mut bar2 = sample_kline_bar(start + 60_000);
+    bar2.open = 82.04;
+    bar2.high = 82.08;
+    bar2.low = 82.01;
+    bar2.close = 82.06;
+    bar2.volume = 3.0;
+
+    let mut bar3 = sample_kline_bar(start + 120_000);
+    bar3.open = 82.06;
+    bar3.high = 82.11;
+    bar3.low = 82.00;
+    bar3.close = 82.02;
+    bar3.volume = 5.0;
+
+    let bars = aggregate_source_klines_to_klines(
+        &[bar1, bar2, bar3],
+        ticker_info,
+        Timeframe::M3,
+        start,
+        end,
+    )
+    .expect("expected aggregated klines");
+
+    let first = bars.first().expect("expected one bar");
+    assert_eq!(first.time, start);
+    assert_eq!(first.open.to_f32(), 82.00);
+    assert_eq!(first.high.to_f32(), 82.11);
+    assert_eq!(first.low.to_f32(), 81.98);
+    assert_eq!(first.close.to_f32(), 82.02);
+    assert_eq!(f32::from(first.volume.total()), 1_000.0);
+}
+
+#[test]
+fn aggregate_source_klines_to_klines_fills_missing_first_bucket_from_preclose() {
+    let ticker_info = sample_ticker_info();
+    let start = china_ms(2026, 4, 9, 9, 30, 0);
+    let end = start + 360_000;
+
+    let mut bar = sample_kline_bar(start + 180_000);
+    bar.open = 82.20;
+    bar.high = 82.30;
+    bar.low = 82.10;
+    bar.close = 82.25;
+    bar.volume = 4.0;
+    bar.pre_close = Some(81.90);
+
+    let bars = aggregate_source_klines_to_klines(&[bar], ticker_info, Timeframe::M3, start, end)
+        .expect("expected aggregated klines");
+
+    let first = bars.first().expect("expected first filled bar");
+    assert_eq!(first.time, start);
+    assert_eq!(first.open.to_f32(), 81.90);
+    assert_eq!(first.high.to_f32(), 81.90);
+    assert_eq!(first.low.to_f32(), 81.90);
+    assert_eq!(first.close.to_f32(), 81.90);
+    assert_eq!(f32::from(first.volume.total()), 0.0);
+}
+
+#[test]
+fn synthesize_trades_from_1m_klines_uses_single_directional_trade() {
+    let ticker_info = sample_ticker_info();
+    let start = china_ms(2026, 4, 9, 9, 30, 0);
+
+    let mut bar = sample_kline_bar(start);
+    bar.open = 82.00;
+    bar.close = 82.08;
+    bar.volume = 2.0;
+
+    let trades = synthesize_trades_from_1m_klines(&[bar], ticker_info);
+    assert_eq!(trades.len(), 1);
+    assert!(!trades[0].is_sell);
+    assert_eq!(trades[0].time, start);
+    assert_eq!(trades[0].price.to_f32(), 82.08);
+    assert_eq!(f32::from(trades[0].qty), 200.0);
+}
+
+#[test]
+fn synthesize_trades_from_1m_klines_splits_flat_bar() {
+    let ticker_info = sample_ticker_info();
+    let start = china_ms(2026, 4, 9, 9, 31, 0);
+
+    let mut bar = sample_kline_bar(start);
+    bar.open = 82.05;
+    bar.close = 82.05;
+    bar.volume = 3.0;
+
+    let trades = synthesize_trades_from_1m_klines(&[bar], ticker_info);
+    assert_eq!(trades.len(), 2);
+    assert!(!trades[0].is_sell);
+    assert!(trades[1].is_sell);
+    assert_eq!(trades[0].price.to_f32(), 82.05);
+    assert_eq!(trades[1].price.to_f32(), 82.05);
+    assert_eq!(f32::from(trades[0].qty) + f32::from(trades[1].qty), 300.0);
 }
 
 #[test]
