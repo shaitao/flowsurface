@@ -9,7 +9,10 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const CLEANUP_THRESHOLD: usize = 4800;
+// A full A-share trading day at 3s basis is 4h / 3s = 4,800 buckets.
+// Keep enough headroom so a full day plus replay/live overlap does not evict
+// the opening session immediately after the initial history load.
+pub const CLEANUP_THRESHOLD: usize = 14_400;
 
 /// Allow up to 500ms delay in order updates before starting a new order run.
 /// Prevents fragmentation(e.g. network latency) when qty and is_bid remain unchanged.

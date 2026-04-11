@@ -1,8 +1,9 @@
 use super::{
-    Chart, HorizontalLevel, Interaction, Message, PlotConstants, RightRect, TEXT_SIZE, ViewState,
-    scale::linear::PriceInfoLabel,
+    Action, Chart, HorizontalLevel, Interaction, Message, PlotConstants, RightRect, TEXT_SIZE,
+    ViewState, request_fetch, scale::linear::PriceInfoLabel,
 };
 use crate::{
+    connector::fetcher::{FetchRange, RequestHandler},
     modal::pane::settings::study::{self, Study},
     style,
 };
@@ -185,6 +186,7 @@ enum IndicatorData {
 
 pub struct HeatmapChart {
     chart: ViewState,
+    request_handler: RequestHandler,
     trades: TimeSeries<HeatmapDataPoint>,
     indicators: EnumMap<HeatmapIndicator, Option<IndicatorData>>,
     horizontal_levels: Vec<HorizontalLevel>,
@@ -196,6 +198,7 @@ pub struct HeatmapChart {
     pending_history_depths: BTreeMap<u64, Depth>,
     history_sync_pending: bool,
     replay_cutoff_time: Option<u64>,
+    oldest_history_time: Option<u64>,
     heatmap: HistoricalDepth,
     visual_config: Config,
     study_configurator: study::Configurator<HeatmapStudy>,
@@ -237,6 +240,7 @@ impl HeatmapChart {
 
         HeatmapChart {
             chart: view_state,
+            request_handler: RequestHandler::default(),
             indicators,
             horizontal_levels: vec![],
             horizontal_level_mode: false,
@@ -247,6 +251,7 @@ impl HeatmapChart {
             pending_history_depths: BTreeMap::new(),
             history_sync_pending: false,
             replay_cutoff_time: None,
+            oldest_history_time: None,
             heatmap,
             trades: TimeSeries::<HeatmapDataPoint>::new(basis, step),
             visual_config: config.unwrap_or_default(),
@@ -374,6 +379,8 @@ impl HeatmapChart {
         self.pending_history_depths.clear();
         self.history_sync_pending = false;
         self.replay_cutoff_time = None;
+        self.oldest_history_time = None;
+        self.request_handler = RequestHandler::default();
 
         let chart = &mut self.chart;
         chart.translation = Vector::new(
@@ -440,6 +447,8 @@ impl HeatmapChart {
         self.pending_history_depths.clear();
         self.history_sync_pending = false;
         self.replay_cutoff_time = None;
+        self.oldest_history_time = None;
+        self.request_handler = RequestHandler::default();
     }
 
     pub fn tick_size(&self) -> PriceStep {
@@ -471,6 +480,7 @@ impl HeatmapChart {
 
         if let Some(t) = now {
             self.last_tick = t;
+            return self.fetch_missing_data();
         }
 
         None
@@ -500,7 +510,30 @@ impl HeatmapChart {
 
         self.replay_cutoff_time = history_cutoff;
         self.flush_pending_history_updates();
+        self.record_history_range(trades, depths);
         self.cleanup_old_data();
+        self.invalidate(Some(Instant::now()));
+    }
+
+    pub fn insert_additional_history(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        trades: &[Trade],
+        depths: &[(u64, Depth)],
+    ) {
+        self.apply_historical_updates(trades, depths);
+        self.record_history_range(trades, depths);
+        self.cleanup_old_data();
+
+        if let Some(req_id) = req_id {
+            if trades.is_empty() && depths.is_empty() {
+                self.request_handler
+                    .mark_failed(req_id, "No data received".to_string());
+            } else {
+                self.request_handler.mark_completed(req_id);
+            }
+        }
+
         self.invalidate(Some(Instant::now()));
     }
 
@@ -532,6 +565,10 @@ impl HeatmapChart {
     }
 
     fn replay_history_updates_as_live(&mut self, trades: &[Trade], depths: &[(u64, Depth)]) {
+        self.apply_historical_updates(trades, depths);
+    }
+
+    fn apply_historical_updates(&mut self, trades: &[Trade], depths: &[(u64, Depth)]) {
         let mut trade_index = 0usize;
         let mut depth_index = 0usize;
 
@@ -539,19 +576,19 @@ impl HeatmapChart {
             match (trades.get(trade_index), depths.get(depth_index)) {
                 (Some(trade), Some((depth_time, depth))) => {
                     if *depth_time <= trade.time {
-                        self.insert_depth(depth, *depth_time);
+                        self.insert_historical_depth_at(*depth_time, depth);
                         depth_index += 1;
                     } else {
-                        self.insert_trades(std::slice::from_ref(trade), trade.time);
+                        self.insert_trade_at_time(trade, trade.time);
                         trade_index += 1;
                     }
                 }
                 (Some(trade), None) => {
-                    self.insert_trades(std::slice::from_ref(trade), trade.time);
+                    self.insert_trade_at_time(trade, trade.time);
                     trade_index += 1;
                 }
                 (None, Some((depth_time, depth))) => {
-                    self.insert_depth(depth, *depth_time);
+                    self.insert_historical_depth_at(*depth_time, depth);
                     depth_index += 1;
                 }
                 (None, None) => break,
@@ -585,6 +622,65 @@ impl HeatmapChart {
             chart.base_price_y = trade.price.round_to_step(chart.tick_size);
             chart.last_price = Some(PriceInfoLabel::Neutral(trade.price));
         }
+    }
+
+    fn insert_historical_depth_at(&mut self, depth_update_t: u64, depth: &Depth) {
+        let rounded_depth_update = self.round_to_basis_time(depth_update_t);
+        self.heatmap
+            .insert_latest_depth(depth, rounded_depth_update);
+
+        let chart = &mut self.chart;
+        if rounded_depth_update >= chart.latest_x {
+            let mid_price = depth.mid_price().unwrap_or(chart.base_price_y);
+            chart.base_price_y = mid_price.round_to_step(chart.tick_size);
+            chart.last_price = Some(PriceInfoLabel::Neutral(mid_price));
+            chart.latest_x = rounded_depth_update;
+        }
+    }
+
+    fn record_history_range(&mut self, trades: &[Trade], depths: &[(u64, Depth)]) {
+        let earliest = trades
+            .iter()
+            .map(|trade| trade.time)
+            .chain(depths.iter().map(|(time, _)| *time))
+            .min();
+
+        if let Some(earliest) = earliest {
+            self.oldest_history_time = Some(
+                self.oldest_history_time
+                    .map_or(earliest, |loaded| loaded.min(earliest)),
+            );
+        }
+    }
+
+    pub fn request_missing_history(&mut self) -> Option<Action> {
+        self.fetch_missing_data()
+    }
+
+    pub fn mark_request_failed(&mut self, req_id: uuid::Uuid, error: String) {
+        self.request_handler.mark_failed(req_id, error);
+    }
+
+    fn fetch_missing_data(&mut self) -> Option<Action> {
+        if self.history_sync_pending {
+            return None;
+        }
+
+        let oldest_loaded = self.oldest_history_time?;
+        let (visible_earliest, _) = self.visible_timerange()?;
+        let venue = self.chart.ticker_info.exchange().venue();
+        let (fetch_from, _) =
+            exchange::adapter::qmt::heatmap_history_day_range(venue, visible_earliest)?;
+        let fetch_to = oldest_loaded.saturating_sub(1);
+
+        if fetch_from >= oldest_loaded {
+            return None;
+        }
+
+        request_fetch(
+            &mut self.request_handler,
+            FetchRange::HeatmapHistory(fetch_from, fetch_to),
+        )
     }
 
     fn calc_qty_scales(
@@ -659,6 +755,8 @@ impl canvas::Program<Message> for HeatmapChart {
 
             let (earliest, latest) = chart.interval_range(&region);
             let (highest, lowest) = chart.price_range(&region);
+            let (rounded_highest, rounded_lowest) =
+                rounded_visible_price_range(chart, highest, lowest);
 
             if latest < earliest {
                 return;
@@ -745,28 +843,28 @@ impl canvas::Program<Message> for HeatmapChart {
             }
 
             if let Some(latest_timestamp) = self.trades.latest_timestamp() {
-                let max_qty = self
+                let latest_runs = self
                     .heatmap
-                    .latest_order_runs(highest, lowest, latest_timestamp)
+                    .latest_order_runs(rounded_highest, rounded_lowest, latest_timestamp)
+                    .collect::<Vec<_>>();
+
+                if let Some(max_qty) = latest_runs
+                    .iter()
                     .map(|(_, run)| run.qty.to_f32_lossy())
-                    .fold(f32::MIN, f32::max)
-                    .ceil()
-                    * 5.0
-                    / 5.0;
+                    .reduce(f32::max)
+                {
+                    let max_qty = max_qty.ceil() * 5.0 / 5.0;
 
-                if !max_qty.is_infinite() {
-                    self.heatmap
-                        .latest_order_runs(highest, lowest, latest_timestamp)
-                        .for_each(|(price, run)| {
-                            let y_position = chart.price_to_y(*price);
-                            let bar_width = (run.qty.to_f32_lossy() / max_qty) * 50.0;
+                    latest_runs.into_iter().for_each(|(price, run)| {
+                        let y_position = chart.price_to_y(*price);
+                        let bar_width = (run.qty.to_f32_lossy() / max_qty) * 50.0;
 
-                            frame.fill_rectangle(
-                                Point::new(0.0, y_position - (cell_height / 2.0)),
-                                Size::new(bar_width, cell_height),
-                                depth_color(palette, run.is_bid, 0.5),
-                            );
-                        });
+                        frame.fill_rectangle(
+                            Point::new(0.0, y_position - (cell_height / 2.0)),
+                            Size::new(bar_width, cell_height),
+                            depth_color(palette, run.is_bid, 0.5),
+                        );
+                    });
 
                     // max bid/ask quantity text
                     let text_size = 9.0 / chart.scaling;
@@ -937,6 +1035,8 @@ impl canvas::Program<Message> for HeatmapChart {
                     profile_kind,
                     palette,
                     chart,
+                    rounded_highest,
+                    rounded_lowest,
                     &self.trades,
                     area_width,
                 );
@@ -986,6 +1086,8 @@ impl canvas::Program<Message> for HeatmapChart {
                 palette,
                 &self.horizontal_levels,
                 interaction.active_horizontal_level_id(),
+                bounds,
+                cursor,
             );
         });
 
@@ -1150,11 +1252,11 @@ fn draw_volume_profile(
     kind: &ProfileKind,
     palette: &Extended,
     chart: &ViewState,
+    rounded_highest: Price,
+    rounded_lowest: Price,
     timeseries: &TimeSeries<HeatmapDataPoint>,
     area_width: f32,
 ) {
-    let (highest, lowest) = chart.price_range(region);
-
     let time_range = match kind {
         ProfileKind::VisibleRange => {
             let earliest = chart.x_to_interval(region.x);
@@ -1177,9 +1279,8 @@ fn draw_volume_profile(
     };
 
     let step = chart.tick_size;
-
-    let first_tick = lowest.round_to_side_step(false, step);
-    let last_tick = highest.round_to_side_step(true, step);
+    let first_tick = rounded_lowest;
+    let last_tick = rounded_highest;
 
     let num_ticks = match Price::steps_between_inclusive(first_tick, last_tick, step) {
         Some(n) => n,
@@ -1196,7 +1297,7 @@ fn draw_volume_profile(
     timeseries.datapoints.range(time_range).for_each(|(_, dp)| {
         dp.grouped_trades
             .iter()
-            .filter(|trade| trade.price >= lowest && trade.price <= highest)
+            .filter(|trade| trade.price >= rounded_lowest && trade.price <= rounded_highest)
             .for_each(|trade| {
                 let grouped_price = trade.price.round_to_side_step(trade.is_sell, step);
 
@@ -1264,26 +1365,40 @@ fn draw_volume_profile(
     }
 }
 
+fn rounded_visible_price_range(chart: &ViewState, highest: Price, lowest: Price) -> (Price, Price) {
+    let step = chart.tick_size;
+    (
+        highest.round_to_side_step(false, step),
+        lowest.round_to_side_step(true, step),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{FixedOffset, NaiveDate, TimeZone};
     use data::chart::ViewConfig;
     use exchange::{
         Ticker,
-        adapter::Exchange,
+        adapter::{Exchange, StreamKind},
         depth::Depth,
         unit::{Price, Qty},
     };
+    use iced::{Rectangle, Size, Vector};
     use std::collections::BTreeMap;
 
     fn sample_chart() -> HeatmapChart {
+        sample_chart_with_step(0.01)
+    }
+
+    fn sample_chart_with_step(step: f32) -> HeatmapChart {
         let ticker = Ticker::new("600309.SH", Exchange::SSH);
         let ticker_info = TickerInfo::new(ticker, 0.01, 1.0, None);
 
         HeatmapChart::new(
             ViewConfig::default(),
             Basis::Time(exchange::Timeframe::MS3000),
-            PriceStep::from_f32(0.01),
+            PriceStep::from_f32(step),
             &[HeatmapIndicator::Volume],
             ticker_info,
             None,
@@ -1307,6 +1422,20 @@ mod tests {
             bids,
             asks: BTreeMap::new(),
         }
+    }
+
+    fn china_timestamp(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> u64 {
+        FixedOffset::east_opt(8 * 60 * 60)
+            .unwrap()
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(y, m, d)
+                    .unwrap()
+                    .and_hms_opt(hh, mm, ss)
+                    .unwrap(),
+            )
+            .single()
+            .unwrap()
+            .timestamp_millis() as u64
     }
 
     #[test]
@@ -1387,5 +1516,69 @@ mod tests {
             }
             _ => panic!("expected neutral last price label"),
         }
+    }
+
+    #[test]
+    fn rounded_visible_price_range_expands_to_outer_bucket_boundaries() {
+        let chart = sample_chart_with_step(0.05);
+        let step = chart.state().tick_size;
+        let (rounded_highest, rounded_lowest) = rounded_visible_price_range(
+            chart.state(),
+            Price::from_f32(82.02),
+            Price::from_f32(81.99),
+        );
+
+        assert_eq!(rounded_highest.units % step.units, 0);
+        assert_eq!(rounded_lowest.units % step.units, 0);
+        assert!(rounded_highest >= Price::from_f32(82.02));
+        assert!(rounded_lowest <= Price::from_f32(81.99));
+        assert!(Price::steps_between_inclusive(rounded_lowest, rounded_highest, step).is_some());
+    }
+
+    #[test]
+    fn cleanup_threshold_exceeds_full_qmt_3s_session() {
+        const FULL_QMT_3S_SESSION_BUCKETS: usize = ((2 * 60 * 60) + (2 * 60 * 60)) / 3;
+
+        assert_eq!(FULL_QMT_3S_SESSION_BUCKETS, 4_800);
+        assert!(CLEANUP_THRESHOLD > FULL_QMT_3S_SESSION_BUCKETS);
+    }
+
+    #[test]
+    fn request_missing_history_fetches_previous_heatmap_day_when_panned_left() {
+        let mut chart = sample_chart();
+        let current_day_latest = china_timestamp(2026, 4, 10, 14, 59, 59);
+        let current_day_oldest = china_timestamp(2026, 4, 10, 9, 30, 2);
+
+        chart.chart.bounds = Rectangle::with_size(Size::new(600.0, 320.0));
+        chart.chart.latest_x = current_day_latest;
+        chart.chart.translation = Vector::new(14_800.0, 0.0);
+        chart.oldest_history_time = Some(current_day_oldest);
+
+        let (visible_earliest, _) = chart.visible_timerange().expect("visible range");
+        let (expected_from, _) = exchange::adapter::qmt::heatmap_history_day_range(
+            Exchange::SSH.venue(),
+            visible_earliest,
+        )
+        .expect("expected previous trading day range");
+        let expected_to = current_day_oldest.saturating_sub(1);
+        assert!(expected_from < current_day_oldest);
+
+        let Some(Action::RequestFetch(reqs)) = chart.request_missing_history() else {
+            panic!("expected heatmap history fetch request");
+        };
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(
+            reqs[0].fetch,
+            FetchRange::HeatmapHistory(from, to) if from == expected_from && to == expected_to
+        ));
+        assert!(matches!(reqs[0].stream, None));
+
+        let heatmap_stream = StreamKind::Depth {
+            ticker_info: chart.chart.ticker_info,
+            depth_aggr: exchange::adapter::StreamTicksize::Client,
+            push_freq: exchange::PushFrequency::ServerDefault,
+            synthetic_book_levels: None,
+        };
+        assert_eq!(heatmap_stream.ticker_info(), chart.chart.ticker_info);
     }
 }

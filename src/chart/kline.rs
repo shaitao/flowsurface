@@ -1467,6 +1467,8 @@ impl canvas::Program<Message> for KlineChart {
                 palette,
                 &self.horizontal_levels,
                 interaction.active_horizontal_level_id(),
+                bounds,
+                cursor,
             );
 
             chart.draw_last_price_line(frame, palette, region);

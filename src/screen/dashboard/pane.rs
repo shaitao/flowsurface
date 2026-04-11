@@ -137,14 +137,32 @@ impl State {
         let shared_horizontal_levels = settings
             .horizontal_rays
             .iter()
-            .map(|ray| chart::HorizontalLevel::new(ray.start_time, ray.price))
+            .map(|ray| {
+                chart::HorizontalLevel::new(
+                    ray.start_time,
+                    ray.price,
+                    match ray.side {
+                        data::layout::pane::HorizontalRaySide::Buy => {
+                            chart::HorizontalLevelSide::Buy
+                        }
+                        data::layout::pane::HorizontalRaySide::Sell => {
+                            chart::HorizontalLevelSide::Sell
+                        }
+                    },
+                )
+            })
+            .collect();
+        let shared_right_rects = settings
+            .right_rects
+            .iter()
+            .map(|rect| chart::RightRect::new(rect.start_time, rect.high_price, rect.low_price))
             .collect();
 
         Self {
             content,
             settings,
             shared_horizontal_levels,
-            shared_right_rects: vec![],
+            shared_right_rects,
             streams: ResolvedStream::waiting(streams),
             link_group,
             ..Default::default()
@@ -184,6 +202,10 @@ impl State {
             .map(|level| data::layout::pane::HorizontalRay {
                 start_time: level.start_time,
                 price: level.price,
+                side: match level.side {
+                    chart::HorizontalLevelSide::Buy => data::layout::pane::HorizontalRaySide::Buy,
+                    chart::HorizontalLevelSide::Sell => data::layout::pane::HorizontalRaySide::Sell,
+                },
             })
             .collect();
 
@@ -196,6 +218,14 @@ impl State {
 
     pub fn set_shared_right_rects(&mut self, rects: Vec<chart::RightRect>) {
         self.shared_right_rects = rects.clone();
+        self.settings.right_rects = rects
+            .iter()
+            .map(|rect| data::layout::pane::RightRect {
+                start_time: rect.start_time,
+                high_price: rect.high_price,
+                low_price: rect.low_price,
+            })
+            .collect();
 
         match &mut self.content {
             Content::Heatmap { chart: Some(c), .. } => c.set_right_rects(rects),
@@ -636,7 +666,12 @@ impl State {
         }
     }
 
-    pub fn insert_heatmap_history(&mut self, trades: &[Trade], depths: &[(u64, Depth)]) {
+    pub fn insert_heatmap_history(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        trades: &[Trade],
+        depths: &[(u64, Depth)],
+    ) {
         match &mut self.content {
             Content::Heatmap { chart, .. } => {
                 let Some(chart) = chart else {
@@ -645,7 +680,11 @@ impl State {
                     );
                     return;
                 };
-                chart.apply_history_replay(trades, depths);
+                if req_id.is_some() {
+                    chart.insert_additional_history(req_id, trades, depths);
+                } else {
+                    chart.apply_history_replay(trades, depths);
+                }
             }
             _ => {
                 log::error!("pane content not heatmap");
@@ -679,6 +718,11 @@ impl State {
         };
 
         match (&mut self.content, stream) {
+            (Content::Heatmap { chart, .. }, _) => {
+                if let Some(chart) = chart {
+                    chart.mark_request_failed(req_id, error);
+                }
+            }
             (Content::Kline { chart, .. }, _) => {
                 if let Some(chart) = chart {
                     chart.mark_request_failed(req_id, error);
@@ -1361,9 +1405,17 @@ impl State {
             }
             Event::ChartInteraction(msg) => match &mut self.content {
                 Content::Heatmap { chart: Some(c), .. } => match msg {
-                    chart::Message::CreateHorizontalLevel { start_time, price } => {
+                    chart::Message::CreateHorizontalLevel {
+                        start_time,
+                        price,
+                        side,
+                    } => {
                         return Some(Effect::SharedHorizontalLevel(
-                            chart::HorizontalLevelEvent::Create { start_time, price },
+                            chart::HorizontalLevelEvent::Create {
+                                start_time,
+                                price,
+                                side,
+                            },
                         ));
                     }
                     chart::Message::MoveHorizontalLevel {
@@ -1411,12 +1463,35 @@ impl State {
                     chart::Message::DeleteRightRect(id) => {
                         return Some(Effect::SharedRightRect(chart::RightRectEvent::Delete(id)));
                     }
-                    _ => super::chart::update(c, &msg),
+                    _ => {
+                        super::chart::update(c, &msg);
+                        if matches!(
+                            msg,
+                            chart::Message::Translated(_)
+                                | chart::Message::Scaled(_, _)
+                                | chart::Message::AutoscaleToggled
+                                | chart::Message::XScaling(_, _, _)
+                                | chart::Message::BoundsChanged(_)
+                                | chart::Message::DoubleClick(_)
+                        ) && let Some(chart::Action::RequestFetch(fetch)) =
+                            c.request_missing_history()
+                        {
+                            return Some(Effect::RequestFetch(fetch));
+                        }
+                    }
                 },
                 Content::Kline { chart: Some(c), .. } => match msg {
-                    chart::Message::CreateHorizontalLevel { start_time, price } => {
+                    chart::Message::CreateHorizontalLevel {
+                        start_time,
+                        price,
+                        side,
+                    } => {
                         return Some(Effect::SharedHorizontalLevel(
-                            chart::HorizontalLevelEvent::Create { start_time, price },
+                            chart::HorizontalLevelEvent::Create {
+                                start_time,
+                                price,
+                                side,
+                            },
                         ));
                     }
                     chart::Message::MoveHorizontalLevel {

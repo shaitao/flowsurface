@@ -731,6 +731,31 @@ fn qmt_latest_history_chunk_range_skips_empty_latest_day_overlap() {
 }
 
 #[test]
+fn qmt_default_heatmap_history_bounds_falls_back_to_previous_trading_day_on_weekend() {
+    if let Ok(mut cache) = TRADING_DAY_CACHE.write() {
+        cache.clear();
+    }
+
+    let start_day = NaiveDate::from_ymd_opt(2026, 4, 6).expect("valid date");
+    let end_day = NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid date");
+    let trading_days = [
+        NaiveDate::from_ymd_opt(2026, 4, 6).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 4, 7).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 4, 8).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 4, 9).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
+    ];
+    cache_trading_days(Venue::SSH, start_day, end_day, &trading_days);
+
+    let weekend = NaiveDate::from_ymd_opt(2026, 4, 11).expect("valid weekend date");
+    let chunk = qmt_default_heatmap_history_bounds(Venue::SSH, weekend)
+        .expect("expected fallback heatmap history bounds");
+
+    assert_eq!(chunk.0, china_ms(2026, 4, 10, 9, 30, 0));
+    assert_eq!(chunk.1, china_ms(2026, 4, 10, 15, 0, 0));
+}
+
+#[test]
 fn merge_ticks_keeps_order_and_deduplicates() {
     let mut tick1 = sample_tick(china_ms(2026, 4, 9, 9, 30, 1));
     tick1.volume = 100;

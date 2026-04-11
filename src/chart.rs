@@ -8,7 +8,11 @@ use crate::connector::fetcher::{FetchRange, FetchSpec, RequestHandler};
 use crate::style;
 use crate::widget::multi_split::{DRAG_SIZE, MultiSplit};
 use crate::widget::tooltip;
-use data::chart::{Autoscale, Basis, PlotData, ViewConfig, indicator::Indicator};
+use data::{
+    UserTimezone,
+    chart::{Autoscale, Basis, PlotData, ViewConfig, indicator::Indicator},
+    config::timezone::TimeLabelKind,
+};
 use exchange::TickerInfo;
 use exchange::unit::{Price, PriceStep};
 use scale::linear::PriceInfoLabel;
@@ -81,11 +85,19 @@ pub enum RightRectHandle {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HorizontalLevelSide {
+    #[default]
+    Buy,
+    Sell,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HorizontalLevel {
     pub id: Uuid,
     pub start_time: u64,
     pub price: Price,
+    pub side: HorizontalLevelSide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,11 +120,12 @@ impl RightRect {
 }
 
 impl HorizontalLevel {
-    pub fn new(start_time: u64, price: Price) -> Self {
+    pub fn new(start_time: u64, price: Price, side: HorizontalLevelSide) -> Self {
         Self {
             id: Uuid::new_v4(),
             start_time,
             price,
+            side,
         }
     }
 }
@@ -122,6 +135,7 @@ pub enum HorizontalLevelEvent {
     Create {
         start_time: u64,
         price: Price,
+        side: HorizontalLevelSide,
     },
     Move {
         id: Uuid,
@@ -161,6 +175,7 @@ pub enum Message {
     CreateHorizontalLevel {
         start_time: u64,
         price: Price,
+        side: HorizontalLevelSide,
     },
     MoveHorizontalLevel {
         id: Uuid,
@@ -576,6 +591,8 @@ pub(super) fn draw_horizontal_levels(
     palette: &Extended,
     levels: &[HorizontalLevel],
     active_level: Option<Uuid>,
+    bounds: Rectangle,
+    cursor: mouse::Cursor,
 ) {
     if levels.is_empty() {
         return;
@@ -583,6 +600,7 @@ pub(super) fn draw_horizontal_levels(
 
     let state = chart.state();
     let region = state.visible_region(frame.size());
+    let hovered_level = hit_test_horizontal_level(chart, bounds, cursor);
     let line_width = style::horizontal_ray_width(theme);
     let handle_radius = style::horizontal_ray_handle_radius(theme) / state.scaling.max(0.001);
     let text_size = 12.0 / state.scaling.max(0.001);
@@ -606,12 +624,22 @@ pub(super) fn draw_horizontal_levels(
 
         let start_x = start_x_unclipped.max(region.x);
         let is_active = active_level == Some(level.id);
-        let line_color = if is_active {
-            palette.primary.strong.color
-        } else {
-            palette.primary.base.color.scale_alpha(0.9)
+        let (line_color, label_text_color) = match (level.side, is_active) {
+            (HorizontalLevelSide::Buy, true) => {
+                (palette.success.strong.color, palette.success.strong.text)
+            }
+            (HorizontalLevelSide::Buy, false) => (
+                palette.success.base.color.scale_alpha(0.9),
+                palette.success.base.text,
+            ),
+            (HorizontalLevelSide::Sell, true) => {
+                (palette.danger.strong.color, palette.danger.strong.text)
+            }
+            (HorizontalLevelSide::Sell, false) => (
+                palette.danger.base.color.scale_alpha(0.9),
+                palette.danger.base.text,
+            ),
         };
-        let label_text_color = palette.primary.base.text;
         let label = format!("{:.*}", state.decimals, level.price.to_f32_lossy());
         let approx_label_width =
             text_size * 0.62 * label.chars().count() as f32 + label_padding_x * 2.0;
@@ -662,6 +690,55 @@ pub(super) fn draw_horizontal_levels(
             align_y: Alignment::Center.into(),
             ..canvas::Text::default()
         });
+
+        if active_level == Some(level.id) || hovered_level == Some(level.id) {
+            let Some(start_time_label) = UserTimezone::Local
+                .format_with_kind(level.start_time as i64, TimeLabelKind::Custom("%m%d:%H:%M"))
+            else {
+                continue;
+            };
+
+            let hint_text_size = 11.0 / state.scaling.max(0.001);
+            let hint_padding_x = 6.0 / state.scaling.max(0.001);
+            let hint_padding_y = 3.0 / state.scaling.max(0.001);
+            let hint_width = hint_text_size * 0.62 * start_time_label.chars().count() as f32
+                + hint_padding_x * 2.0;
+            let hint_height = hint_text_size + hint_padding_y * 2.0;
+            let hint_anchor_x = start_x_unclipped.clamp(region.x, right_x - hint_width);
+            let hint_x = hint_anchor_x;
+            let hint_y = (y - handle_radius - hint_height - label_margin)
+                .clamp(region.y, region.y + region.height - hint_height);
+
+            frame.fill_rectangle(
+                Point::new(hint_x, hint_y),
+                Size::new(hint_width, hint_height),
+                palette.background.weakest.color.scale_alpha(0.96),
+            );
+
+            frame.stroke(
+                &Path::rectangle(
+                    Point::new(hint_x, hint_y),
+                    Size::new(hint_width, hint_height),
+                ),
+                Stroke::with_color(
+                    Stroke {
+                        width: line_width,
+                        ..Stroke::default()
+                    },
+                    line_color.scale_alpha(0.9),
+                ),
+            );
+
+            frame.fill_text(canvas::Text {
+                content: start_time_label,
+                position: Point::new(hint_x + hint_padding_x, hint_y + hint_height / 2.0),
+                size: iced::Pixels(hint_text_size),
+                color: palette.background.base.text,
+                font: style::AZERET_MONO,
+                align_y: Alignment::Center.into(),
+                ..canvas::Text::default()
+            });
+        }
     }
 }
 
@@ -765,6 +842,7 @@ fn canvas_interaction<T: Chart>(
                                         canvas::Action::publish(Message::CreateHorizontalLevel {
                                             start_time,
                                             price,
+                                            side: HorizontalLevelSide::Buy,
                                         })
                                         .and_capture(),
                                     );
@@ -796,6 +874,7 @@ fn canvas_interaction<T: Chart>(
                                         canvas::Action::publish(Message::CreateHorizontalLevel {
                                             start_time,
                                             price,
+                                            side: HorizontalLevelSide::Buy,
                                         })
                                         .and_capture(),
                                     );
@@ -830,6 +909,21 @@ fn canvas_interaction<T: Chart>(
                                 return Some(canvas::Action::publish(Message::CrosshairMoved));
                             }
 
+                            if matches!(interaction, Interaction::ArmedHorizontalLevel) {
+                                let price = cursor_price(state, bounds, cursor_in_bounds);
+                                let start_time =
+                                    cursor_anchor_time(chart, bounds, cursor_in_bounds);
+                                *interaction = Interaction::None;
+                                return Some(
+                                    canvas::Action::publish(Message::CreateHorizontalLevel {
+                                        start_time,
+                                        price,
+                                        side: HorizontalLevelSide::Sell,
+                                    })
+                                    .and_capture(),
+                                );
+                            }
+
                             if let Some((id, _)) = hit_test_right_rect_handle(chart, bounds, cursor)
                             {
                                 return Some(
@@ -847,6 +941,19 @@ fn canvas_interaction<T: Chart>(
                                 return Some(
                                     canvas::Action::publish(Message::DeleteHorizontalLevel(id))
                                         .and_capture(),
+                                );
+                            }
+                            if chart.horizontal_level_mode() {
+                                let price = cursor_price(state, bounds, cursor_in_bounds);
+                                let start_time =
+                                    cursor_anchor_time(chart, bounds, cursor_in_bounds);
+                                return Some(
+                                    canvas::Action::publish(Message::CreateHorizontalLevel {
+                                        start_time,
+                                        price,
+                                        side: HorizontalLevelSide::Sell,
+                                    })
+                                    .and_capture(),
                                 );
                             }
                         }

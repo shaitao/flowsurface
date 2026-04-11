@@ -1154,6 +1154,84 @@ Current rule:
 - replay them through the same insert/update path used by live WS events
 - history backfill should act like zero-delay WS playback, not a separate chart mutation shortcut
 
+### 4h. Default heatmap history must fall back to the latest trading day on weekends
+
+QMT heatmap open-state should not assume "today" is tradable.
+
+Failure mode:
+
+- app opens on a weekend or holiday
+- default heatmap history still requests `00:00 -> 16:00` for the current China date
+- `/api/v1/ticks` correctly returns no rows
+- there is no live WS activity either
+- the pane stays on `Waiting for data...`
+
+Current rule:
+
+- when heatmap open uses the default `range=None`
+- first resolve the latest trading-day chunk from the cached trading calendar
+- if the current China date is not tradable, fall back to the previous trading day instead of returning an empty pane
+
+### 4i. Switching QMT tickers during loading must rebuild the global stream set immediately
+
+This one looked like a bridge bug at first because the backend showed alternating `/ws/tick?symbol=A` and `/ws/tick?symbol=B`.
+
+Failure mode:
+
+- pane switches from ticker A to ticker B while history is still loading
+- pane-local stream state updates, but dashboard-global stream set still keeps the old ticker for a moment
+- both QMT symbols remain subscribed together
+- bridge repeatedly reconnects between the two symbols and live data never stabilizes
+
+Current rule:
+
+- do not `extend(...)` the old global stream set when a pane retargets
+- immediately rebuild the unique stream set from current pane state
+- old QMT symbol subscriptions must be removed before the new symbol is considered settled
+
+### 4j. A full `3s` QMT heatmap day already needs about 4,800 buckets
+
+This is easy to miss because the number is not large until session compression is taken into account.
+
+Failure mode:
+
+- heatmap cleanup threshold is set to `4800`
+- one full A-share trading day at `3s` basis is already `4h / 3s = 4,800` buckets
+- initial current-day replay plus any live overlap pushes the chart just over the limit
+- cleanup immediately evicts the oldest `480` buckets
+- visually this looks like the opening segment (`09:30 ~ 09:50` or so) is missing
+
+Current rule:
+
+- keep heatmap cleanup capacity comfortably above one full QMT `3s` trading day
+- treat `4,800` as the minimum viable single-day capacity, not as a safe cleanup threshold
+- if opening-session data appears to vanish while raw ticks are present, check cleanup pressure before blaming bridge history
+
+### 4k. Missing late-February 2026 `600309.SH` history is not a Spring Festival explanation
+
+This was verified against exchange trading dates.
+
+Observed symptom:
+
+- `600309.SH` showed no historical rows for several late-February 2026 dates
+- it was tempting to assume the gap was still inside Spring Festival shutdown
+
+Verified facts:
+
+- 2026 Spring Festival closure ends before `2026-02-24`
+- the following dates are normal trading days:
+  - `2026-02-24`
+  - `2026-02-25`
+  - `2026-02-26`
+  - `2026-02-27`
+- app logs showed `rows=0` for those days anyway
+
+Current rule:
+
+- do not explain late-February 2026 gaps as holiday behavior
+- if those dates return `rows=0`, treat it as a bridge/history-source hole and verify raw files upstream
+- remember that the day-cache will preserve those zero-row results until restart or cache invalidation
+
 ### 5. Footprint history should not be blocked by a separate trade-fetch path
 
 Before the combined QMT history fetch:

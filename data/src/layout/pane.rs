@@ -98,12 +98,30 @@ pub struct Settings {
     pub selected_basis: Option<Basis>,
     #[serde(deserialize_with = "ok_or_default", default)]
     pub horizontal_rays: Vec<HorizontalRay>,
+    #[serde(deserialize_with = "ok_or_default", default)]
+    pub right_rects: Vec<RightRect>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub enum HorizontalRaySide {
+    #[default]
+    Buy,
+    Sell,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HorizontalRay {
     pub start_time: u64,
     pub price: exchange::unit::Price,
+    #[serde(default)]
+    pub side: HorizontalRaySide,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RightRect {
+    pub start_time: u64,
+    pub high_price: exchange::unit::Price,
+    pub low_price: exchange::unit::Price,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]

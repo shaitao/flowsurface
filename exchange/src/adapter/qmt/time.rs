@@ -490,6 +490,24 @@ pub(super) fn qmt_current_day_history_bounds(day: NaiveDate) -> Option<(u64, u64
     Some((start, end))
 }
 
+pub(super) fn qmt_default_heatmap_history_bounds(
+    venue: Venue,
+    reference_day: NaiveDate,
+) -> Option<(u64, u64)> {
+    let (_, requested_end) = qmt_current_day_history_bounds(reference_day)?;
+    let requested_start = requested_end.saturating_sub(QMT_KLINE_SEED_CALENDAR_LOOKBACK_MS);
+    qmt_latest_history_chunk_range(venue, requested_start, requested_end)
+}
+
+pub fn heatmap_history_day_range(venue: Venue, timestamp_ms: u64) -> Option<(u64, u64)> {
+    let day = china_trading_day(timestamp_ms)?;
+    if current_china_day() == Some(day) {
+        qmt_current_day_history_bounds(day)
+    } else {
+        qmt_tick_fetch_bounds(venue, day)
+    }
+}
+
 pub(super) fn qmt_latest_history_chunk_range(
     venue: Venue,
     requested_start: u64,

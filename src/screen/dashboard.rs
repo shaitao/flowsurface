@@ -197,7 +197,8 @@ impl Dashboard {
             }
             state.begin_heatmap_history_sync();
             return Some(
-                fetcher::heatmap_history_fetch_task(layout_id, pane_id, stream).map(Message::from),
+                fetcher::heatmap_history_fetch_task(layout_id, pane_id, stream, None, None)
+                    .map(Message::from),
             );
         }
 
@@ -333,8 +334,12 @@ impl Dashboard {
                 .or_default();
 
             match event {
-                chart::HorizontalLevelEvent::Create { start_time, price } => {
-                    levels.push(chart::HorizontalLevel::new(start_time, price));
+                chart::HorizontalLevelEvent::Create {
+                    start_time,
+                    price,
+                    side,
+                } => {
+                    levels.push(chart::HorizontalLevel::new(start_time, price, side));
                 }
                 chart::HorizontalLevelEvent::Move {
                     id,
@@ -1308,7 +1313,6 @@ impl Dashboard {
     ) -> Task<Message> {
         let layout_id = self.layout_id;
         let mut initial_fetch = None;
-        let mut streams_to_add = None;
         let shared_horizontal_levels = self.horizontal_levels_for_ticker(ticker_info);
         let shared_right_rects = self.right_rects_for_ticker(ticker_info);
         if let Some(state) = self.get_mut_pane(main_window, window, selected_pane) {
@@ -1321,14 +1325,10 @@ impl Dashboard {
             Self::set_idle_pane_status(state);
             initial_fetch =
                 Self::initial_history_fetch_task(layout_id, pane_id, state, &streams, content_kind);
-            streams_to_add = Some(streams);
         }
 
-        if let Some(streams) = streams_to_add {
-            self.streams.extend(streams.iter());
-        }
-
-        initial_fetch.unwrap_or_else(Task::none)
+        self.refresh_streams(main_window)
+            .chain(initial_fetch.unwrap_or_else(Task::none))
     }
 
     pub fn init_focused_pane(
@@ -1347,7 +1347,6 @@ impl Dashboard {
 
         let mut initial_fetch = None;
         let mut handled_focus = false;
-        let mut streams_to_add = None;
         let shared_horizontal_levels = self.horizontal_levels_for_ticker(ticker_info);
         let shared_right_rects = self.right_rects_for_ticker(ticker_info);
         if let Some((window, selected_pane)) = self.focus
@@ -1368,18 +1367,13 @@ impl Dashboard {
             let pane_id = state.unique_id();
             initial_fetch =
                 Self::initial_history_fetch_task(layout_id, pane_id, state, &streams, content_kind);
-            streams_to_add = Some(streams);
-        }
-
-        if let Some(streams) = streams_to_add {
-            self.streams.extend(streams.iter());
         }
 
         if let Some(task) = initial_fetch {
-            return task;
+            return self.refresh_streams(main_window).chain(task);
         }
         if handled_focus {
-            return Task::none();
+            return self.refresh_streams(main_window);
         }
 
         Task::done(Message::Notification(Toast::warn(
@@ -1573,9 +1567,13 @@ impl Dashboard {
                     );
                 }
             }
-            FetchedData::HeatmapHistory { trades, depths } => {
+            FetchedData::HeatmapHistory {
+                trades,
+                depths,
+                req_id,
+            } => {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
-                    pane_state.insert_heatmap_history(&trades, &depths);
+                    pane_state.insert_heatmap_history(req_id, &trades, &depths);
                     Self::set_idle_pane_status(pane_state);
                 }
             }
@@ -1904,7 +1902,58 @@ impl Dashboard {
                             .settings
                             .horizontal_rays
                             .iter()
-                            .map(|ray| chart::HorizontalLevel::new(ray.start_time, ray.price))
+                            .map(|ray| {
+                                chart::HorizontalLevel::new(
+                                    ray.start_time,
+                                    ray.price,
+                                    match ray.side {
+                                        data::layout::pane::HorizontalRaySide::Buy => {
+                                            chart::HorizontalLevelSide::Buy
+                                        }
+                                        data::layout::pane::HorizontalRaySide::Sell => {
+                                            chart::HorizontalLevelSide::Sell
+                                        }
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                } else {
+                    None
+                }
+            });
+        let restored_right_rects = self
+            .iter_all_panes(main_window)
+            .find(|(_, _, state)| state.unique_id() == pane_id)
+            .and_then(|(_, _, state)| {
+                if !matches!(
+                    state.content.kind(),
+                    ContentKind::HeatmapChart
+                        | ContentKind::CandlestickChart
+                        | ContentKind::FootprintChart
+                ) || state.settings.right_rects.is_empty()
+                {
+                    return None;
+                }
+
+                let ticker_info = streams.first()?.ticker_info();
+                if streams
+                    .iter()
+                    .all(|stream| stream.ticker_info() == ticker_info)
+                {
+                    Some((
+                        ticker_info,
+                        state
+                            .settings
+                            .right_rects
+                            .iter()
+                            .map(|rect| {
+                                chart::RightRect::new(
+                                    rect.start_time,
+                                    rect.high_price,
+                                    rect.low_price,
+                                )
+                            })
                             .collect::<Vec<_>>(),
                     ))
                 } else {
@@ -1916,6 +1965,11 @@ impl Dashboard {
             && !self.shared_horizontal_levels.contains_key(&ticker_info)
         {
             self.shared_horizontal_levels.insert(ticker_info, levels);
+        }
+        if let Some((ticker_info, rects)) = restored_right_rects
+            && !self.shared_right_rects.contains_key(&ticker_info)
+        {
+            self.shared_right_rects.insert(ticker_info, rects);
         }
 
         if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {

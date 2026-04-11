@@ -220,14 +220,40 @@ pub async fn fetch_trades(
 pub async fn fetch_heatmap_history(
     ticker_info: TickerInfo,
     synthetic_book_levels: Option<u16>,
+    range: Option<(u64, u64)>,
 ) -> Result<(Vec<Trade>, Vec<(u64, crate::depth::Depth)>), AdapterError> {
-    let Some(day) = current_china_day() else {
-        return Ok((Vec::new(), Vec::new()));
+    let range = if let Some(range) = range {
+        range
+    } else {
+        let venue = ticker_info.exchange().venue();
+        let Some(day) = current_china_day() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+
+        let Some((requested_start, requested_end)) = qmt_current_day_history_bounds(day) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+
+        if let Err(error) = ensure_trading_calendar(
+            venue,
+            requested_start.saturating_sub(QMT_KLINE_SEED_CALENDAR_LOOKBACK_MS),
+            requested_end,
+        )
+        .await
+        {
+            log::warn!(
+                "QMT trading calendar seed fetch failed for {} heatmap default range: {error}",
+                ticker_info.ticker
+            );
+        }
+
+        let Some(range) = qmt_default_heatmap_history_bounds(venue, day) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        range
     };
 
-    let Some(range) = qmt_current_day_history_bounds(day) else {
-        return Ok((Vec::new(), Vec::new()));
-    };
+    let (requested_start, requested_end) = range;
 
     let fetch_started_at = Instant::now();
     let ticks = fetch_ticks(ticker_info, range).await?;
@@ -241,6 +267,8 @@ pub async fn fetch_heatmap_history(
             qmt_tick_has_traded_volume(tick)
                 && qmt_tick_has_top_of_book(tick)
                 && qmt_heatmap_tick_in_session(venue, tick.time)
+                && requested_start <= tick.time
+                && tick.time <= requested_end
         })
         .collect::<Vec<_>>();
 
@@ -250,8 +278,10 @@ pub async fn fetch_heatmap_history(
     let derive_elapsed = derive_started_at.elapsed();
 
     log::info!(
-        "QMT heatmap history {} ticks={} replay_ticks={} trades={} depths={} fetch_elapsed={:?} derive_elapsed={:?}",
+        "QMT heatmap history {} range=({}..{}) ticks={} replay_ticks={} trades={} depths={} fetch_elapsed={:?} derive_elapsed={:?}",
         ticker_info.ticker,
+        requested_start,
+        requested_end,
         total_ticks,
         replay_ticks.len(),
         trades.len(),

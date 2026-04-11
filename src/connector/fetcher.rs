@@ -46,6 +46,7 @@ pub enum FetchedData {
     HeatmapHistory {
         trades: Vec<Trade>,
         depths: Vec<(u64, Depth)>,
+        req_id: Option<uuid::Uuid>,
     },
 }
 
@@ -134,6 +135,7 @@ pub enum FetchRange {
     KlineTrades(u64, u64),
     OpenInterest(u64, u64),
     Trades(u64, u64),
+    HeatmapHistory(u64, u64),
 }
 
 #[derive(PartialEq, Debug)]
@@ -157,6 +159,9 @@ impl FetchRequest {
                 e1 == e2 && s1 == s2
             }
             (FetchRange::OpenInterest(s1, e1), FetchRange::OpenInterest(s2, e2)) => {
+                e1 == e2 && s1 == s2
+            }
+            (FetchRange::HeatmapHistory(s1, e1), FetchRange::HeatmapHistory(s2, e2)) => {
                 e1 == e2 && s1 == s2
             }
             _ => false,
@@ -401,6 +406,29 @@ pub fn request_fetch(
                 }
             }
         }
+        FetchRange::HeatmapHistory(from_time, to_time) => {
+            let heatmap_stream = if let Some(s) = stream {
+                Some((s, pane_id))
+            } else {
+                ready_streams.iter().find_map(|stream| {
+                    if matches!(stream, StreamKind::Depth { .. } | StreamKind::Trades { .. }) {
+                        Some((*stream, pane_id))
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            if let Some((stream, pane_uid)) = heatmap_stream {
+                return heatmap_history_fetch_task(
+                    layout_id,
+                    pane_uid,
+                    stream,
+                    Some(req_id),
+                    Some((from_time, to_time)),
+                );
+            }
+        }
     }
 
     Task::none()
@@ -594,6 +622,8 @@ pub fn heatmap_history_fetch_task(
     layout_id: Uuid,
     pane_id: Uuid,
     stream: StreamKind,
+    req_id: Option<Uuid>,
+    range: Option<(u64, u64)>,
 ) -> Task<FetchUpdate> {
     let update_status = Task::done(FetchUpdate::Status {
         pane_id,
@@ -607,7 +637,7 @@ pub fn heatmap_history_fetch_task(
             ..
         } => Task::perform(
             iced::futures::TryFutureExt::map_err(
-                adapter::fetch_heatmap_history(ticker_info, synthetic_book_levels),
+                adapter::fetch_heatmap_history(ticker_info, synthetic_book_levels, range),
                 |err| {
                     log::error!("Heatmap history fetch failed: {err}");
                     err.ui_message()
@@ -615,7 +645,11 @@ pub fn heatmap_history_fetch_task(
             ),
             move |result| match result {
                 Ok((trades, depths)) => {
-                    let data = FetchedData::HeatmapHistory { trades, depths };
+                    let data = FetchedData::HeatmapHistory {
+                        trades,
+                        depths,
+                        req_id,
+                    };
                     FetchUpdate::Data {
                         layout_id,
                         pane_id,
@@ -625,7 +659,7 @@ pub fn heatmap_history_fetch_task(
                 }
                 Err(err) => FetchUpdate::Error {
                     pane_id,
-                    req_id: None,
+                    req_id,
                     stream: Some(stream),
                     error: err,
                 },
@@ -633,7 +667,7 @@ pub fn heatmap_history_fetch_task(
         ),
         StreamKind::Trades { ticker_info } => Task::perform(
             iced::futures::TryFutureExt::map_err(
-                adapter::fetch_heatmap_history(ticker_info, None),
+                adapter::fetch_heatmap_history(ticker_info, None, range),
                 |err| {
                     log::error!("Heatmap history fetch failed: {err}");
                     err.ui_message()
@@ -641,7 +675,11 @@ pub fn heatmap_history_fetch_task(
             ),
             move |result| match result {
                 Ok((trades, depths)) => {
-                    let data = FetchedData::HeatmapHistory { trades, depths };
+                    let data = FetchedData::HeatmapHistory {
+                        trades,
+                        depths,
+                        req_id,
+                    };
                     FetchUpdate::Data {
                         layout_id,
                         pane_id,
@@ -651,7 +689,7 @@ pub fn heatmap_history_fetch_task(
                 }
                 Err(err) => FetchUpdate::Error {
                     pane_id,
-                    req_id: None,
+                    req_id,
                     stream: Some(stream),
                     error: err,
                 },

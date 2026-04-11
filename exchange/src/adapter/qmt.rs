@@ -51,8 +51,8 @@ use streams::build_depth_history_from_ticks;
 pub use streams::{connect_depth_stream, connect_kline_stream, connect_trade_stream};
 use time::*;
 pub use time::{
-    is_trading_bucket_start, supports_gapless_time_axis_timeframe, time_axis_bucket_at_offset,
-    time_axis_bucket_offset, uses_gapless_time_axis,
+    heatmap_history_day_range, is_trading_bucket_start, supports_gapless_time_axis_timeframe,
+    time_axis_bucket_at_offset, time_axis_bucket_offset, uses_gapless_time_axis,
 };
 
 const DEFAULT_QMT_BRIDGE_BASE: &str = "http://127.0.0.1:8765";
