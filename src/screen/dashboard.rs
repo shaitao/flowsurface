@@ -173,6 +173,10 @@ impl Dashboard {
         streams: &[StreamKind],
         content_kind: ContentKind,
     ) -> Option<Task<Message>> {
+        let loading_klines = matches!(state.status, pane::Status::Loading(InfoKind::FetchingKlines));
+        let loading_heatmap =
+            matches!(state.status, pane::Status::Loading(InfoKind::FetchingHeatmap));
+
         if matches!(content_kind, ContentKind::OrderEntry)
             && let pane::Content::OrderEntry(Some(panel)) = &mut state.content
         {
@@ -186,6 +190,14 @@ impl Dashboard {
         if matches!(content_kind, ContentKind::HeatmapChart)
             && let Some(stream) = Self::qmt_heatmap_history_stream(streams)
         {
+            if loading_heatmap {
+                log::debug!(
+                    "Skipping duplicate initial heatmap history fetch pane={} content={:?}",
+                    pane_id,
+                    content_kind
+                );
+                return None;
+            }
             if !matches!(
                 &state.content,
                 pane::Content::Heatmap { chart: Some(_), .. }
@@ -195,6 +207,7 @@ impl Dashboard {
                 );
                 return None;
             }
+            state.status = pane::Status::Loading(InfoKind::FetchingHeatmap);
             state.begin_heatmap_history_sync();
             return Some(
                 fetcher::heatmap_history_fetch_task(layout_id, pane_id, stream, None, None)
@@ -206,9 +219,11 @@ impl Dashboard {
             content_kind,
             ContentKind::CandlestickChart | ContentKind::FootprintChart
         ) && let pane::Content::Kline { chart: Some(c), .. } = &mut state.content
+            && !loading_klines
             && c.basis().is_trade_based()
             && let Some(chart::Action::RequestFetch(reqs)) = c.invalidate(Some(Instant::now()))
         {
+            state.status = pane::Status::Loading(InfoKind::FetchingKlines);
             return Some(
                 fetcher::request_fetch_many(
                     pane_id,
@@ -225,10 +240,31 @@ impl Dashboard {
                 )
                 .map(Message::from),
             );
+        } else if matches!(
+            content_kind,
+            ContentKind::CandlestickChart | ContentKind::FootprintChart
+        ) && loading_klines
+        {
+            log::debug!(
+                "Skipping duplicate initial kline history fetch pane={} content={:?}",
+                pane_id,
+                content_kind
+            );
+            return None;
         }
 
         for stream in streams {
             if let StreamKind::Kline { ticker_info, .. } = stream {
+                if loading_klines {
+                    log::debug!(
+                        "Skipping duplicate initial kline history fetch pane={} content={:?} stream={:?}",
+                        pane_id,
+                        content_kind,
+                        stream
+                    );
+                    return None;
+                }
+                state.status = pane::Status::Loading(InfoKind::FetchingKlines);
                 log::info!(
                     "Starting initial kline history fetch pane={} content={:?} stream={:?} combined_qmt={}",
                     pane_id,

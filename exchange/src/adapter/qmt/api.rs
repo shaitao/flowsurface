@@ -221,13 +221,27 @@ async fn fetch_history_with_kline_fallback(
                 latest_day_only,
                 range
             );
-            let fallback =
-                fetch_history_from_1m_klines(ticker_info, timeframe, range, latest_day_only)
-                    .await?;
-            if fallback.0.is_empty() {
-                Ok((klines, trades))
-            } else {
-                Ok(fallback)
+            match fetch_history_from_1m_klines(ticker_info, timeframe, range, latest_day_only)
+                .await
+            {
+                Ok(fallback) => {
+                    if fallback.0.is_empty() {
+                        Ok((klines, trades))
+                    } else {
+                        Ok(fallback)
+                    }
+                }
+                Err(fallback_error) => {
+                    log::error!(
+                        "QMT 1m-kline fallback failed for {} {} latest_day_only={} range={:?}: {}; returning empty tick-derived history",
+                        ticker_info.ticker,
+                        timeframe,
+                        latest_day_only,
+                        range,
+                        fallback_error
+                    );
+                    Ok((klines, trades))
+                }
             }
         }
         Err(error) => {
@@ -697,10 +711,18 @@ async fn fetch_kline_chunk(
         ],
     )?;
 
+    log::info!(
+        "QMT fetch_kline_chunk start {} period={} range=({}..{})",
+        ticker_info.ticker,
+        period,
+        start,
+        end
+    );
     let request_started_at = Instant::now();
     let response = qmt_bridge_http_client()
         .get(&url)
         .header(reqwest::header::ACCEPT, QMT_BRIDGE_MSGPACK_CONTENT_TYPE)
+        .timeout(QMT_BRIDGE_REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(AdapterError::from)?;

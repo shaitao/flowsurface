@@ -526,12 +526,7 @@ impl HeatmapChart {
         self.cleanup_old_data();
 
         if let Some(req_id) = req_id {
-            if trades.is_empty() && depths.is_empty() {
-                self.request_handler
-                    .mark_failed(req_id, "No data received".to_string());
-            } else {
-                self.request_handler.mark_completed(req_id);
-            }
+            self.request_handler.mark_completed(req_id);
         }
 
         self.invalidate(Some(Instant::now()));

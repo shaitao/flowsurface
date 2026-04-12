@@ -903,12 +903,7 @@ impl KlineChart {
                 if is_batches_done {
                     self.fetching_trades = (false, None);
                     if let Some(req_id) = req_id {
-                        if merged_trades.is_empty() {
-                            self.request_handler
-                                .mark_failed(req_id, "No data received".to_string());
-                        } else {
-                            self.request_handler.mark_completed(req_id);
-                        }
+                        self.request_handler.mark_completed(req_id);
                     }
                 }
             }
@@ -918,12 +913,7 @@ impl KlineChart {
                 if is_batches_done {
                     self.fetching_trades = (false, None);
                     if let Some(req_id) = req_id {
-                        if merged_trades.is_empty() {
-                            self.request_handler
-                                .mark_failed(req_id, "No data received".to_string());
-                        } else {
-                            self.request_handler.mark_completed(req_id);
-                        }
+                        self.request_handler.mark_completed(req_id);
                     }
                 }
             }
@@ -987,12 +977,7 @@ impl KlineChart {
         if is_batches_done {
             self.fetching_trades = (false, None);
             if let Some(req_id) = req_id {
-                if klines_raw.is_empty() && merged_trades.is_empty() {
-                    self.request_handler
-                        .mark_failed(req_id, "No data received".to_string());
-                } else {
-                    self.request_handler.mark_completed(req_id);
-                }
+                self.request_handler.mark_completed(req_id);
             }
         }
 
@@ -1058,12 +1043,7 @@ impl KlineChart {
                 }
 
                 if is_batches_done {
-                    if klines_raw.is_empty() {
-                        self.request_handler
-                            .mark_failed(req_id, "No data received".to_string());
-                    } else {
-                        self.request_handler.mark_completed(req_id);
-                    }
+                    self.request_handler.mark_completed(req_id);
                 }
             }
             PlotData::TickBased(_) => {}
@@ -1121,12 +1101,7 @@ impl KlineChart {
 
     pub fn insert_open_interest(&mut self, req_id: Option<uuid::Uuid>, oi_data: &[OIData]) {
         if let Some(req_id) = req_id {
-            if oi_data.is_empty() {
-                self.request_handler
-                    .mark_failed(req_id, "No data received".to_string());
-            } else {
-                self.request_handler.mark_completed(req_id);
-            }
+            self.request_handler.mark_completed(req_id);
         }
 
         if let Some(indi) = self.indicators[KlineIndicator::OpenInterest].as_mut() {

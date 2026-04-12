@@ -59,6 +59,7 @@ const DEFAULT_QMT_BRIDGE_BASE: &str = "http://127.0.0.1:8765";
 const QMT_BRIDGE_MSGPACK_CONTENT_TYPE: &str = "application/msgpack";
 const QMT_BRIDGE_ZSTD_CONTENT_ENCODING: &str = "zstd";
 const QMT_BRIDGE_ZSTD_LEVEL: i32 = 3;
+const QMT_BRIDGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_QMT_INITIAL_KLINE_BARS: u64 = 450;
 const QMT_VOLUME_LOT_SIZE: f32 = 100.0;
 const QMT_KLINE_SEED_CALENDAR_LOOKBACK_MS: u64 = 14 * 86_400_000;
