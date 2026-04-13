@@ -2030,7 +2030,7 @@ impl ViewState {
         Length::Fixed(width.ceil())
     }
 
-    fn snap_x_to_index(&self, x: f32, bounds: Size, region: Rectangle) -> (u64, f32) {
+    pub(crate) fn snap_x_to_index(&self, x: f32, bounds: Size, region: Rectangle) -> (u64, f32) {
         let x_ratio = x / bounds.width;
 
         match self.basis {

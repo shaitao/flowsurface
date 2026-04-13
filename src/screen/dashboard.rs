@@ -173,9 +173,14 @@ impl Dashboard {
         streams: &[StreamKind],
         content_kind: ContentKind,
     ) -> Option<Task<Message>> {
-        let loading_klines = matches!(state.status, pane::Status::Loading(InfoKind::FetchingKlines));
-        let loading_heatmap =
-            matches!(state.status, pane::Status::Loading(InfoKind::FetchingHeatmap));
+        let loading_klines = matches!(
+            state.status,
+            pane::Status::Loading(InfoKind::FetchingKlines)
+        );
+        let loading_heatmap = matches!(
+            state.status,
+            pane::Status::Loading(InfoKind::FetchingHeatmap)
+        );
 
         if matches!(content_kind, ContentKind::OrderEntry)
             && let pane::Content::OrderEntry(Some(panel)) = &mut state.content

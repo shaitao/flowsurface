@@ -271,33 +271,8 @@ where
                     width,
                     height: frame.height() / ctx.scaling,
                 };
-                let earliest = ctx.x_to_interval(region.x) as f64;
-                let latest = ctx.x_to_interval(region.x + region.width) as f64;
-
-                let crosshair_ratio = f64::from(cursor_position.x / bounds.width);
-                let (rounded_x, snap_ratio) = match ctx.basis {
-                    Basis::Time(tf) => {
-                        let step = tf.to_milliseconds() as f64;
-                        let rx = ((earliest + crosshair_ratio * (latest - earliest)) / step).round()
-                            as u64
-                            * step as u64;
-
-                        let sr = if latest <= earliest {
-                            0.5
-                        } else {
-                            ((rx as f64 - earliest) / (latest - earliest)) as f32
-                        };
-                        (rx, sr)
-                    }
-                    Basis::Tick(_) | Basis::Volume(_) => {
-                        let world_x = region.x + (cursor_position.x / bounds.width) * region.width;
-                        let snapped_world_x = (world_x / ctx.cell_width).round() * ctx.cell_width;
-
-                        let sr = (snapped_world_x - region.x) / region.width;
-                        let rx = ctx.x_to_interval(snapped_world_x);
-                        (rx, sr)
-                    }
-                };
+                let (rounded_x, snap_ratio) =
+                    ctx.snap_x_to_index(cursor_position.x, bounds.size(), region);
 
                 frame.stroke(
                     &Path::line(

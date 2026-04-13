@@ -221,8 +221,7 @@ async fn fetch_history_with_kline_fallback(
                 latest_day_only,
                 range
             );
-            match fetch_history_from_1m_klines(ticker_info, timeframe, range, latest_day_only)
-                .await
+            match fetch_history_from_1m_klines(ticker_info, timeframe, range, latest_day_only).await
             {
                 Ok(fallback) => {
                     if fallback.0.is_empty() {
