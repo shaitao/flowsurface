@@ -105,7 +105,7 @@ The bridge order panel API (`/api/v1/order/panel`) must return `quantity` in `Or
 - Rust `OrderBookLevel` uses strict serde: only `quantity` is accepted.
 - If the bridge sends `volume`, deserialization fails with `"Invalid server response"`.
 - This is enforced by contract tests in `exchange/src/order.rs`.
-- The canonical field spec is in `QMT_ORDER_BRIDGE_API.md`.
+- The canonical field spec is in `QMT_BRIDGE_API.md`.
 
 ### 6. Order panel quantity input uses lots for A-shares
 
